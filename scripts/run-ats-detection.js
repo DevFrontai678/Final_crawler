@@ -19,6 +19,7 @@
 'use strict';
 
 require('dotenv').config();
+const ws = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 const { detectATS }    = require('../src/ats-adapters/ats-detector');
 
@@ -46,6 +47,7 @@ function getArg(name) {
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY,
+  { global: { fetch }, realtime: { transport: ws } }
 );
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
