@@ -1,11 +1,9 @@
 const { Queue, Worker } = require('bullmq');
 const Redis = require('ioredis');
 const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios');
 const ws = require('ws');
 require('dotenv').config();
-
-const voyage = require('voyageai');
-const voyageClient = new voyage.Client({ apiKey: process.env.VOYAGE_API_KEY });
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -22,6 +20,26 @@ const redisConnection = new Redis({
 const QUEUE_NAME = 'embedding-queue';
 const queue = new Queue(QUEUE_NAME, { connection: redisConnection });
 
+// ─── Voyage AI REST API ──────────────────────────────────────────────────────
+async function getVoyageEmbedding(text) {
+    const response = await axios.post(
+        'https://api.voyageai.com/v1/embeddings',
+        {
+            input: [text],
+            model: 'voyage-3-large'
+        },
+        {
+            headers: {
+                'Authorization': `Bearer ${process.env.VOYAGE_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 30000
+        }
+    );
+    return response.data.data[0].embedding;
+}
+
+// ─── Queue Functions ─────────────────────────────────────────────────────────
 async function addJobsToQueue(limit = 5000) {
     const { data: jobs, error } = await supabase
         .from('jobs')
@@ -59,11 +77,7 @@ const worker = new Worker(QUEUE_NAME, async job => {
 
     try {
         const inputText = skills.join(', ');
-        const response = await voyageClient.embed({
-            input: [inputText],
-            model: 'voyage-3-large'
-        });
-        const embedding = response.embeddings[0];
+        const embedding = await getVoyageEmbedding(inputText);
 
         const { error: updateError } = await supabase
             .from('jobs')
@@ -81,14 +95,14 @@ const worker = new Worker(QUEUE_NAME, async job => {
     }
 }, {
     connection: redisConnection,
-    concurrency: 5
+    concurrency: 1
 });
 
 worker.on('completed', job => console.log(`✅ Job ${job.id} completed`));
 worker.on('failed', (job, err) => console.error(`❌ Job ${job.id} failed:`, err));
 
 (async () => {
-    await addJobsToQueue(5000);
+    await new Promise(r => setTimeout(r, 20000)); // 20 second delay
     console.log(`\n🚀 Queue has ${await queue.count()} jobs. Workers running...\n`);
 })();
 

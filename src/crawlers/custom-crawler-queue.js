@@ -47,6 +47,52 @@ async function addCustomCompaniesToQueue(limit = 200) {
     }
 }
 
+// ─── SMART EXTRACTION FUNCTION ──────────────────────────────────────────────
+async function extractJobDescription(page) {
+    // 1. Try common job description selectors
+    const selectors = [
+        '.job-description', '.job-details', '.description', '.content',
+        '#job-description', '.job-content', '[class*="job-description"]',
+        '[class*="job-detail"]', '[class*="description"]', 'article',
+        '.main-content', '#content', '.text-content', '.post-content',
+        '.entry-content', '.job__description', '.job-listing__description'
+    ];
+
+    for (const selector of selectors) {
+        try {
+            const element = await page.$(selector);
+            if (element) {
+                const text = await page.$eval(selector, el => el.innerText);
+                if (text && text.length > 100) {
+                    return text;
+                }
+            }
+        } catch (e) { /* try next */ }
+    }
+
+    // 2. Fallback: take the largest text block, but filter out common noise
+    const bodyText = await page.$eval('body', el => el.innerText).catch(() => '');
+    if (bodyText) {
+        // Split lines, trim, remove short lines and typical navigation/footer keywords
+        const lines = bodyText.split('\n')
+            .map(l => l.trim())
+            .filter(l => l.length > 20)
+            .filter(l => !/impressum|datenschutz|agb|karriere|bewerbung|startseite|menu|footer|cookie|datenschutzerklärung/i.test(l));
+        
+        // Keep only lines that look like sentences (long enough)
+        const candidates = lines.filter(l => l.length > 100);
+        if (candidates.length > 0) {
+            // Sort by length and take top 3 blocks (usually job description)
+            candidates.sort((a, b) => b.length - a.length);
+            return candidates.slice(0, 3).join('\n');
+        }
+        
+        // If no long block, return the whole filtered body (still better than raw)
+        return lines.join('\n');
+    }
+    return bodyText;
+}
+
 const worker = new Worker(QUEUE_NAME, async job => {
     const { companyId, companyName, careerUrl } = job.data;
     console.log(`\n🕸️ Crawling: ${companyName} (${careerUrl})`);
@@ -78,7 +124,8 @@ const worker = new Worker(QUEUE_NAME, async job => {
             try {
                 await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 15000 });
                 const title = await page.title();
-                const bodyText = await page.$eval('body', el => el.innerText).catch(() => '');
+                // Use smart extraction for description
+                const bodyText = await extractJobDescription(page);
                 if (bodyText.length < 50) continue;
 
                 const externalId = Buffer.from(link).toString('base64').slice(0, 50);
@@ -139,7 +186,7 @@ worker.on('completed', job => console.log(`✅ Job ${job.id} completed`));
 worker.on('failed', (job, err) => console.error(`❌ Job ${job.id} failed:`, err));
 
 (async () => {
-    await addCustomCompaniesToQueue(200);
+    await addCustomCompaniesToQueue(200);  // Set to 0 or remove limit for all custom companies
     console.log(`\n🚀 Queue has ${await customCrawlQueue.count()} jobs. Workers running...\n`);
 })();
 

@@ -20,12 +20,11 @@ const redisConnection = new Redis({
 const QUEUE_NAME = 'job-structuring';
 const queue = new Queue(QUEUE_NAME, { connection: redisConnection });
 
-// ─── Add all jobs that need structuring ──────────────────────────────────
 async function addJobsToQueue(limit = 5000) {
+    // Fetch ALL jobs – we'll filter in JavaScript
     const { data: jobs, error } = await supabase
         .from('jobs')
-        .select('id, title, raw_description, company_id')
-        .is('structured_skills', null)
+        .select('id, title, raw_description, company_id, structured_skills')
         .limit(limit);
 
     if (error) {
@@ -33,9 +32,15 @@ async function addJobsToQueue(limit = 5000) {
         return;
     }
 
-    console.log(`📋 Adding ${jobs.length} jobs to queue...`);
+    // Filter jobs that need structuring: null OR empty array
+    const jobsToStructure = jobs.filter(job => {
+        const skills = job.structured_skills;
+        return !skills || (Array.isArray(skills) && skills.length === 0);
+    });
 
-    for (const job of jobs) {
+    console.log(`📋 Found ${jobsToStructure.length} jobs to structure (out of ${jobs.length} total)`);
+
+    for (const job of jobsToStructure) {
         await queue.add('structure-job', {
             jobId: job.id,
             title: job.title,
@@ -45,18 +50,17 @@ async function addJobsToQueue(limit = 5000) {
             attempts: 3,
             backoff: { type: 'exponential', delay: 5000 }
         });
+        console.log(`Added: ${job.title}`);
     }
-    console.log(`✅ Added ${jobs.length} jobs to queue`);
+    console.log(`✅ Added ${jobsToStructure.length} jobs to queue`);
 }
 
-// ─── Worker: process one job ──────────────────────────────────────────────
 const worker = new Worker(QUEUE_NAME, async job => {
     const { jobId, title, raw_description } = job.data;
     console.log(`🔄 Structuring: ${title}`);
 
     try {
         const structured = await structureJob({ id: jobId, title, raw_description });
-
         if (!structured) {
             console.log(`⚠️ No structured data for ${title}`);
             return;
@@ -76,9 +80,8 @@ const worker = new Worker(QUEUE_NAME, async job => {
 
         if (updateError) {
             console.error(`❌ Save error for ${title}:`, updateError.message);
-            throw updateError; // triggers retry
+            throw updateError;
         }
-
         console.log(`✅ Saved: ${title} | ${structured.skills?.length || 0} skills`);
     } catch (err) {
         console.error(`❌ Failed: ${title}`, err.message);
@@ -86,15 +89,14 @@ const worker = new Worker(QUEUE_NAME, async job => {
     }
 }, {
     connection: redisConnection,
-    concurrency: 5  // 5 parallel workers
+    concurrency: 5
 });
 
 worker.on('completed', job => console.log(`✅ Job ${job.id} completed`));
 worker.on('failed', (job, err) => console.error(`❌ Job ${job.id} failed:`, err));
 
-// ─── Start ──────────────────────────────────────────────────────────────────
 (async () => {
-    await addJobsToQueue(5000); // Process 5000 jobs per run (adjust later)
+    await addJobsToQueue(5000);
     console.log(`\n🚀 Queue has ${await queue.count()} jobs. Workers running...\n`);
 })();
 

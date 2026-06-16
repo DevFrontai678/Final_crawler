@@ -13,7 +13,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.100.1",
     "@supabase/supabase-js": "^2.107.0",
-    "axios": "^1.17.0",
+    "axios": "^1.18.0",
     "bullmq": "^5.78.0",
     "cheerio": "^1.2.0",
     "csv-parse": "^6.2.1",
@@ -21,6 +21,7 @@
     "ioredis": "^5.11.1",
     "playwright": "^1.60.0",
     "scrapingbee": "^1.7.6",
+    "voyageai": "^0.4.0",
     "winston": "^3.19.0",
     "ws": "^8.21.0"
   },
