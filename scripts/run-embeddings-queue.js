@@ -20,7 +20,6 @@ const redisConnection = new Redis({
 const QUEUE_NAME = 'embedding-queue';
 const queue = new Queue(QUEUE_NAME, { connection: redisConnection });
 
-// ─── Voyage AI REST API ──────────────────────────────────────────────────────
 async function getVoyageEmbedding(text) {
     const response = await axios.post(
         'https://api.voyageai.com/v1/embeddings',
@@ -39,8 +38,8 @@ async function getVoyageEmbedding(text) {
     return response.data.data[0].embedding;
 }
 
-// ─── Queue Functions ─────────────────────────────────────────────────────────
 async function addJobsToQueue(limit = 5000) {
+    // ─── Fetch ALL jobs with skills, then filter in JS ──────────────────
     const { data: jobs, error } = await supabase
         .from('jobs')
         .select('id, structured_skills')
@@ -53,8 +52,14 @@ async function addJobsToQueue(limit = 5000) {
         return;
     }
 
-    console.log(`📋 Adding ${jobs.length} jobs to queue...`);
-    for (const job of jobs) {
+    // Filter out jobs with empty array
+    const filteredJobs = jobs.filter(job => 
+        Array.isArray(job.structured_skills) && job.structured_skills.length > 0
+    );
+
+    console.log(`📋 Found ${filteredJobs.length} jobs with skills (out of ${jobs.length} total)`);
+
+    for (const job of filteredJobs) {
         await queue.add('embed-job', {
             jobId: job.id,
             skills: job.structured_skills
@@ -63,7 +68,7 @@ async function addJobsToQueue(limit = 5000) {
             backoff: { type: 'exponential', delay: 5000 }
         });
     }
-    console.log(`✅ Added ${jobs.length} jobs to queue`);
+    console.log(`✅ Added ${filteredJobs.length} jobs to queue`);
 }
 
 const worker = new Worker(QUEUE_NAME, async job => {
@@ -89,20 +94,27 @@ const worker = new Worker(QUEUE_NAME, async job => {
             throw updateError;
         }
         console.log(`✅ Saved embedding for job ${jobId}`);
+        await new Promise(r => setTimeout(r, 20000)); // 20 sec delay for rate limit
+
     } catch (err) {
+        if (err.response?.status === 429) {
+            console.log(`⏳ Rate limit hit, waiting 60s...`);
+            await new Promise(r => setTimeout(r, 60000));
+            throw new Error('Rate limit retry');
+        }
         console.error(`❌ Failed for job ${jobId}:`, err.message);
         throw err;
     }
 }, {
     connection: redisConnection,
-    concurrency: 1
+    concurrency: 1  // Slow but safe for free tier
 });
 
 worker.on('completed', job => console.log(`✅ Job ${job.id} completed`));
 worker.on('failed', (job, err) => console.error(`❌ Job ${job.id} failed:`, err));
 
 (async () => {
-    await new Promise(r => setTimeout(r, 20000)); // 20 second delay
+    await addJobsToQueue(5000);
     console.log(`\n🚀 Queue has ${await queue.count()} jobs. Workers running...\n`);
 })();
 

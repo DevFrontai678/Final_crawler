@@ -65,8 +65,9 @@ function isJobDetailPage(url, title, pageText) {
     // Skip legal/info pages
     const skipPatterns = [
         /impressum/i, /datenschutz/i, /agb/i, /cookie/i, /privacy/i,
-        /kontakt/i, /about- us/i, /ueber-uns/i, /404/i, /not-found/i,
-        /login/i, /signin/i, /sign-in/i, /register/i
+        /kontakt/i, /about-us/i, /ueber-uns/i, /404/i, /not-found/i,
+        /login/i, /signin/i, /sign-in/i, /register/i,
+        /download/i, /pdf/i, /bilder/i, /images/i
     ];
     for (const pattern of skipPatterns) {
         if (pattern.test(url) || pattern.test(title || '')) return false;
@@ -78,7 +79,9 @@ function isJobDetailPage(url, title, pageText) {
         'aufgaben', 'anforderungen', 'ihr profil', 'wir bieten',
         'verantwortlichkeiten', 'qualifikation', 'erfahrung',
         'responsibilities', 'requirements', 'qualifications',
-        'stellen-id', 'job-id', 'job id', 'referenznummer'
+        'stellen-id', 'job-id', 'job id', 'referenznummer',
+        'ihre aufgaben', 'ihr profil', 'das bringen sie mit',
+        'was sie erwartet', 'was sie mitbringen'
     ];
     const hasJobContent = jobKeywords.some(kw => text.includes(kw));
 
@@ -88,7 +91,9 @@ function isJobDetailPage(url, title, pageText) {
         /\/vakanz\//i, /\/ausschreibung\//i,
         /\/detail\?/i, /\/apply\?/i, /\/job-details/i,
         /\/job-posting/i, /\/stellenanzeige/i,
-        /\/offene-stelle/i, /\/career-detail/i
+        /\/offene-stelle/i, /\/career-detail/i,
+        /\/job-offer/i, /\/joblisting/i,
+        /\/job-\d+/i, /\/stelle-\d+/i
     ];
     const hasDetailPattern = detailPatterns.some(p => p.test(url));
 
@@ -111,7 +116,9 @@ async function extractJobDescription(page) {
         '[class*="job-detail"]', '[class*="detail"]',
         '.job-text', '.job__text', '.description-text',
         // Common WordPress/Shopify patterns
-        '.entry-content', '.post-content', '.page-content'
+        '.entry-content', '.post-content', '.page-content',
+        // More German specific
+        '[class*="aufgaben"]', '[class*="profil"]', '[class*="anforderung"]'
     ];
 
     for (const selector of selectors) {
@@ -140,7 +147,7 @@ async function extractSkillsWithClaude(title, description) {
 
     try {
         const response = await anthropic.messages.create({
-            model: 'claude-opus-4-5', // Use your existing model
+            model: 'claude-opus-4-5',
             max_tokens: 400,
             messages: [{
                 role: 'user',
@@ -171,9 +178,9 @@ JSON array:`
         const skills = JSON.parse(clean);
         return Array.isArray(skills) ? skills.slice(0, 25) : [];
     } catch (err) {
-        if (err.message.includes('rate_limit')) {
-            console.log(`  ⏳ Rate limit hit, waiting 30s...`);
-            await new Promise(r => setTimeout(r, 30000));
+        if (err.message && err.message.includes('rate_limit')) {
+            console.log(`  ⏳ Rate limit hit, waiting 60s...`);
+            await new Promise(r => setTimeout(r, 60000));
             // Retry once
             try {
                 const retryResponse = await anthropic.messages.create({
@@ -203,10 +210,37 @@ async function pageHasJobDescription(page) {
         'aufgaben', 'anforderungen', 'ihr profil', 'wir bieten',
         'verantwortlichkeiten', 'qualifikation', 'erfahrung',
         'responsibilities', 'requirements', 'qualifications',
-        'stellen-id', 'job-id', 'referenznummer'
+        'stellen-id', 'job-id', 'referenznummer',
+        'ihre aufgaben', 'ihr profil', 'das bringen sie mit'
     ];
     const found = keywords.some(kw => text.toLowerCase().includes(kw));
     return found;
+}
+
+// ─── CHECK IF PAGE LOADS SUCCESSFULLY ──────────────────────────────────────
+async function safeGoto(page, url, timeout = 60000) {
+    try {
+        await page.goto(url, { 
+            waitUntil: 'domcontentloaded', 
+            timeout: timeout 
+        });
+        return true;
+    } catch (err) {
+        // If timeout, try one more time with longer timeout
+        if (err.message.includes('Timeout')) {
+            console.log(`  ⏳ Retry loading: ${url}`);
+            try {
+                await page.goto(url, { 
+                    waitUntil: 'domcontentloaded', 
+                    timeout: 90000 
+                });
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+        return false;
+    }
 }
 
 // ─── WORKER ──────────────────────────────────────────────────────────────────
@@ -223,7 +257,13 @@ const worker = new Worker(QUEUE_NAME, async job => {
     });
 
     try {
-        await page.goto(careerUrl, { waitUntil: 'networkidle', timeout: 30000 });
+        // ─── Load career page with retry ────────────────────────────────
+        const loaded = await safeGoto(page, careerUrl, 60000);
+        if (!loaded) {
+            console.log(`   ❌ Failed to load career page after retry`);
+            await browser.close();
+            return;
+        }
 
         // ─── Get job links with improved filtering ──────────────────────
         const jobLinks = await page.$$eval(
@@ -237,24 +277,32 @@ const worker = new Worker(QUEUE_NAME, async job => {
                     !l.href.includes('tel:') &&
                     l.href !== window.location.href &&
                     // Only job detail URLs, not listing pages
-                    !/karriere|jobs|stellenangebote|offene-stellen|jobboerse|careers|career/i.test(l.href) ||
+                    !/karriere|jobs|stellenangebote|offene-stellen|jobboerse|careers|career|bewerbung|bewerben/i.test(l.href) ||
                     /\/job\//i.test(l.href) ||
                     /\/stelle\//i.test(l.href) ||
                     /\/position\//i.test(l.href) ||
                     /\/vakanz\//i.test(l.href) ||
-                    /\/ausschreibung\//i.test(l.href)
+                    /\/ausschreibung\//i.test(l.href) ||
+                    /\/detail\?/i.test(l.href) ||
+                    /\/job-\d+/i.test(l.href)
                 )
         );
 
         // Deduplicate links
-        const uniqueLinks = [...new Map(jobLinks.map(l => [l.href, l])).values()].slice(0, 15);
+        const uniqueLinks = [...new Map(jobLinks.map(l => [l.href, l])).values()].slice(0, 20);
         console.log(`   Found ${uniqueLinks.length} job detail links`);
 
         const jobs = [];
 
         for (const link of uniqueLinks) {
             try {
-                await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                // ─── Load job page ──────────────────────────────────────
+                const jobLoaded = await safeGoto(page, link.href, 30000);
+                if (!jobLoaded) {
+                    console.log(`   ⏭️  Skipped: ${link.href.substring(0, 50)} (page load failed)`);
+                    continue;
+                }
+
                 const title = await page.title();
 
                 // Get page text for validation
