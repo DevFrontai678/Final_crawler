@@ -50,37 +50,68 @@ async function addCustomCompaniesToQueue(limit = 200) {
     }
 }
 
-// ─── CHECK IF URL IS A REAL JOB PAGE ────────────────────────────────────────
-function isLikelyJobPage(url, title) {
+// ─── CHECK IF URL IS A REAL JOB DETAIL PAGE ──────────────────────────────
+function isJobDetailPage(url, title, pageText) {
+    // Skip social media / non-job domains
+    const skipDomains = [
+        'linkedin.com', 'xing.com', 'facebook.com', 'instagram.com',
+        'twitter.com', 'youtube.com', 'google.com', 'glassdoor.com',
+        'indeed.com', 'stepstone.de', 'monster.de'
+    ];
+    for (const domain of skipDomains) {
+        if (url.includes(domain)) return false;
+    }
+
+    // Skip legal/info pages
     const skipPatterns = [
-        /linkedin\.com/i, /xing\.com/i, /facebook\.com/i, /instagram\.com/i,
-        /twitter\.com/i, /youtube\.com/i, /google\.com/i, /glassdoor\.com/i,
-        /404/i, /not-found/i, /datenschutz/i, /impressum/i,
-        /agb/i, /kontakt/i, /login/i, /signin/i, /sign-in/i,
-        /cookie/i, /privacy/i, /about-us/i, /ueber-uns/i
+        /impressum/i, /datenschutz/i, /agb/i, /cookie/i, /privacy/i,
+        /kontakt/i, /about- us/i, /ueber-uns/i, /404/i, /not-found/i,
+        /login/i, /signin/i, /sign-in/i, /register/i
     ];
     for (const pattern of skipPatterns) {
         if (pattern.test(url) || pattern.test(title || '')) return false;
     }
 
-    const jobPatterns = [
-        /job/i, /stelle/i, /career/i, /karriere/i, /vakanz/i,
-        /position/i, /bewerbung/i, /offene/i, /work/i, /ausbildung/i,
-        /praktikum/i, /werkstudent/i, /junior/i, /senior/i, /manager/i,
-        /engineer/i, /entwickler/i, /architect/i, /consultant/i
+    // Check if page has job description keywords
+    const text = (pageText || '').toLowerCase();
+    const jobKeywords = [
+        'aufgaben', 'anforderungen', 'ihr profil', 'wir bieten',
+        'verantwortlichkeiten', 'qualifikation', 'erfahrung',
+        'responsibilities', 'requirements', 'qualifications',
+        'stellen-id', 'job-id', 'job id', 'referenznummer'
     ];
-    return jobPatterns.some(p => p.test(url) || p.test(title || ''));
+    const hasJobContent = jobKeywords.some(kw => text.includes(kw));
+
+    // Check URL patterns for job detail pages
+    const detailPatterns = [
+        /\/job\//i, /\/stelle\//i, /\/position\//i,
+        /\/vakanz\//i, /\/ausschreibung\//i,
+        /\/detail\?/i, /\/apply\?/i, /\/job-details/i,
+        /\/job-posting/i, /\/stellenanzeige/i,
+        /\/offene-stelle/i, /\/career-detail/i
+    ];
+    const hasDetailPattern = detailPatterns.some(p => p.test(url));
+
+    // Must have either detail pattern OR job content
+    return hasDetailPattern || hasJobContent;
 }
 
-// ─── SMART JOB DESCRIPTION EXTRACTION ───────────────────────────────────────
+// ─── EXTRACT JOB DESCRIPTION ────────────────────────────────────────────────
 async function extractJobDescription(page) {
     const selectors = [
+        // English selectors
         '.job-description', '.job-details', '.description', '.content',
         '#job-description', '.job-content', '[class*="job-description"]',
         '[class*="job-detail"]', '[class*="description"]', 'article',
         '.main-content', '#content', '.text-content', '.post-content',
         '.entry-content', '.job__description', '.job-listing__description',
-        '[class*="stellenanzeige"]', '[class*="stelle"]', '[class*="anzeige"]'
+        '[itemprop="description"]', '[itemprop="jobDescription"]',
+        // German selectors
+        '[class*="stellenanzeige"]', '[class*="stelle"]', '[class*="anzeige"]',
+        '[class*="job-detail"]', '[class*="detail"]',
+        '.job-text', '.job__text', '.description-text',
+        // Common WordPress/Shopify patterns
+        '.entry-content', '.post-content', '.page-content'
     ];
 
     for (const selector of selectors) {
@@ -90,25 +121,26 @@ async function extractJobDescription(page) {
         } catch (e) { /* try next */ }
     }
 
-    // Fallback: filtered body text
+    // Fallback: filter body text to remove noise
     const bodyText = await page.$eval('body', el => el.innerText).catch(() => '');
     if (bodyText) {
         const lines = bodyText.split('\n')
             .map(l => l.trim())
             .filter(l => l.length > 20)
-            .filter(l => !/impressum|datenschutz|agb|cookie|footer|menu|navigation|copyright/i.test(l));
-        return lines.join('\n').slice(0, 5000);
+            .filter(l => !/impressum|datenschutz|agb|cookie|footer|menu|navigation|copyright|©|^$/.test(l));
+        const result = lines.join('\n');
+        if (result.length > 200) return result;
     }
     return '';
 }
 
-// ─── CLAUDE: EXTRACT SKILLS (GERMAN + ENGLISH) ──────────────────────────────
+// ─── CLAUDE: EXTRACT SKILLS ────────────────────────────────────────────────
 async function extractSkillsWithClaude(title, description) {
-    if (!description || description.length < 50) return [];
+    if (!description || description.length < 100) return [];
 
     try {
         const response = await anthropic.messages.create({
-            model: 'claude-opus-4-5',
+            model: 'claude-opus-4-5', // Use your existing model
             max_tokens: 400,
             messages: [{
                 role: 'user',
@@ -128,7 +160,7 @@ Return ONLY a JSON array of skill strings in English. No explanation, no markdow
 Example output: ["Python", "Docker", "AWS", "SAP", "Agile", "PostgreSQL"]
 
 Job Title: ${title}
-Job Description: ${description.slice(0, 2500)}
+Job Description: ${description.slice(0, 3000)}
 
 JSON array:`
             }]
@@ -139,12 +171,45 @@ JSON array:`
         const skills = JSON.parse(clean);
         return Array.isArray(skills) ? skills.slice(0, 25) : [];
     } catch (err) {
-        console.error('  Claude skill extraction error:', err.message);
+        if (err.message.includes('rate_limit')) {
+            console.log(`  ⏳ Rate limit hit, waiting 30s...`);
+            await new Promise(r => setTimeout(r, 30000));
+            // Retry once
+            try {
+                const retryResponse = await anthropic.messages.create({
+                    model: 'claude-opus-4-5',
+                    max_tokens: 400,
+                    messages: [{
+                        role: 'user',
+                        content: `Extract skills from job: ${title}\n${description.slice(0, 2500)}\n\nReturn JSON array only:`
+                    }]
+                });
+                const text2 = retryResponse.content[0].text.trim().replace(/```json|```/g, '');
+                const skills2 = JSON.parse(text2);
+                return Array.isArray(skills2) ? skills2.slice(0, 25) : [];
+            } catch (e) { return []; }
+        }
+        console.error(`  Claude error: ${err.message}`);
         return [];
     }
 }
 
-// ─── WORKER ─────────────────────────────────────────────────────────────────
+// ─── CHECK IF PAGE HAS JOB DESCRIPTION ────────────────────────────────────
+async function pageHasJobDescription(page) {
+    const text = await page.$eval('body', el => el.innerText).catch(() => '');
+    if (!text || text.length < 100) return false;
+
+    const keywords = [
+        'aufgaben', 'anforderungen', 'ihr profil', 'wir bieten',
+        'verantwortlichkeiten', 'qualifikation', 'erfahrung',
+        'responsibilities', 'requirements', 'qualifications',
+        'stellen-id', 'job-id', 'referenznummer'
+    ];
+    const found = keywords.some(kw => text.toLowerCase().includes(kw));
+    return found;
+}
+
+// ─── WORKER ──────────────────────────────────────────────────────────────────
 const worker = new Worker(QUEUE_NAME, async job => {
     const { companyId, companyName, careerUrl } = job.data;
     console.log(`\n🕸️  Crawling: ${companyName}`);
@@ -153,7 +218,6 @@ const worker = new Worker(QUEUE_NAME, async job => {
     const browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
 
-    // Set German browser headers to get German content
     await page.setExtraHTTPHeaders({
         'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
     });
@@ -161,7 +225,7 @@ const worker = new Worker(QUEUE_NAME, async job => {
     try {
         await page.goto(careerUrl, { waitUntil: 'networkidle', timeout: 30000 });
 
-        // Get all job links from career page
+        // ─── Get job links with improved filtering ──────────────────────
         const jobLinks = await page.$$eval(
             'a[href*="job"], a[href*="stelle"], a[href*="karriere"], a[href*="bewerbung"], a[href*="vakanz"], a[href*="offene"], a[href*="position"], a[href*="ausbildung"], a[href*="praktikum"]',
             links => links
@@ -171,12 +235,20 @@ const worker = new Worker(QUEUE_NAME, async job => {
                     !l.href.includes('#') &&
                     !l.href.includes('mailto:') &&
                     !l.href.includes('tel:') &&
-                    l.href !== window.location.href
+                    l.href !== window.location.href &&
+                    // Only job detail URLs, not listing pages
+                    !/karriere|jobs|stellenangebote|offene-stellen|jobboerse|careers|career/i.test(l.href) ||
+                    /\/job\//i.test(l.href) ||
+                    /\/stelle\//i.test(l.href) ||
+                    /\/position\//i.test(l.href) ||
+                    /\/vakanz\//i.test(l.href) ||
+                    /\/ausschreibung\//i.test(l.href)
                 )
         );
 
+        // Deduplicate links
         const uniqueLinks = [...new Map(jobLinks.map(l => [l.href, l])).values()].slice(0, 15);
-        console.log(`   Found ${uniqueLinks.length} potential job links`);
+        console.log(`   Found ${uniqueLinks.length} job detail links`);
 
         const jobs = [];
 
@@ -185,24 +257,34 @@ const worker = new Worker(QUEUE_NAME, async job => {
                 await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 15000 });
                 const title = await page.title();
 
-                // Skip bad pages
-                if (!isLikelyJobPage(link.href, title)) {
-                    console.log(`   ⏭️  Skipped: ${title?.substring(0, 50)}`);
+                // Get page text for validation
+                const pageText = await page.$eval('body', el => el.innerText).catch(() => '');
+
+                // ─── SKIP: Not a real job page ──────────────────────────
+                if (!isJobDetailPage(link.href, title, pageText)) {
+                    console.log(`   ⏭️  Skipped: ${title?.substring(0, 50)} (not a job detail page)`);
                     continue;
                 }
 
+                // ─── SKIP: No job description content ────────────────────
+                if (!await pageHasJobDescription(page)) {
+                    console.log(`   ⏭️  Skipped: ${title?.substring(0, 50)} (no description found)`);
+                    continue;
+                }
+
+                // ─── Extract description ──────────────────────────────────
                 const description = await extractJobDescription(page);
                 if (!description || description.length < 100) {
-                    console.log(`   ⚠️  Too short, skipping: ${title?.substring(0, 50)}`);
+                    console.log(`   ⏭️  Skipped: ${title?.substring(0, 50)} (description too short)`);
                     continue;
                 }
 
-                // Extract skills with Claude
+                // ─── Extract skills with Claude ──────────────────────────
                 const skills = await extractSkillsWithClaude(title, description);
 
                 const skillsDisplay = skills.length > 0
                     ? skills.slice(0, 5).join(', ') + (skills.length > 5 ? ` +${skills.length - 5} more` : '')
-                    : 'none found';
+                    : 'none';
 
                 console.log(`   ✅ ${title?.substring(0, 50)}`);
                 console.log(`      Skills (${skills.length}): ${skillsDisplay}`);
@@ -225,7 +307,7 @@ const worker = new Worker(QUEUE_NAME, async job => {
             }
         }
 
-        // Deduplicate
+        // Deduplicate jobs
         const seen = new Set();
         const uniqueJobs = jobs.filter(job => {
             const key = `${job.company_id}-${job.external_job_id}`;
@@ -244,12 +326,12 @@ const worker = new Worker(QUEUE_NAME, async job => {
             if (error) console.error('   Supabase error:', error.message);
             else console.log(`   💾 Saved ${uniqueJobs.length} jobs for ${companyName}`);
         } else {
-            console.log(`   ⚠️  No valid jobs found for ${companyName}`);
+            console.log(`   ⚠️  No valid job pages found for ${companyName}`);
         }
 
     } catch (err) {
         console.error(`❌ Crawl failed for ${companyName}: ${err.message}`);
-        throw err; // BullMQ retry ke liye
+        throw err;
     } finally {
         await browser.close();
     }
