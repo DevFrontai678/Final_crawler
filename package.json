@@ -19,6 +19,7 @@
     "csv-parse": "^6.2.1",
     "dotenv": "^17.4.2",
     "ioredis": "^5.11.1",
+    "p-limit": "^7.3.0",
     "playwright": "^1.60.0",
     "scrapingbee": "^1.7.6",
     "voyageai": "^0.4.0",
