@@ -18,7 +18,7 @@ async function matchAllCandidates(topK = 10) {
     .not('skill_embedding', 'is', null);   // ← FIXED: removed extra quote and semicolon
 
   if (candError) throw candError;
-  console.log(`📋 Found ${candidates.length} candidates with embeddings\n`);
+  console.log(`Found ${candidates.length} candidates with embeddings\n`);
 
   let totalMatches = 0;
 
