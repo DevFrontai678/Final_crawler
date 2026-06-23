@@ -3,3 +3,6 @@
 *.log
 .DS_Store
 dist/
+*.save
+*.save.*
+.env

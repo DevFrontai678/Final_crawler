@@ -24,7 +24,8 @@
     "scrapingbee": "^1.7.6",
     "voyageai": "^0.4.0",
     "winston": "^3.19.0",
-    "ws": "^8.21.0"
+    "ws": "^8.21.0",
+    "xml2js": "^0.6.2"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
