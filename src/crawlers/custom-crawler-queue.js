@@ -341,7 +341,7 @@ worker.on('completed', job => console.log(`✅ Job ${job.id} completed`));
 worker.on('failed', (job, err) => console.error(`❌ Job ${job?.id} failed: ${err.message}`));
 
 (async () => {
-    await addCustomCompaniesToQueue();
+    await addCustomCompaniesToQueue(0);
     const count = await customCrawlQueue.count();
     console.log(`\n🚀 Queue ready with ${count} companies. Workers running (concurrency: 3)...\n`);
 })();
