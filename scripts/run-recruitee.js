@@ -23,63 +23,139 @@ function detectRemoteType(description) {
     return 'onsite';
 }
 
-// ─── CUSTOM CRAWLER HELPERS ─────────────────────────────────────────────
-async function customCrawlerFetchPage(url) {
-    let browser;
-    try {
-        browser = await chromium.launch({ headless: true });
-        const page = await browser.newPage();
-        await page.setExtraHTTPHeaders({
-            'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
-        });
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-        const html = await page.content();
-        return html;
-    } catch (err) {
-        console.log(`   ⚠️ Custom crawler fetch error: ${err.message}`);
-        return null;
-    } finally {
-        if (browser) await browser.close();
+// ─── CUSTOM CRAWLER HELPERS (IMPROVED) ────────────────────────────────
+
+/**
+ * Generate a list of candidate career URLs to try for a given base domain.
+ */
+function getPotentialCareerUrls(baseUrl) {
+    const paths = [
+        '',                     // root (original URL)
+        '/careers',
+        '/jobs',
+        '/karriere',
+        '/stellenangebote',
+        '/en/careers',
+        '/en/jobs',
+        '/europe/jobs',
+        '/europe/careers',
+        '/de/karriere',
+        '/de/stellen',
+        '/company/careers',
+        '/career',
+        '/jobs/list',
+        '/open-positions',
+        '/vacancies',
+    ];
+    // Build absolute URLs, remove duplicates while preserving order
+    const urlSet = new Set();
+    const result = [];
+    for (const path of paths) {
+        try {
+            const url = new URL(path, baseUrl).href;
+            if (!urlSet.has(url)) {
+                urlSet.add(url);
+                result.push(url);
+            }
+        } catch (_) { /* ignore invalid base */ }
     }
+    return result;
 }
 
+/**
+ * Fetch a page with Playwright, using retries and a shorter timeout.
+ */
+async function customCrawlerFetchPage(url, retries = 2) {
+    let browser;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            browser = await chromium.launch({ headless: true });
+            const page = await browser.newPage();
+            await page.setExtraHTTPHeaders({
+                'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            });
+            // Use 'domcontentloaded' instead of 'networkidle' for faster response
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            // Wait a bit for any dynamic content (optional)
+            await page.waitForSelector('a[href*="job"], a[href*="career"]', { timeout: 5000 }).catch(() => {});
+            const html = await page.content();
+            return html;
+        } catch (err) {
+            console.log(`   ⚠️ Attempt ${attempt+1} failed for ${url}: ${err.message}`);
+            if (attempt === retries) break;
+            await new Promise(r => setTimeout(r, 2000 * (attempt + 1))); // exponential backoff
+        } finally {
+            if (browser) await browser.close();
+        }
+    }
+    return null;
+}
+
+/**
+ * Enhanced extraction of job links from HTML.
+ */
 function customCrawlerExtractLinks(html, baseUrl) {
     const $ = cheerio.load(html);
-    const links = [];
+    const links = new Set();
 
     const jobKeywords = [
-        'job', 'jobs', 'karriere', 'karrier', 'career', 'careers',
+        'job', 'jobs', 'karriere', 'career', 'careers',
         'stelle', 'stellen', 'stellenangebote', 'offene-stellen',
-        'vakanz', 'position', 'positionen', 'ausbildung',
-        'praktikum', 'bewerbung', 'vacancies', 'vacancy',
-        'mitarbeiter', 'fachkraft', 'führungskraft', 'leitung',
+        'vakanz', 'position', 'positionen',
+        'mitarbeiter', 'fachkraft', 'leitung',
         'entwickler', 'engineer', 'manager', 'consultant',
-        'offer', 'offers'
+        'offer', 'offers', 'apply', 'bewerben'
     ];
 
+    // Containers that typically hold job listings
+    const containers = [
+        '.jobs', '.job-list', '.career-list', '.positions',
+        '.vacancies', '.open-positions', '[class*="job"]',
+        '[class*="career"]', '[class*="position"]', 'ul li a'
+    ];
+
+    // 1. Prioritise links inside job containers
+    containers.forEach(selector => {
+        $(selector).find('a').each((_, el) => {
+            const href = $(el).attr('href');
+            const text = $(el).text().toLowerCase().trim();
+            if (href && !href.startsWith('#') && !href.includes('mailto:')) {
+                try {
+                    const full = new URL(href, baseUrl).href;
+                    if (jobKeywords.some(kw => href.includes(kw) || text.includes(kw))) {
+                        links.add(full);
+                    }
+                } catch (_) {}
+            }
+        });
+    });
+
+    // 2. Fallback: any link with matching keywords
     $('a').each((_, el) => {
         const href = $(el).attr('href');
         const text = $(el).text().toLowerCase().trim();
-        if (!href || href.includes('#') || href.includes('mailto:') || href.includes('tel:')) return;
+        if (!href || href.startsWith('#') || href.includes('mailto:') || href.includes('tel:')) return;
         const hrefLower = href.toLowerCase();
         if (jobKeywords.some(kw => hrefLower.includes(kw) || text.includes(kw))) {
-            let fullUrl = href;
-            if (!href.startsWith('http')) {
-                try {
-                    fullUrl = new URL(href, baseUrl).href;
-                } catch (e) { return; }
-            }
-            links.push(fullUrl);
+            try {
+                const full = new URL(href, baseUrl).href;
+                links.add(full);
+            } catch (_) {}
         }
     });
 
-    const unique = [...new Set(links)];
-    const filtered = unique.filter(href =>
-        !/impressum|datenschutz|agb|cookie|kontakt|about|team|news|blog|unternehmen|über-uns|karriere-übersicht/i.test(href)
+    // Filter out unwanted sections (impressum, datenschutz, etc.)
+    const filtered = [...links].filter(href =>
+        !/impressum|datenschutz|agb|cookie|kontakt|about|team|news|blog|unternehmen|über-uns/i.test(href)
     );
-    return filtered.length > 0 ? filtered.slice(0, 30) : unique.slice(0, 30);
+
+    return filtered.length ? filtered.slice(0, 50) : [...links].slice(0, 50);
 }
 
+/**
+ * Scrape a single job page for title, description, location.
+ */
 async function customCrawlerScrapeJob(url) {
     const html = await customCrawlerFetchPage(url);
     if (!html) return null;
@@ -331,48 +407,71 @@ async function processRecruiteeCompany(company) {
         }
     }
 
-    // ─── LAYER 3: CUSTOM CRAWLER FALLBACK ──────────────────────────────
+    // ─── LAYER 3: IMPROVED CUSTOM CRAWLER FALLBACK ──────────────────────
     if (jobs.length === 0) {
         console.log(`   🔄 Layer 3: Custom crawler fallback...`);
-        const html = await customCrawlerFetchPage(company.detected_career_url);
-        if (html) {
-            const links = customCrawlerExtractLinks(html, company.detected_career_url);
-            if (links.length > 0) {
-                let saved = 0;
-                for (const link of links) {
-                    if (jobs.some(j => j.apply_url === link)) continue;
-                    const jobData = await customCrawlerScrapeJob(link);
-                    if (jobData) {
-                        const id = Buffer.from(link).toString('base64').slice(0, 50);
-                        jobs.push({
-                            external_job_id: id,
-                            title: jobData.title,
-                            location: jobData.location,
-                            employment_type: null,
-                            remote_type: detectRemoteType(jobData.description),
-                            raw_description: jobData.description.slice(0, 5000),
-                            apply_url: link,
-                            ats_source: 'recruitee'
-                        });
-                        saved++;
-                    }
-                }
-                if (saved > 0) {
-                    console.log(`   ✅ Layer 3: Found ${saved} jobs via custom crawler`);
-                } else {
-                    console.log(`   ⚠️ Layer 3: No jobs found`);
-                }
-            } else {
-                console.log(`   ⚠️ Layer 3: No job links found`);
+
+        // Build a base URL from the detected career URL (or just use the domain)
+        let baseUrl;
+        try {
+            const parsed = new URL(company.detected_career_url);
+            baseUrl = parsed.origin;
+        } catch (_) {
+            // fallback: use the URL as is
+            baseUrl = company.detected_career_url;
+        }
+
+        const candidateUrls = getPotentialCareerUrls(baseUrl);
+        let found = false;
+
+        for (const url of candidateUrls) {
+            if (found) break;
+            console.log(`   🔄 Trying: ${url}`);
+            const html = await customCrawlerFetchPage(url);
+            if (!html) continue;
+
+            const links = customCrawlerExtractLinks(html, url);
+            if (links.length === 0) {
+                console.log(`   ⚠️ No job links found at ${url}`);
+                continue;
             }
-        } else {
-            console.log(`   ❌ Layer 3: Failed to fetch page`);
+
+            let saved = 0;
+            for (const link of links) {
+                if (jobs.some(j => j.apply_url === link)) continue;
+                const jobData = await customCrawlerScrapeJob(link);
+                if (jobData) {
+                    const id = Buffer.from(link).toString('base64').slice(0, 50);
+                    jobs.push({
+                        external_job_id: id,
+                        title: jobData.title,
+                        location: jobData.location,
+                        employment_type: null,
+                        remote_type: detectRemoteType(jobData.description),
+                        raw_description: jobData.description.slice(0, 5000),
+                        apply_url: link,
+                        ats_source: 'recruitee'
+                    });
+                    saved++;
+                }
+            }
+            if (saved > 0) {
+                console.log(`   ✅ Layer 3: Found ${saved} jobs via custom crawler from ${url}`);
+                found = true;
+            } else {
+                console.log(`   ⚠️ Layer 3: No jobs found at ${url}`);
+            }
+        }
+
+        if (!found) {
+            console.log(`   ❌ Layer 3: No jobs found after trying all candidate URLs`);
         }
     }
 
     return { company, slug: companySlug, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
 }
 
+// ─── MAIN ─────────────────────────────────────────────────────────────────
 async function run() {
     const { data: companies, error } = await supabase
         .from('companies')

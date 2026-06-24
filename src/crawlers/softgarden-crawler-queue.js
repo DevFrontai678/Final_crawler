@@ -20,7 +20,7 @@ const redisConnection = new Redis({
 const QUEUE_NAME = 'softgarden-crawl';
 const softgardenQueue = new Queue(QUEUE_NAME, { connection: redisConnection });
 
-// ─── ADD COMPANIES TO QUEUE WITH PAGINATION ───────────────────────────────
+// ─── ADD COMPANIES TO QUEUE ────────────────────────────────────────────────
 async function addSoftgardenCompaniesToQueue() {
     const pageSize = 1000;
     let page = 0;
@@ -58,7 +58,8 @@ async function addSoftgardenCompaniesToQueue() {
             await softgardenQueue.add('crawl-softgarden-company', {
                 companyId: company.Id,
                 companyName: company.Name,
-                careerUrl: company.detected_career_url
+                careerUrl: company.detected_career_url,
+                attempt: 1  // 🔥 Track attempt number
             }, {
                 attempts: 3,
                 backoff: { type: 'exponential', delay: 5000 }
@@ -78,39 +79,74 @@ async function addSoftgardenCompaniesToQueue() {
 
 // ─── WORKER ──────────────────────────────────────────────────────────────────
 const worker = new Worker(QUEUE_NAME, async job => {
-    const { companyId, companyName, careerUrl } = job.data;
-    console.log(`\n🕸️ Processing: ${companyName}`);
+    const { companyId, companyName, careerUrl, attempt = 1 } = job.data;
+    console.log(`\n🕸️ Processing: ${companyName} (Attempt ${attempt}/3)`);
 
     try {
         const company = { Id: companyId, Name: companyName, detected_career_url: careerUrl };
-        const result = await processSoftgardenCompany(company);
+        
+        // 🔥 isRetry = true if attempt > 1
+        const result = await processSoftgardenCompany(company, attempt > 1);
 
-        // IDs nahi milay aur fallback bhi 0 jobs — retry se faida nahi, fail mark karo
+        // 🔥 Agar shouldRetry flag hai aur attempt < 3 → retry
+        if (result.shouldRetry && attempt < 3) {
+            console.log(`   🔄 Retrying ${companyName} (Attempt ${attempt + 1}/3)...`);
+            await softgardenQueue.add('crawl-softgarden-company', {
+                companyId: companyId,
+                companyName: companyName,
+                careerUrl: careerUrl,
+                attempt: attempt + 1
+            }, {
+                attempts: 3,
+                backoff: { type: 'exponential', delay: 5000 }
+            });
+            
+            await supabase.from('crawl_logs').insert({
+                company_id: companyId,
+                status: 'retry',
+                error_message: `Retry scheduled (attempt ${attempt})`,
+                created_at: new Date()
+            });
+            console.log(`   ✅ Retry scheduled`);
+            return;
+        }
+
+        // 🔥 Agar error hai aur attempt 3 hai → custom crawler fallback already used
         if (result.error) {
+            // Check if this was a custom fallback attempt
+            if (result.usedFallback) {
+                console.log(`   ⚠️ Custom fallback also failed, marking as failed`);
+            } else {
+                console.log(`   ❌ Failed after ${attempt} attempts`);
+            }
+            
             await supabase.from('crawl_logs').insert({
                 company_id: companyId,
                 status: 'failed',
-                error_message: result.error,
+                error_message: result.error || 'Unknown error',
                 created_at: new Date()
             });
             await supabase.from('companies')
                 .update({ crawl_status: 'failed' })
                 .eq('Id', companyId);
-            console.log(`   ⚠️ No IDs found, marked as failed (no retry)`);
             return;
         }
 
-        const jobsToSave = result.jobs.map(j => ({
-            company_id: companyId,
-            external_job_id: j.external_job_id,
-            title: j.title,
-            raw_description: j.raw_description ? j.raw_description.slice(0, 5000) : null,
-            apply_url: j.apply_url,
-            ats_source: j.ats_source || 'softgarden',
-            is_active: true,
-            first_seen_at: new Date(),
-            last_seen_at: new Date()
-        }));
+        // 🔥 Success — save jobs
+        const jobsToSave = result.jobs.map((j, index) => {
+            const externalId = j.external_job_id || `fallback_${Date.now()}_${index}`;
+            return {
+                company_id: companyId,
+                external_job_id: externalId,
+                title: j.title || 'Untitled',
+                raw_description: j.raw_description ? j.raw_description.slice(0, 5000) : null,
+                apply_url: j.apply_url || null,
+                ats_source: j.ats_source || 'softgarden',
+                is_active: true,
+                first_seen_at: new Date(),
+                last_seen_at: new Date()
+            };
+        });
 
         if (jobsToSave.length > 0) {
             const { error: saveError } = await supabase
@@ -120,10 +156,21 @@ const worker = new Worker(QUEUE_NAME, async job => {
                     ignoreDuplicates: true
                 });
 
-            if (saveError) throw new Error(`Supabase save failed: ${saveError.message}`);
-            console.log(`   💾 Saved ${jobsToSave.length} jobs (source: ${result.usedFallback ? 'custom_fallback' : 'softgarden'})`);
+            if (saveError) {
+                console.error(`   ❌ Supabase save error: ${saveError.message}`);
+                throw new Error(`Supabase save failed: ${saveError.message}`);
+            }
+            
+            const sourceLabel = result.usedFallback ? 'custom_fallback' : 'softgarden';
+            console.log(`   ✅ Saved ${jobsToSave.length} jobs (source: ${sourceLabel}, attempt: ${attempt})`);
+            
+            // Check jobs without description
+            const withoutDesc = jobsToSave.filter(j => !j.raw_description || j.raw_description.length < 100);
+            if (withoutDesc.length > 0) {
+                console.log(`   ⚠️ ${withoutDesc.length} jobs saved without description`);
+            }
         } else {
-            console.log(`   ⚠️ IDs found but 0 jobs currently posted`);
+            console.log(`   ⚠️ No jobs to save`);
         }
 
         await supabase.from('crawl_logs').insert({
@@ -138,7 +185,6 @@ const worker = new Worker(QUEUE_NAME, async job => {
             .eq('Id', companyId);
 
     } catch (err) {
-        // Asli exception (network/timeout/Supabase down) — yahan throw karo taake BullMQ retry kare
         await supabase.from('crawl_logs').insert({
             company_id: companyId,
             status: 'error',

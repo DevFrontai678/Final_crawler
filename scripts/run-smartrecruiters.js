@@ -1,6 +1,9 @@
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
+const { chromium } = require('playwright');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -8,9 +11,7 @@ const supabase = createClient(
     { realtime: { transport: ws } }
 );
 
-const axios = require('axios');
-const cheerio = require('cheerio');
-
+// ─── Remote Type Detection ──────────────────────────────────────────────
 function detectRemoteType(description) {
     const text = (description || '').toLowerCase();
     if (text.includes('remote') || text.includes('homeoffice') || text.includes('100% remote') || text.includes('full remote')) {
@@ -22,6 +23,120 @@ function detectRemoteType(description) {
     return 'onsite';
 }
 
+// ─── CUSTOM CRAWLER HELPERS ──────────────────────────────────────────────
+
+// FIX 1: Browser leak fix - browser ab har attempt mein finally block mein band hoga
+async function customCrawlerFetchPage(url, retries = 2) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        let browser;
+        try {
+            browser = await chromium.launch({ headless: true });
+            const page = await browser.newPage();
+            await page.setExtraHTTPHeaders({
+                'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
+            });
+            await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+            const html = await page.content();
+            await browser.close(); // explicit close on success
+            return html;
+        } catch (err) {
+            console.log(`   ⚠️ Playwright attempt ${attempt + 1} failed: ${err.message}`);
+            if (browser) {
+                try { await browser.close(); } catch (_) {}
+            }
+            if (attempt === retries) {
+                console.log(`   🔄 Falling back to Axios for: ${url}`);
+                try {
+                    const response = await axios.get(url, {
+                        timeout: 15000,
+                        headers: { 'User-Agent': 'Mozilla/5.0' }
+                    });
+                    return response.data;
+                } catch (axiosErr) {
+                    console.log(`   ❌ Axios also failed: ${axiosErr.message}`);
+                    return null;
+                }
+            }
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    }
+    return null;
+}
+
+function customCrawlerExtractLinks(html, baseUrl) {
+    const $ = cheerio.load(html);
+    const links = [];
+
+    const jobKeywords = [
+        'job', 'jobs', 'karriere', 'karrier', 'career', 'careers',
+        'stelle', 'stellen', 'stellenangebote', 'offene-stellen',
+        'vakanz', 'position', 'positionen', 'ausbildung',
+        'praktikum', 'bewerbung', 'vacancies', 'vacancy',
+        'mitarbeiter', 'fachkraft', 'führungskraft', 'leitung',
+        'entwickler', 'engineer', 'manager', 'consultant'
+    ];
+
+    $('a').each((_, el) => {
+        const href = $(el).attr('href');
+        const text = $(el).text().toLowerCase().trim();
+        if (!href || href.includes('#') || href.includes('mailto:') || href.includes('tel:')) return;
+        const hrefLower = href.toLowerCase();
+        if (jobKeywords.some(kw => hrefLower.includes(kw) || text.includes(kw))) {
+            let fullUrl = href;
+            if (!href.startsWith('http')) {
+                try {
+                    fullUrl = new URL(href, baseUrl).href;
+                } catch (e) { return; }
+            }
+            links.push(fullUrl);
+        }
+    });
+
+    const unique = [...new Set(links)];
+    const filtered = unique.filter(href =>
+        !/impressum|datenschutz|agb|cookie|kontakt|about|team|news|blog|unternehmen|über-uns|karriere-übersicht/i.test(href)
+    );
+    return filtered.length > 0 ? filtered.slice(0, 30) : unique.slice(0, 30);
+}
+
+async function customCrawlerScrapeJob(url) {
+    const html = await customCrawlerFetchPage(url);
+    if (!html) return null;
+    const $ = cheerio.load(html);
+    const title = $('title').text().trim() || 'Untitled';
+
+    const selectors = [
+        '.job-description', '.job-details', '.description', '.content',
+        '#job-description', '.job-content', '[class*="job-description"]',
+        '[class*="job-detail"]', '[class*="description"]', 'article',
+        '.main-content', '#content', '.text-content', '.post-content',
+        '.entry-content', '.job__description', '.job-listing__description',
+        '[itemprop="description"]', '[itemprop="jobDescription"]',
+        '[class*="stellenanzeige"]', '[class*="stelle"]', '[class*="anzeige"]',
+        '[class*="aufgaben"]', '[class*="profil"]', '[class*="anforderung"]'
+    ];
+    let description = '';
+    for (const selector of selectors) {
+        const text = $(selector).text().trim();
+        if (text && text.length > 200) {
+            description = text;
+            break;
+        }
+    }
+    if (!description) {
+        description = $('body').text()
+            .split('\n')
+            .map(l => l.trim())
+            .filter(l => l.length > 20)
+            .filter(l => !/impressum|datenschutz|agb|cookie|footer|menu|navigation|copyright|©/.test(l))
+            .join('\n')
+            .slice(0, 5000);
+    }
+    const location = $('.location, .office, .city, .job-location').first().text().trim() || null;
+    return { title, description, location };
+}
+
+// ─── SmartRecruiters Processing ──────────────────────────────────────────
 async function processSmartRecruitersCompany(company) {
     console.log(`\n🔍 Processing: ${company.Name}`);
     console.log(`   URL: ${company.detected_career_url}`);
@@ -29,9 +144,10 @@ async function processSmartRecruitersCompany(company) {
     let smartDomain = null;
     let companySlug = null;
 
+    // Step 1: Try to extract slug from detected_career_url directly
     if (company.detected_career_url && company.detected_career_url.includes('smartrecruiters.com')) {
         let match = company.detected_career_url.match(/https?:\/\/([^.]+)\.careers\.smartrecruiters\.com/);
-        if (match) {
+        if (match && match[1] !== 'www') {
             companySlug = match[1];
             smartDomain = `${companySlug}.careers.smartrecruiters.com`;
         } else {
@@ -43,6 +159,7 @@ async function processSmartRecruitersCompany(company) {
         }
     }
 
+    // Step 2: If no slug yet, fetch the career page and look for SmartRecruiters references
     if (!companySlug) {
         try {
             const response = await axios.get(company.detected_career_url, {
@@ -62,7 +179,7 @@ async function processSmartRecruitersCompany(company) {
 
             if (foundUrl) {
                 let match = foundUrl.match(/https?:\/\/([^.]+)\.careers\.smartrecruiters\.com/);
-                if (match) {
+                if (match && match[1] !== 'www') {
                     companySlug = match[1];
                     smartDomain = `${companySlug}.careers.smartrecruiters.com`;
                 } else {
@@ -76,7 +193,7 @@ async function processSmartRecruitersCompany(company) {
 
             if (!companySlug && html.includes('smartrecruiters.com')) {
                 let match = html.match(/https?:\/\/([^.]+)\.careers\.smartrecruiters\.com/);
-                if (match) {
+                if (match && match[1] !== 'www') {
                     companySlug = match[1];
                     smartDomain = `${companySlug}.careers.smartrecruiters.com`;
                 } else {
@@ -92,19 +209,25 @@ async function processSmartRecruitersCompany(company) {
         }
     }
 
+    // FIX 2: Slug guess se pehle minimum length 4 karein, aur sirf meaningful words use karein
+    // "ni" jaise 2-char garbage slugs ko reject karo
     if (!companySlug) {
-        let candidate = company.Name
+        const candidate = company.Name
             .toLowerCase()
-            .replace(/[^a-z0-9]/g, '')
-            .replace(/gmbh|ag|kg|co|e\.k\./g, '')
+            .replace(/\s+/g, '')           // spaces hata do
+            .replace(/[^a-z0-9]/g, '')     // special chars hata do
+            .replace(/gmbh|ag|kg|co|ek|gmbhcokg/g, '') // legal suffixes hata do
             .trim();
-        if (candidate.length > 3) {
+
+        // FIX: minimum 4 chars required, warna slug "ni", "ag" jaise meaningless banega
+        if (candidate.length >= 4) {
             companySlug = candidate;
             smartDomain = `${companySlug}.careers.smartrecruiters.com`;
             console.log(`   ⚠️ Using guessed slug: ${companySlug}`);
         } else {
-            console.log(`   ❌ Could not find SmartRecruiters slug for ${company.Name}`);
-            return { company, jobs: [], error: 'No slug found' };
+            console.log(`   ❌ Could not find valid SmartRecruiters slug for ${company.Name} (candidate too short: "${candidate}") – skipping to custom crawler`);
+            // Slug nahi mila - seedha custom crawler pe jaao
+            return await fallbackToCustomCrawler(company);
         }
     }
 
@@ -113,6 +236,7 @@ async function processSmartRecruitersCompany(company) {
 
     const jobs = [];
 
+    // ─── LAYER 1: API ─────────────────────────────────────────────────────
     try {
         const apiUrl = `https://api.smartrecruiters.com/v1/companies/${companySlug}/jobs`;
         const response = await axios.get(apiUrl, {
@@ -136,7 +260,7 @@ async function processSmartRecruitersCompany(company) {
                 ats_source: 'smartrecruiters'
             });
         }
-        console.log(`   ✅ Found ${jobs.length} jobs via SmartRecruiters API`);
+        console.log(`   ✅ Layer 1 (API): Found ${jobs.length} jobs`);
     } catch (err) {
         if (err.response?.status === 429) {
             console.log(`   ⚠️ API rate limited (429) – waiting 10s...`);
@@ -163,12 +287,12 @@ async function processSmartRecruitersCompany(company) {
                         ats_source: 'smartrecruiters'
                     });
                 }
-                console.log(`   ✅ Found ${jobs.length} jobs via SmartRecruiters API (retry)`);
+                console.log(`   ✅ Layer 1 (API) retry: Found ${jobs.length} jobs`);
             } catch (e) {
                 console.log(`   ❌ API retry also failed: ${e.message}`);
             }
         } else if (err.response?.status === 404) {
-            console.log(`   ⚠️ SmartRecruiters API returned 404 – trying alternative endpoint...`);
+            console.log(`   ⚠️ API returned 404 – trying alternative endpoint...`);
             try {
                 const altApiUrl = `https://api.smartrecruiters.com/jobs?company=${companySlug}`;
                 const response = await axios.get(altApiUrl, {
@@ -191,17 +315,18 @@ async function processSmartRecruitersCompany(company) {
                         ats_source: 'smartrecruiters'
                     });
                 }
-                console.log(`   ✅ Found ${jobs.length} jobs via alternative SmartRecruiters API`);
+                console.log(`   ✅ Layer 1 (alt API): Found ${jobs.length} jobs`);
             } catch (e) {
                 console.log(`   ❌ Alternative API also failed: ${e.message}`);
             }
         } else {
-            console.log(`   ⚠️ SmartRecruiters API failed: ${err.message}`);
+            console.log(`   ⚠️ API failed: ${err.message}`);
         }
     }
 
+    // ─── LAYER 2: HTML Scraping ──────────────────────────────────────────
     if (jobs.length === 0) {
-        console.log(`   ⚠️ No jobs via API – falling back to HTML scraping...`);
+        console.log(`   🔄 Layer 2: HTML scraping...`);
         try {
             const pageUrl = smartDomain.startsWith('http') ? smartDomain : `https://${smartDomain}`;
             const response = await axios.get(pageUrl, {
@@ -210,6 +335,7 @@ async function processSmartRecruitersCompany(company) {
             });
             const html = response.data;
             const $ = cheerio.load(html);
+
             const jobElements = $('.job, .position, .job-item, .job-listing, [data-job-id], .job-card, .job-posting, .job-offer');
             if (jobElements.length > 0) {
                 jobElements.each((_, el) => {
@@ -220,14 +346,16 @@ async function processSmartRecruitersCompany(company) {
                     const id = $(el).attr('data-job-id') || $(el).attr('data-id') || $(el).attr('data-position-id') || String(Math.random());
                     let fullUrl = link;
                     if (link && !link.startsWith('http')) {
-                        fullUrl = new URL(link, pageUrl).href;
+                        try {
+                            fullUrl = new URL(link, pageUrl).href;
+                        } catch (e) { fullUrl = `https://${companySlug}.careers.smartrecruiters.com/jobs/${id}`; }
                     } else if (!link) {
                         fullUrl = `https://${companySlug}.careers.smartrecruiters.com/jobs/${id}`;
                     }
                     jobs.push({
                         external_job_id: id,
-                        title: title,
-                        location: location,
+                        title,
+                        location,
                         employment_type: null,
                         remote_type: detectRemoteType(description),
                         raw_description: description.slice(0, 5000),
@@ -235,7 +363,7 @@ async function processSmartRecruitersCompany(company) {
                         ats_source: 'smartrecruiters'
                     });
                 });
-                console.log(`   ✅ Found ${jobs.length} jobs via HTML scraping`);
+                console.log(`   ✅ Layer 2: Found ${jobs.length} jobs via HTML scraping`);
             } else {
                 $('script').each((_, el) => {
                     const content = $(el).html() || '';
@@ -265,17 +393,65 @@ async function processSmartRecruitersCompany(company) {
                     }
                 });
                 if (jobs.length > 0) {
-                    console.log(`   ✅ Found ${jobs.length} jobs via script JSON parsing`);
+                    console.log(`   ✅ Layer 2: Found ${jobs.length} jobs via script JSON parsing`);
                 } else {
-                    console.log(`   ⚠️ No job listings found via HTML scraping`);
+                    console.log(`   ⚠️ Layer 2: No job listings found`);
                 }
             }
         } catch (err) {
-            console.log(`   ❌ HTML scraping failed: ${err.message}`);
+            console.log(`   ❌ Layer 2 failed: ${err.message}`);
         }
     }
 
+    // ─── LAYER 3: CUSTOM CRAWLER FALLBACK (sirf tab jab Layer 1 & 2 fail ho) ──
+    if (jobs.length === 0) {
+        return await fallbackToCustomCrawler(company, jobs);
+    }
+
     return { company, slug: companySlug, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
+}
+
+// FIX 3: Custom crawler ko alag function mein nikaala - reusable aur clean
+async function fallbackToCustomCrawler(company, existingJobs = []) {
+    const jobs = [...existingJobs];
+    console.log(`   🔄 Layer 3: Custom crawler fallback...`);
+
+    const html = await customCrawlerFetchPage(company.detected_career_url);
+    if (html) {
+        const links = customCrawlerExtractLinks(html, company.detected_career_url);
+        if (links.length > 0) {
+            let saved = 0;
+            for (const link of links) {
+                if (jobs.some(j => j.apply_url === link)) continue;
+                const jobData = await customCrawlerScrapeJob(link);
+                if (jobData) {
+                    const id = Buffer.from(link).toString('base64').slice(0, 50);
+                    jobs.push({
+                        external_job_id: id,
+                        title: jobData.title,
+                        location: jobData.location,
+                        employment_type: null,
+                        remote_type: detectRemoteType(jobData.description),
+                        raw_description: jobData.description.slice(0, 5000),
+                        apply_url: link,
+                        ats_source: 'custom_crawler'   // FIX: source correctly mark karo
+                    });
+                    saved++;
+                }
+            }
+            if (saved > 0) {
+                console.log(`   ✅ Layer 3: Found ${saved} jobs via custom crawler`);
+            } else {
+                console.log(`   ⚠️ Layer 3: No jobs found`);
+            }
+        } else {
+            console.log(`   ⚠️ Layer 3: No job links found`);
+        }
+    } else {
+        console.log(`   ❌ Layer 3: Failed to fetch page`);
+    }
+
+    return { company, slug: null, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
 }
 
 async function run() {

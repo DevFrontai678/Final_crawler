@@ -70,7 +70,7 @@ function parseConfigFromHtml(html) {
   return null;
 }
 
-// ─── GLOBAL BROWSER (reused across all requests — no leak, no repeated cold-starts) ──
+// ─── GLOBAL BROWSER ──────────────────────────────────────────────────────────
 let globalBrowser = null;
 
 async function getBrowser() {
@@ -89,7 +89,7 @@ async function closeSoftgardenBrowser() {
   }
 }
 
-// ─── PLAYWRIGHT SE CONFIG NIKALO — JS RENDER KE BAAD ──────────────────────
+// ─── PLAYWRIGHT SE CONFIG NIKALO ──────────────────────────────────────────
 async function extractConfigWithPlaywright(url) {
   let context = null;
   let page = null;
@@ -125,7 +125,7 @@ async function extractConfigWithPlaywright(url) {
 
     await page.goto(url, {
       waitUntil: 'networkidle',
-      timeout: 30000
+      timeout: 60000
     });
 
     await page.waitForTimeout(2000);
@@ -185,7 +185,7 @@ async function extractConfigWithPlaywright(url) {
   }
 }
 
-// ─── URL SE CONFIG NIKALO — STATIC + PLAYWRIGHT ───────────────────────────
+// ─── URL SE CONFIG NIKALO ──────────────────────────────────────────────────
 async function extractSoftgardenConfig(url) {
   try {
     console.log(`    Static fetch: ${url}`);
@@ -206,16 +206,19 @@ async function extractSoftgardenConfig(url) {
 }
 
 // ─── KNOWN FALSE-POSITIVE SUBDOMAINS ──────────────────────────────────────
-// Softgarden career pages embed a "related jobs" widget showing OTHER
-// unrelated client companies. Add to this list as more false positives
-// get discovered (verify by opening the subdomain manually in a browser).
-const EXCLUDED_SUBDOMAINS = ['certificate', 'datagroup'];
+const EXCLUDED_SUBDOMAINS = [
+  'certificate',
+  'datagroup',
+  'commerzdirektservice',
+  'hegemann-gruppe',
+  'next'
+];
 
 function isExcludedSlug(slug) {
   return EXCLUDED_SUBDOMAINS.some(ex => slug.toLowerCase().includes(ex));
 }
 
-// ─── MAIN ID EXTRACTION — DIRECT PAGE FIRST, WIDGET-LINK FALLBACK LAST ────
+// ─── MAIN ID EXTRACTION ────────────────────────────────────────────────────
 async function extractSoftgardenIds(careerPageUrl) {
   try {
     console.log(`    Extracting from: ${careerPageUrl}`);
@@ -283,12 +286,189 @@ async function extractSoftgardenIds(careerPageUrl) {
   }
 }
 
-// ─── GENERIC FALLBACK CRAWLER (last resort — sirf jab Softgarden IDs na milein) ──
+// ─── NAYA: PUBLIC jobs.feed.json ──────────────────────────────────────────
+async function fetchJobsFeedJson(baseUrl) {
+  try {
+    const feedUrl = `${baseUrl.replace(/\/$/, '')}/jobs.feed.json`;
+    const response = await axios.get(feedUrl, {
+      timeout: 10000,
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+    });
+
+    const data = response.data;
+    let items = [];
+
+    if (data.dataFeedElement) items = data.dataFeedElement;
+    else if (data.jobs) items = data.jobs;
+    else if (data.data) items = data.data;
+
+    const map = new Map();
+
+    for (const entry of items) {
+      const job = entry.item || entry;
+      if (!job) continue;
+
+      const id = job.identifier?.value || job.id || job.jobId || job.jobPostingId;
+      if (!id) continue;
+
+      map.set(String(id), {
+        title: job.title || job.jobTitle || null,
+        raw_description: job.description || job.jobDescription || null,
+        apply_url: job.url || job.applicationUrl || job.applyUrl || null,
+        employment_type: job.employmentType || job.workTime || null,
+        location: job.location || job.jobLocation?.address?.addressLocality || job.city || null
+      });
+    }
+
+    if (map.size > 0) {
+      console.log(`    ✅ jobs.feed.json mila: ${map.size} jobs full data ke saath`);
+    }
+    return map;
+  } catch (err) {
+    return new Map();
+  }
+}
+
+// ─── DISCOVER SOFTGARDEN FEED MAP ──────────────────────────────────────────
+async function discoverSoftgardenFeedMap(careerPageUrl) {
+  let feedMap = await fetchJobsFeedJson(careerPageUrl);
+  if (feedMap.size > 0) return feedMap;
+
+  try {
+    const response = await axios.get(careerPageUrl, {
+      timeout: 15000,
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      maxRedirects: 5
+    });
+
+    const html = response.data;
+    const $ = cheerio.load(html);
+    const allLinks = [];
+    $('a, iframe, script').each((_, el) => {
+      const href = $(el).attr('href') || $(el).attr('src') || $(el).attr('data-src') || '';
+      if (href) allLinks.push(href);
+    });
+
+    for (const link of allLinks) {
+      const deMatch = link.match(/https?:\/\/([^.]+)\.career\.softgarden\.de/);
+      if (deMatch && !isExcludedSlug(deMatch[1])) {
+        const map = await fetchJobsFeedJson(`https://${deMatch[1]}.career.softgarden.de`);
+        if (map.size > 0) return map;
+      }
+      const ioMatch = link.match(/https?:\/\/([^./]+)\.softgarden\.io/);
+      if (ioMatch && !isExcludedSlug(ioMatch[1])) {
+        const map = await fetchJobsFeedJson(`https://${ioMatch[1]}.softgarden.io`);
+        if (map.size > 0) return map;
+      }
+    }
+
+    return new Map();
+
+  } catch (err) {
+    return new Map();
+  }
+}
+
+// ─── 🔥 CUSTOM FALLBACK — Direct Softgarden Job Page Scraper ──────────────
+async function customSoftgardenScraper(careerPageUrl) {
+  console.log(`    🔄 Custom Softgarden scraper fallback...`);
+
+  try {
+    const response = await axios.get(careerPageUrl, {
+      timeout: 15000,
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      maxRedirects: 5
+    });
+    const html = response.data;
+    const $ = cheerio.load(html);
+
+    const jobs = [];
+
+    // 🔥 Find Softgarden job links — "vacancies" pattern
+    $('a[href*="vacancies"], a[href*="job"], a[href*="stelle"], a[href*="karriere"], a[href*="bewerbung"]').each((_, el) => {
+      let href = $(el).attr('href');
+      if (!href) return;
+
+      // Clean up URL
+      if (!href.startsWith('http')) {
+        const baseUrl = new URL(careerPageUrl);
+        href = new URL(href, baseUrl).href;
+      }
+
+      // Softgarden link pattern check
+      if (!href.includes('softgarden')) return;
+
+      // Skip unwanted links
+      if (href.includes('login') || href.includes('register') || href.includes('imprint') || href.includes('data-security')) return;
+
+      const title = $(el).text().trim();
+      if (!title || title.length < 3) return;
+
+      // External ID from URL
+      const idMatch = href.match(/\/jobs\/(\d+)/) || href.match(/\/vacancies\/(\d+)/) || href.match(/jobId=(\d+)/);
+      const externalId = idMatch ? idMatch[1] : Buffer.from(href).toString('base64').slice(0, 30);
+
+      jobs.push({
+        external_job_id: externalId,
+        title: title,
+        raw_description: null, // Will try to fetch later
+        apply_url: href,
+        location: null,
+        employment_type: null,
+        department: null,
+        ats_source: 'custom_softgarden_scraper'
+      });
+    });
+
+    // 🔥 If no links found via href, try looking for job cards
+    if (jobs.length === 0) {
+      $('.job, .job-item, .job-card, [class*="job"], [class*="vacancy"]').each((_, el) => {
+        const link = $(el).find('a').first();
+        let href = link.attr('href');
+        if (!href) return;
+
+        if (!href.startsWith('http')) {
+          const baseUrl = new URL(careerPageUrl);
+          href = new URL(href, baseUrl).href;
+        }
+
+        if (!href.includes('softgarden')) return;
+        if (href.includes('login') || href.includes('register')) return;
+
+        const title = link.text().trim() || $(el).text().trim().split('\n')[0];
+        if (!title || title.length < 3) return;
+
+        const idMatch = href.match(/\/jobs\/(\d+)/) || href.match(/\/vacancies\/(\d+)/);
+        const externalId = idMatch ? idMatch[1] : Buffer.from(href).toString('base64').slice(0, 30);
+
+        jobs.push({
+          external_job_id: externalId,
+          title: title,
+          raw_description: null,
+          apply_url: href,
+          location: null,
+          employment_type: null,
+          department: null,
+          ats_source: 'custom_softgarden_scraper'
+        });
+      });
+    }
+
+    console.log(`    ✅ Custom scraper found ${jobs.length} jobs`);
+    return jobs;
+
+  } catch (err) {
+    console.log(`    ❌ Custom scraper failed: ${err.message}`);
+    return [];
+  }
+}
+
+// ─── GENERIC FALLBACK CRAWLER (last resort) ──────────────────────────────
 function extractJobLinksGeneric(html, baseUrl) {
   const $ = cheerio.load(html);
   const links = [];
 
-  $('a[href*="job"], a[href*="stelle"], a[href*="karriere"], a[href*="bewerbung"], a[href*="vakanz"], a[href*="offene"], a[href*="position"], a[href*="ausbildung"], a[href*="praktikum"]').each((_, el) => {
+  $('a[href*="job"], a[href*="stelle"], a[href*="karriere"], a[href*="bewerbung"], a[href*="vakanz"], a[href*="offene"], a[href*="position"], a[href*="ausbildung"], a[href*="praktikum"], a[href*="vacancies"]').each((_, el) => {
     let href = $(el).attr('href');
     if (href && !href.includes('#') && !href.includes('mailto:') && !href.includes('tel:')) {
       if (!href.startsWith('http')) {
@@ -299,14 +479,15 @@ function extractJobLinksGeneric(html, baseUrl) {
   });
 
   const filtered = links.filter(href =>
-    !/karriere|jobs|stellenangebote|offene-stellen|jobboerse|careers|career|bewerbung|bewerben/i.test(href) ||
+    !/karriere|jobs|stellenangebote|offene-stellen|jobboerse|careers|career|bewerbung|bewerben|vacancies/i.test(href) ||
     /\/job\//i.test(href) ||
     /\/stelle\//i.test(href) ||
     /\/position\//i.test(href) ||
     /\/vakanz\//i.test(href) ||
     /\/ausschreibung\//i.test(href) ||
     /\/detail\?/i.test(href) ||
-    /\/job-\d+/i.test(href)
+    /\/job-\d+/i.test(href) ||
+    /\/vacancies\//i.test(href)
   );
 
   return [...new Set(filtered)].slice(0, 20);
@@ -352,7 +533,10 @@ async function fetchHtmlForFallback(url) {
       const browser = await getBrowser();
       context = await browser.newContext();
       page = await context.newPage();
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000
+      });
       const html = await page.content();
       return html;
     } catch (playwrightErr) {
@@ -405,8 +589,48 @@ async function genericFallbackCrawl(careerPageUrl) {
   return jobs;
 }
 
+// ─── SIMPLE CONCURRENCY-LIMITED MAPPER ─────────────────────────────────────
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (index < items.length) {
+      const i = index++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
+// ─── DESCRIPTION ENRICHMENT ────────────────────────────────────────────────
+async function enrichJobDescription(job) {
+  if (job.raw_description && job.raw_description.length > 100) {
+    return job;
+  }
+
+  if (!job.apply_url) return job;
+
+  try {
+    const html = await fetchHtmlForFallback(job.apply_url);
+    if (!html) return job;
+
+    const description = extractDescriptionGeneric(html);
+    if (description && description.length > 100) {
+      job.raw_description = description.slice(0, 5000);
+    }
+  } catch (err) {
+    console.log(`      ⚠️ Could not enrich description: ${err.message}`);
+  }
+
+  return job;
+}
+
 // ─── SOFTGARDEN API SE JOBS FETCH KARO ────────────────────────────────────
-async function fetchSoftgardenJobs(userId, projectId, pageId) {
+async function fetchSoftgardenJobs(userId, projectId, pageId, feedMap = new Map()) {
   try {
     console.log(`    Fetching jobs...`);
     console.log(`    userId:    ${userId}`);
@@ -466,27 +690,36 @@ async function fetchSoftgardenJobs(userId, projectId, pageId) {
     );
 
     const data = response.data;
-    const jobs = data?.jobs || data?.jobAds || data?.data || [];
+    const rawJobs = data?.jobs || data?.jobAds || data?.data || [];
 
-    console.log(`    ✅ ${jobs.length} jobs found!`);
+    console.log(`    ✅ ${rawJobs.length} jobs found!`);
 
-    return jobs.map(job => ({
-      external_job_id: String(
-        job.jobPostingId || job.id || job.jobAdId || Math.random()
-      ),
-      title: job.jobTitle || job.title || job.name || 'Unknown',
-      location: job.location?.city ||
-                job.city ||
-                job.locationName ||
-                job.location || null,
-      employment_type: job.workTime || job.employmentType || null,
-      raw_description: job.jobDescription || job.description || null,
-      apply_url: job.applyUrl ||
-                 job.applicationUrl ||
-                 `https://pcw-api.softgarden.de/job/${job.jobPostingId}` || null,
-      department: job.category || job.department || null,
-      ats_source: 'softgarden'
-    }));
+    const jobs = rawJobs.map(job => {
+      const externalId = String(job.jobPostingId || job.id || job.jobAdId || Math.random());
+      const feedEntry = feedMap.get(externalId);
+
+      return {
+        external_job_id: externalId,
+        title: (feedEntry && feedEntry.title) || job.jobTitle || job.title || job.name || 'Unknown',
+        location: (feedEntry && feedEntry.location) ||
+                  job.location?.city || job.city || job.locationName || job.location || null,
+        employment_type: (feedEntry && feedEntry.employment_type) || job.workTime || job.employmentType || null,
+        raw_description: (feedEntry && feedEntry.raw_description) || job.jobDescription || job.description || null,
+        apply_url: (feedEntry && feedEntry.apply_url) ||
+                   job.applyUrl || job.applicationUrl ||
+                   `https://pcw-api.softgarden.de/job/${job.jobPostingId}` || null,
+        department: job.category || job.department || null,
+        ats_source: 'softgarden'
+      };
+    });
+
+    console.log(`    📄 Enriching ${jobs.length} jobs with full descriptions...`);
+    await mapWithConcurrency(jobs, 5, job => enrichJobDescription(job));
+
+    const withDescription = jobs.filter(j => j.raw_description && j.raw_description.length > 100).length;
+    console.log(`    📄 ${withDescription}/${jobs.length} jobs have usable descriptions`);
+
+    return jobs;
 
   } catch (err) {
     console.log(`    API error: ${err.message}`);
@@ -498,32 +731,60 @@ async function fetchSoftgardenJobs(userId, projectId, pageId) {
   }
 }
 
-// ─── MAIN FUNCTION — SOFTGARDEN FIRST, GENERIC FALLBACK LAST ──────────────
+// ─── MAIN FUNCTION ──────────────────────────────────────────────────────────
 async function processSoftgardenCompany(company) {
   console.log(`\n🔍 Processing: ${company.Name}`);
   console.log(`   Career URL: ${company.detected_career_url}`);
 
   const ids = await extractSoftgardenIds(company.detected_career_url);
+  const feedMap = await discoverSoftgardenFeedMap(company.detected_career_url);
 
+  // 🔥 Agar IDs nahi mile — custom Softgarden scraper try karo (new fallback)
   if (!ids) {
-    console.log(`   ⚠️ Softgarden IDs nahi milay — generic fallback try karte hain...`);
-    const fallbackJobs = await genericFallbackCrawl(company.detected_career_url);
+    console.log(`   ⚠️ Softgarden IDs nahi milay — trying custom Softgarden scraper...`);
+    const customJobs = await customSoftgardenScraper(company.detected_career_url);
+    if (customJobs.length > 0) {
+      console.log(`   ✅ Custom scraper successful: ${customJobs.length} jobs`);
+      return { company, jobs: customJobs, error: null, usedFallback: true };
+    }
 
+    console.log(`   ⚠️ Custom scraper failed — generic fallback try karte hain...`);
+    const fallbackJobs = await genericFallbackCrawl(company.detected_career_url);
     if (fallbackJobs.length > 0) {
       console.log(`   ✅ Fallback successful: ${fallbackJobs.length} jobs`);
       return { company, jobs: fallbackJobs, error: null, usedFallback: true };
     }
 
-    console.log(`   ❌ Fallback bhi fail — koi job nahi mila`);
-    return { company, jobs: [], error: 'No Softgarden IDs, fallback also returned 0 jobs' };
+    console.log(`   ❌ All fallbacks failed — koi job nahi mila`);
+    return { company, jobs: [], error: 'No Softgarden IDs, all fallbacks returned 0 jobs' };
   }
 
   console.log(`   ✅ userId:    ${ids.userId}`);
   console.log(`   ✅ projectId: ${ids.projectId}`);
   console.log(`   ✅ pageId:    ${ids.pageId || 'not found'}`);
 
-  const jobs = await fetchSoftgardenJobs(ids.userId, ids.projectId, ids.pageId);
+  const jobs = await fetchSoftgardenJobs(ids.userId, ids.projectId, ids.pageId, feedMap);
   console.log(`   📋 Total jobs: ${jobs.length}`);
+
+  // 🔥 Agar API ne 0 jobs di — custom Softgarden scraper try karo
+  if (jobs.length === 0) {
+    console.log(`   ⚠️ API returned 0 jobs — trying custom Softgarden scraper...`);
+    const customJobs = await customSoftgardenScraper(company.detected_career_url);
+    if (customJobs.length > 0) {
+      console.log(`   ✅ Custom scraper successful: ${customJobs.length} jobs`);
+      return { company, jobs: customJobs, error: null, usedFallback: true };
+    }
+
+    console.log(`   ⚠️ Custom scraper failed — generic fallback try karte hain...`);
+    const fallbackJobs = await genericFallbackCrawl(company.detected_career_url);
+    if (fallbackJobs.length > 0) {
+      console.log(`   ✅ Fallback successful: ${fallbackJobs.length} jobs`);
+      return { company, jobs: fallbackJobs, error: null, usedFallback: true };
+    }
+
+    console.log(`   ❌ All fallbacks failed — koi job nahi mila`);
+    return { company, jobs: [], error: 'API returned 0 jobs, all fallbacks returned 0 jobs' };
+  }
 
   return { company, ids, jobs, error: null };
 }
@@ -532,5 +793,6 @@ module.exports = {
   processSoftgardenCompany,
   fetchSoftgardenJobs,
   extractSoftgardenIds,
-  closeSoftgardenBrowser
+  closeSoftgardenBrowser,
+  customSoftgardenScraper   // 🔥 YEH LINE ADD KARO
 };
