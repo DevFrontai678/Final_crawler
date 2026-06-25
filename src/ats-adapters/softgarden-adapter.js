@@ -2,6 +2,39 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 require('dotenv').config();
 
+// ─── HELPER: ACCEPT COOKIES ON PAGE ──────────────────────────────────────
+async function acceptCookies(page) {
+  const cookieSelectors = [
+    'button[aria-label*="cookie"]',
+    'button[aria-label*="Cookie"]',
+    'button[id*="cookie"]',
+    'button[class*="cookie"]',
+    'button:has-text("Accept")',
+    'button:has-text("Accept all")',
+    'button:has-text("Zustimmen")',
+    'button:has-text("Alle akzeptieren")',
+    'button:has-text("OK")',
+    'a:has-text("Accept")',
+    'a:has-text("Zustimmen")',
+    '#cookie-consent-accept',
+    '.cookie-accept-button',
+    '.cookie-consent-accept',
+    '[data-cy="cookie-accept"]',
+  ];
+
+  for (const selector of cookieSelectors) {
+    try {
+      const acceptBtn = await page.locator(selector).first();
+      if (await acceptBtn.isVisible({ timeout: 1500 })) {
+        await acceptBtn.click();
+        console.log('    🍪 Accepted cookies');
+        return true;
+      }
+    } catch (e) {}
+  }
+  return false;
+}
+
 // ─── HTML SE CONFIG PARSE KARO — STATIC ───────────────────────────────────
 function parseConfigFromHtml(html) {
   const $ = cheerio.load(html);
@@ -89,6 +122,135 @@ async function closeSoftgardenBrowser() {
   }
 }
 
+// ─── FETCH HTML WITH CONTENT VALIDATION + SCRAPERAPI FALLBACK ──────────────
+async function fetchHtmlWithFallback(url) {
+  // 1. Try static axios first
+  let html = null;
+  let staticSuccess = false;
+
+  try {
+    const response = await axios.get(url, {
+      timeout: 15000,
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      maxRedirects: 5
+    });
+    html = response.data;
+    staticSuccess = true;
+  } catch (staticErr) {
+    console.log(`    ⚠️ Static failed: ${staticErr.message}`);
+  }
+
+  // Check if static HTML contains meaningful job content
+  if (staticSuccess && html) {
+    const $ = cheerio.load(html);
+    const hasJobContent = 
+      html.includes('softgarden') ||
+      html.includes('vacancies') ||
+      html.includes('job') ||
+      html.includes('karriere') ||
+      html.includes('stelle') ||
+      html.includes('bewerbung') ||
+      $('a[href*="job"]').length > 0 ||
+      $('a[href*="vacancies"]').length > 0 ||
+      $('.job, .job-item, .job-card').length > 0;
+
+    if (hasJobContent) {
+      console.log(`    ✅ Static fetch returned valid job content`);
+      return html;
+    } else {
+      console.log(`    ⚠️ Static fetch returned HTML but no job content — falling through`);
+    }
+  }
+
+  // 2. Try Playwright with cookie handling
+  let context = null;
+  let page = null;
+  try {
+    const browser = await getBrowser();
+    context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      locale: 'de-DE',
+    });
+    page = await context.newPage();
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await acceptCookies(page);
+    await page.waitForTimeout(2000);
+    const playwrightHtml = await page.content();
+
+    // Validate content again
+    const $ = cheerio.load(playwrightHtml);
+    const hasJobContent = 
+      playwrightHtml.includes('softgarden') ||
+      playwrightHtml.includes('vacancies') ||
+      playwrightHtml.includes('job') ||
+      playwrightHtml.includes('karriere') ||
+      playwrightHtml.includes('stelle') ||
+      playwrightHtml.includes('bewerbung') ||
+      $('a[href*="job"]').length > 0 ||
+      $('a[href*="vacancies"]').length > 0 ||
+      $('.job, .job-item, .job-card').length > 0;
+
+    if (hasJobContent) {
+      console.log(`    ✅ Playwright returned valid job content`);
+      return playwrightHtml;
+    } else {
+      console.log(`    ⚠️ Playwright HTML also has no job content — falling through`);
+    }
+  } catch (pwErr) {
+    console.log(`    ⚠️ Playwright failed: ${pwErr.message}`);
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+  }
+
+  // 3. 🔥 Last Resort: ScraperAPI
+  try {
+    console.log(`    🔄 Trying ScraperAPI fallback...`);
+    const apiKey = process.env.SCRAPERAPI_API_KEY;
+    if (!apiKey) {
+      console.log(`    ⚠️ SCRAPERAPI_API_KEY not set in .env`);
+      return null;
+    }
+
+    const encodedUrl = encodeURIComponent(url);
+    const apiUrl = `https://api.scraperapi.com/?api_key=${apiKey}&url=${encodedUrl}&render=true&country_code=de&premium=true`;
+    
+    const response = await axios.get(apiUrl, {
+      timeout: 30000,
+      headers: { 'Accept': 'text/html' }
+    });
+
+    if (response.status === 200 && response.data) {
+      // Validate content (ScraperAPI should render properly, but still check)
+      const $ = cheerio.load(response.data);
+      const hasJobContent = 
+        response.data.includes('softgarden') ||
+        response.data.includes('vacancies') ||
+        response.data.includes('job') ||
+        response.data.includes('karriere') ||
+        response.data.includes('stelle') ||
+        response.data.includes('bewerbung') ||
+        $('a[href*="job"]').length > 0 ||
+        $('a[href*="vacancies"]').length > 0 ||
+        $('.job, .job-item, .job-card').length > 0;
+
+      if (hasJobContent) {
+        console.log(`    ✅ ScraperAPI returned valid job content`);
+        return response.data;
+      } else {
+        console.log(`    ⚠️ ScraperAPI returned HTML but no job content`);
+        return null;
+      }
+    } else {
+      console.log(`    ⚠️ ScraperAPI returned status: ${response.status}`);
+    }
+  } catch (saErr) {
+    console.log(`    ❌ ScraperAPI failed: ${saErr.message}`);
+  }
+
+  return null;
+}
+
 // ─── PLAYWRIGHT SE CONFIG NIKALO ──────────────────────────────────────────
 async function extractConfigWithPlaywright(url) {
   let context = null;
@@ -98,7 +260,8 @@ async function extractConfigWithPlaywright(url) {
     console.log(`    Playwright launching...`);
     const browser = await getBrowser();
     context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      locale: 'de-DE',
     });
     page = await context.newPage();
 
@@ -128,6 +291,7 @@ async function extractConfigWithPlaywright(url) {
       timeout: 60000
     });
 
+    await acceptCookies(page);
     await page.waitForTimeout(2000);
 
     if (capturedConfig) return capturedConfig;
@@ -316,7 +480,8 @@ async function fetchJobsFeedJson(baseUrl) {
         raw_description: job.description || job.jobDescription || null,
         apply_url: job.url || job.applicationUrl || job.applyUrl || null,
         employment_type: job.employmentType || job.workTime || null,
-        location: job.location || job.jobLocation?.address?.addressLocality || job.city || null
+        location: job.location || job.jobLocation?.address?.addressLocality || job.city || null,
+        datePosted: job.datePosted || job.validThrough || job.dateCreated || job.publicationDate || null
       });
     }
 
@@ -369,49 +534,53 @@ async function discoverSoftgardenFeedMap(careerPageUrl) {
   }
 }
 
-// ─── 🔥 CUSTOM FALLBACK — Direct Softgarden Job Page Scraper ──────────────
+// ─── 🔥 CUSTOM SOFTGARDEN SCRAPER ──────────────────────────────────────────
 async function customSoftgardenScraper(careerPageUrl) {
   console.log(`    🔄 Custom Softgarden scraper fallback...`);
 
   try {
-    const response = await axios.get(careerPageUrl, {
-      timeout: 15000,
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      maxRedirects: 5
-    });
-    const html = response.data;
-    const $ = cheerio.load(html);
+    const html = await fetchHtmlWithFallback(careerPageUrl);
+    if (!html) {
+      console.log(`    ❌ Could not fetch page`);
+      return [];
+    }
 
+    const $ = cheerio.load(html);
     const jobs = [];
 
-    // 🔥 Find Softgarden job links — "vacancies" pattern
     $('a[href*="vacancies"], a[href*="job"], a[href*="stelle"], a[href*="karriere"], a[href*="bewerbung"]').each((_, el) => {
       let href = $(el).attr('href');
       if (!href) return;
 
-      // Clean up URL
       if (!href.startsWith('http')) {
         const baseUrl = new URL(careerPageUrl);
         href = new URL(href, baseUrl).href;
       }
 
-      // Softgarden link pattern check
       if (!href.includes('softgarden')) return;
-
-      // Skip unwanted links
       if (href.includes('login') || href.includes('register') || href.includes('imprint') || href.includes('data-security')) return;
 
       const title = $(el).text().trim();
       if (!title || title.length < 3) return;
 
-      // External ID from URL
-      const idMatch = href.match(/\/jobs\/(\d+)/) || href.match(/\/vacancies\/(\d+)/) || href.match(/jobId=(\d+)/);
-      const externalId = idMatch ? idMatch[1] : Buffer.from(href).toString('base64').slice(0, 30);
+      const titleLower = title.toLowerCase();
+      const linkLower = href.toLowerCase();
+      if (titleLower === 'stellenangebote' || 
+          titleLower === 'bereits mitarbeiter?' || 
+          titleLower.includes('abonnieren') ||
+          linkLower.includes('?1.-.jobsearch') ||
+          linkLower.includes('internallink') ||
+          linkLower.includes('jobabOlink')) {
+        return;
+      }
+
+      const idMatch = href.match(/\/job\/(\d+)/);
+      if (!idMatch) return;
 
       jobs.push({
-        external_job_id: externalId,
+        external_job_id: idMatch[1],
         title: title,
-        raw_description: null, // Will try to fetch later
+        raw_description: null,
         apply_url: href,
         location: null,
         employment_type: null,
@@ -420,7 +589,6 @@ async function customSoftgardenScraper(careerPageUrl) {
       });
     });
 
-    // 🔥 If no links found via href, try looking for job cards
     if (jobs.length === 0) {
       $('.job, .job-item, .job-card, [class*="job"], [class*="vacancy"]').each((_, el) => {
         const link = $(el).find('a').first();
@@ -435,14 +603,14 @@ async function customSoftgardenScraper(careerPageUrl) {
         if (!href.includes('softgarden')) return;
         if (href.includes('login') || href.includes('register')) return;
 
+        const idMatch = href.match(/\/job\/(\d+)/);
+        if (!idMatch) return;
+
         const title = link.text().trim() || $(el).text().trim().split('\n')[0];
         if (!title || title.length < 3) return;
 
-        const idMatch = href.match(/\/jobs\/(\d+)/) || href.match(/\/vacancies\/(\d+)/);
-        const externalId = idMatch ? idMatch[1] : Buffer.from(href).toString('base64').slice(0, 30);
-
         jobs.push({
-          external_job_id: externalId,
+          external_job_id: idMatch[1],
           title: title,
           raw_description: null,
           apply_url: href,
@@ -458,12 +626,12 @@ async function customSoftgardenScraper(careerPageUrl) {
     return jobs;
 
   } catch (err) {
-    console.log(`    ❌ Custom scraper failed: ${err.message}`);
+    console.log(`    ❌ Custom scraper error: ${err.message}`);
     return [];
   }
 }
 
-// ─── GENERIC FALLBACK CRAWLER (last resort) ──────────────────────────────
+// ─── GENERIC FALLBACK CRAWLER ──────────────────────────────────────────────
 function extractJobLinksGeneric(html, baseUrl) {
   const $ = cheerio.load(html);
   const links = [];
@@ -518,40 +686,10 @@ function extractDescriptionGeneric(html) {
   return text.length > 200 ? text : '';
 }
 
-async function fetchHtmlForFallback(url) {
-  try {
-    const response = await axios.get(url, {
-      timeout: 15000,
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      maxRedirects: 5
-    });
-    return response.data;
-  } catch (err) {
-    let context = null;
-    let page = null;
-    try {
-      const browser = await getBrowser();
-      context = await browser.newContext();
-      page = await context.newPage();
-      await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000
-      });
-      const html = await page.content();
-      return html;
-    } catch (playwrightErr) {
-      return null;
-    } finally {
-      if (page) await page.close().catch(() => {});
-      if (context) await context.close().catch(() => {});
-    }
-  }
-}
-
 async function genericFallbackCrawl(careerPageUrl) {
   console.log(`    🔄 Last resort: generic job-link scraping...`);
 
-  const html = await fetchHtmlForFallback(careerPageUrl);
+  const html = await fetchHtmlWithFallback(careerPageUrl);
   if (!html) {
     console.log(`    ❌ Fallback: could not fetch career page`);
     return [];
@@ -563,7 +701,7 @@ async function genericFallbackCrawl(careerPageUrl) {
   const jobs = [];
 
   for (const link of jobLinks) {
-    const jobHtml = await fetchHtmlForFallback(link);
+    const jobHtml = await fetchHtmlWithFallback(link);
     if (!jobHtml) continue;
 
     const $ = cheerio.load(jobHtml);
@@ -615,7 +753,7 @@ async function enrichJobDescription(job) {
   if (!job.apply_url) return job;
 
   try {
-    const html = await fetchHtmlForFallback(job.apply_url);
+    const html = await fetchHtmlWithFallback(job.apply_url);
     if (!html) return job;
 
     const description = extractDescriptionGeneric(html);
@@ -627,6 +765,70 @@ async function enrichJobDescription(job) {
   }
 
   return job;
+}
+
+// ─── PARSE JOBS FROM FEED — WITH DATE FILTER ──────────────────────────────
+function parseJobsFromFeed(data, subdomain) {
+  const MAX_DAYS = parseInt(process.env.SOFTGARDEN_MAX_DAYS_BACK) || 30;
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - MAX_DAYS);
+
+  let jobs = [];
+
+  if (data.dataFeedElement && Array.isArray(data.dataFeedElement)) {
+    jobs = data.dataFeedElement
+      .map(item => item.item || item)
+      .filter(job => job && (job.title || job.name || job.jobTitle));
+  } else if (data.jobs && Array.isArray(data.jobs)) {
+    jobs = data.jobs;
+  } else if (data.data && Array.isArray(data.data)) {
+    jobs = data.data;
+  } else if (data.jobAds && Array.isArray(data.jobAds)) {
+    jobs = data.jobAds;
+  } else if (data.jobPostings && Array.isArray(data.jobPostings)) {
+    jobs = data.jobPostings;
+  } else if (typeof data === 'object' && !Array.isArray(data)) {
+    const values = Object.values(data);
+    if (values.some(v => v && typeof v === 'object' && (v.title || v.jobTitle))) {
+      jobs = values.filter(v => v && typeof v === 'object' && (v.title || v.jobTitle));
+    }
+  }
+
+  const filtered = jobs
+    .map(job => {
+      const datePosted = job.datePosted || job.validThrough || job.dateCreated || job.publicationDate ||
+                         job.publishedDate || job.startDate || job.publishDate || job.validFrom || job.availableDate;
+      if (datePosted) {
+        const jobDate = new Date(datePosted);
+        if (jobDate < cutoffDate) {
+          console.log(`    ⏭️ Skipping old job: ${job.title || job.jobTitle} (${datePosted})`);
+          return null;
+        }
+      }
+
+      const id = job.identifier?.value || job.id || job.jobId || job.jobPostingId || Math.random().toString();
+      const title = job.title || job.jobTitle || job.name || 'Unknown';
+      const description = job.description || job.jobDescription || job.rawDescription || '';
+      const location = job.location || job.jobLocation?.address?.addressLocality || job.city || null;
+      const employmentType = job.employmentType || job.workTime || job.employment_type || null;
+      const applyUrl = job.url || job.applicationUrl || job.applyUrl || job.link ||
+        (subdomain ? `https://${subdomain}.career.softgarden.de/jobs/${id}` : null);
+
+      return {
+        external_job_id: String(id),
+        title: title,
+        location: location,
+        employment_type: employmentType,
+        raw_description: description,
+        apply_url: applyUrl,
+        department: job.category || job.department || null,
+        ats_source: 'softgarden'
+      };
+    })
+    .filter(job => job !== null);
+
+  console.log(`    ✅ ${filtered.length} recent jobs (last ${MAX_DAYS} days)`);
+  return filtered;
 }
 
 // ─── SOFTGARDEN API SE JOBS FETCH KARO ────────────────────────────────────
@@ -731,6 +933,52 @@ async function fetchSoftgardenJobs(userId, projectId, pageId, feedMap = new Map(
   }
 }
 
+// ─── HELPER: GET SUBDOMAIN ─────────────────────────────────────────────────
+async function getSoftgardenSubdomain(careerPageUrl) {
+  if (!careerPageUrl) return null;
+
+  let match = careerPageUrl.match(/https?:\/\/([^.]+)\.career\.softgarden\.(?:de|io)/);
+  if (match && !isExcludedSlug(match[1])) {
+    return match[1];
+  }
+
+  try {
+    const response = await axios.get(careerPageUrl, {
+      timeout: 15000,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    const html = response.data;
+    const $ = cheerio.load(html);
+    const links = [];
+
+    $('a, iframe, script, link').each((_, el) => {
+      const href = $(el).attr('href') || $(el).attr('src') || '';
+      if (href) links.push(href);
+    });
+
+    for (const link of links) {
+      const m = link.match(/https?:\/\/([^.]+)\.career\.softgarden\.(?:de|io)/);
+      if (m && !isExcludedSlug(m[1])) {
+        return m[1];
+      }
+      const m2 = link.match(/https?:\/\/([^.]+)\.softgarden\.io/);
+      if (m2 && !isExcludedSlug(m2[1])) {
+        return m2[1];
+      }
+    }
+
+    const domainMatch = careerPageUrl.match(/https?:\/\/(?:www\.)?([^.]+)\./);
+    if (domainMatch && domainMatch[1].toLowerCase() === 'she') {
+      return 'shejobs';
+    }
+
+  } catch (err) {
+    console.log(`   ⚠️ Subdomain scan failed: ${err.message}`);
+  }
+
+  return null;
+}
+
 // ─── MAIN FUNCTION ──────────────────────────────────────────────────────────
 async function processSoftgardenCompany(company) {
   console.log(`\n🔍 Processing: ${company.Name}`);
@@ -739,7 +987,6 @@ async function processSoftgardenCompany(company) {
   const ids = await extractSoftgardenIds(company.detected_career_url);
   const feedMap = await discoverSoftgardenFeedMap(company.detected_career_url);
 
-  // 🔥 Agar IDs nahi mile — custom Softgarden scraper try karo (new fallback)
   if (!ids) {
     console.log(`   ⚠️ Softgarden IDs nahi milay — trying custom Softgarden scraper...`);
     const customJobs = await customSoftgardenScraper(company.detected_career_url);
@@ -763,10 +1010,35 @@ async function processSoftgardenCompany(company) {
   console.log(`   ✅ projectId: ${ids.projectId}`);
   console.log(`   ✅ pageId:    ${ids.pageId || 'not found'}`);
 
-  const jobs = await fetchSoftgardenJobs(ids.userId, ids.projectId, ids.pageId, feedMap);
+  let jobs = [];
+  if (feedMap.size > 0) {
+    try {
+      const subdomain = await getSoftgardenSubdomain(company.detected_career_url);
+      if (subdomain) {
+        const feedUrl = `https://${subdomain}.career.softgarden.de/jobs.feed.json`;
+        const response = await axios.get(feedUrl, {
+          timeout: 10000,
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+        });
+        const parsedJobs = parseJobsFromFeed(response.data, subdomain);
+        if (parsedJobs.length > 0) {
+          jobs = parsedJobs;
+          console.log(`   📋 ${jobs.length} recent jobs from feed`);
+        } else {
+          console.log(`   ⚠️ No recent jobs in feed, falling back to API...`);
+        }
+      }
+    } catch (err) {
+      console.log(`   ⚠️ Feed parsing error: ${err.message}, using API...`);
+    }
+  }
+
+  if (jobs.length === 0) {
+    jobs = await fetchSoftgardenJobs(ids.userId, ids.projectId, ids.pageId, feedMap);
+  }
+
   console.log(`   📋 Total jobs: ${jobs.length}`);
 
-  // 🔥 Agar API ne 0 jobs di — custom Softgarden scraper try karo
   if (jobs.length === 0) {
     console.log(`   ⚠️ API returned 0 jobs — trying custom Softgarden scraper...`);
     const customJobs = await customSoftgardenScraper(company.detected_career_url);
@@ -783,7 +1055,7 @@ async function processSoftgardenCompany(company) {
     }
 
     console.log(`   ❌ All fallbacks failed — koi job nahi mila`);
-    return { company, jobs: [], error: 'API returned 0 jobs, all fallbacks returned 0 jobs' };
+    return { company, jobs: [], error: 'All methods returned 0 jobs' };
   }
 
   return { company, ids, jobs, error: null };
@@ -794,5 +1066,5 @@ module.exports = {
   fetchSoftgardenJobs,
   extractSoftgardenIds,
   closeSoftgardenBrowser,
-  customSoftgardenScraper   // 🔥 YEH LINE ADD KARO
+  customSoftgardenScraper
 };

@@ -58,8 +58,7 @@ async function addSoftgardenCompaniesToQueue() {
             await softgardenQueue.add('crawl-softgarden-company', {
                 companyId: company.Id,
                 companyName: company.Name,
-                careerUrl: company.detected_career_url,
-                attempt: 1  // 🔥 Track attempt number
+                careerUrl: company.detected_career_url
             }, {
                 attempts: 3,
                 backoff: { type: 'exponential', delay: 5000 }
@@ -79,60 +78,28 @@ async function addSoftgardenCompaniesToQueue() {
 
 // ─── WORKER ──────────────────────────────────────────────────────────────────
 const worker = new Worker(QUEUE_NAME, async job => {
-    const { companyId, companyName, careerUrl, attempt = 1 } = job.data;
+    const { companyId, companyName, careerUrl } = job.data;
+    const attempt = job.attemptsMade + 1;
     console.log(`\n🕸️ Processing: ${companyName} (Attempt ${attempt}/3)`);
 
     try {
         const company = { Id: companyId, Name: companyName, detected_career_url: careerUrl };
-        
-        // 🔥 isRetry = true if attempt > 1
         const result = await processSoftgardenCompany(company, attempt > 1);
 
-        // 🔥 Agar shouldRetry flag hai aur attempt < 3 → retry
-        if (result.shouldRetry && attempt < 3) {
-            console.log(`   🔄 Retrying ${companyName} (Attempt ${attempt + 1}/3)...`);
-            await softgardenQueue.add('crawl-softgarden-company', {
-                companyId: companyId,
-                companyName: companyName,
-                careerUrl: careerUrl,
-                attempt: attempt + 1
-            }, {
-                attempts: 3,
-                backoff: { type: 'exponential', delay: 5000 }
-            });
-            
-            await supabase.from('crawl_logs').insert({
-                company_id: companyId,
-                status: 'retry',
-                error_message: `Retry scheduled (attempt ${attempt})`,
-                created_at: new Date()
-            });
-            console.log(`   ✅ Retry scheduled`);
-            return;
-        }
-
-        // 🔥 Agar error hai aur attempt 3 hai → custom crawler fallback already used
         if (result.error) {
-            // Check if this was a custom fallback attempt
-            if (result.usedFallback) {
-                console.log(`   ⚠️ Custom fallback also failed, marking as failed`);
-            } else {
-                console.log(`   ❌ Failed after ${attempt} attempts`);
-            }
-            
             await supabase.from('crawl_logs').insert({
                 company_id: companyId,
                 status: 'failed',
-                error_message: result.error || 'Unknown error',
+                error_message: result.error,
                 created_at: new Date()
             });
             await supabase.from('companies')
                 .update({ crawl_status: 'failed' })
                 .eq('Id', companyId);
+            console.log(`   ❌ Failed after ${attempt} attempts`);
             return;
         }
 
-        // 🔥 Success — save jobs
         const jobsToSave = result.jobs.map((j, index) => {
             const externalId = j.external_job_id || `fallback_${Date.now()}_${index}`;
             return {
@@ -160,11 +127,10 @@ const worker = new Worker(QUEUE_NAME, async job => {
                 console.error(`   ❌ Supabase save error: ${saveError.message}`);
                 throw new Error(`Supabase save failed: ${saveError.message}`);
             }
-            
+
             const sourceLabel = result.usedFallback ? 'custom_fallback' : 'softgarden';
             console.log(`   ✅ Saved ${jobsToSave.length} jobs (source: ${sourceLabel}, attempt: ${attempt})`);
-            
-            // Check jobs without description
+
             const withoutDesc = jobsToSave.filter(j => !j.raw_description || j.raw_description.length < 100);
             if (withoutDesc.length > 0) {
                 console.log(`   ⚠️ ${withoutDesc.length} jobs saved without description`);
