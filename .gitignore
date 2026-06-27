@@ -6,3 +6,4 @@ dist/
 *.save
 *.save.*
 .env
+salesforce-lwc/server.key

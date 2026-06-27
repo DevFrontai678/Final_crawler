@@ -1,0 +1,60 @@
+<template>
+    <lightning-card title="Candidate Search" icon-name="standard:search">
+        <div class="slds-p-around_medium">
+
+            <div class="slds-grid slds-gutters slds-grid_vertical-align-end">
+                <div class="slds-col slds-size_3-of-4">
+                    <lightning-input
+                        label="MCG-ID"
+                        placeholder="MCG-XXXXXX"
+                        value={mcgId}
+                        onchange={handleInput}>
+                    </lightning-input>
+                </div>
+                <div class="slds-col slds-size_1-of-4">
+                    <lightning-button
+                        label="Suchen"
+                        variant="brand"
+                        onclick={handleSearch}
+                        disabled={isLoading}>
+                    </lightning-button>
+                </div>
+            </div>
+
+            <template if:true={isLoading}>
+                <div class="slds-m-top_medium slds-align_absolute-center">
+                    <lightning-spinner
+                        alternative-text="Loading..."
+                        size="small">
+                    </lightning-spinner>
+                </div>
+            </template>
+
+            <template if:true={errorMsg}>
+                <div class="slds-m-top_medium slds-box slds-theme_error">
+                    <p>{errorMsg}</p>
+                </div>
+            </template>
+
+            <template if:true={hasResult}>
+                <div class="slds-m-top_medium slds-box">
+                    <p class="slds-text-heading_small slds-m-bottom_small">
+                        Ergebnis:
+                    </p>
+                    <template for:each={resultFields} for:item="field">
+                        <div key={field.label}
+                            class="slds-grid slds-border_bottom slds-p-vertical_x-small">
+                            <div class="slds-col slds-size_1-of-2">
+                                <strong>{field.label}</strong>
+                            </div>
+                            <div class="slds-col slds-size_1-of-2">
+                                {field.value}
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </template>
+
+        </div>
+    </lightning-card>
+</template>

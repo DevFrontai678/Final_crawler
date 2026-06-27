@@ -1,0 +1,10 @@
+{
+  "packageDirectories": [
+    {
+      "path": "force-app",
+      "default": true
+    }
+  ],
+  "name": "candidateSearch",
+  "sourceApiVersion": "58.0"
+}
