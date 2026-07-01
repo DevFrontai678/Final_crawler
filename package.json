@@ -20,6 +20,7 @@
     "dotenv": "^17.4.2",
     "ioredis": "^5.11.1",
     "p-limit": "^7.3.0",
+    "pdf-parse": "^2.4.5",
     "playwright": "^1.60.0",
     "scrapingbee": "^1.7.6",
     "voyageai": "^0.4.0",
