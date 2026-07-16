@@ -14,6 +14,7 @@
  *   - Detailed summary with ATS distribution, HTTP status distribution, performance
  *   - Graceful shutdown (SIGINT / SIGTERM)
  *   - Dry‑run mode
+ *   - Unknown → Custom fallback (if HTML exists)
  * 
  * Usage:
  *   node scripts/run-ats-detection.js
@@ -54,7 +55,7 @@ const CONFIG = {
   cacheTTL:       3600000,
   requestTimeout: 30000,
   maxRedirects:   5,
-  pageSize:       1000,               // 🔥 PAGINATION: companies per page
+  pageSize:       1000,
   checkpointFile: path.join(__dirname, '.ats-checkpoint.json'),
 };
 
@@ -167,7 +168,6 @@ async function fetchCompanies(checkpoint = null) {
       query = query.not('Id', 'in', `(${checkpoint.processedIds.join(',')})`);
     }
 
-    // Apply limit if set
     if (CONFIG.limit > 0) {
       const remaining = CONFIG.limit - totalFetched;
       if (remaining <= 0) break;
@@ -212,14 +212,23 @@ async function batchUpsertCompanies(updates) {
     updated_at: new Date().toISOString(),
   }));
 
+  // 🔥 FIXED: onConflict uses 'id' (lowercase)
   const { error } = await supabase
     .from('companies')
-    .upsert(updateData, { onConflict: 'Id' });
+    .upsert(updateData, { onConflict: 'id' });
 
   if (error) {
+    console.error(`  ⚠️ Batch upsert error: ${error.message}`);
     // Fallback: one by one
+    console.log(`  🔄 Falling back to individual updates...`);
     for (const item of updateData) {
-      await supabase.from('companies').update(item).eq('Id', item.Id);
+      const { error: singleError } = await supabase
+        .from('companies')
+        .update(item)
+        .eq('Id', item.Id);
+      if (singleError) {
+        console.error(`    ❌ Failed to update ${item.Id}: ${singleError.message}`);
+      }
     }
   }
 }
@@ -246,7 +255,6 @@ async function processCompany(company, workerId) {
     };
   }
 
-  // Check cache for known career URL
   let cachedCareerUrl = cacheGet(cache.careerUrl, url);
   const urlToCrawl = cachedCareerUrl || url;
 
@@ -280,6 +288,14 @@ async function processCompany(company, workerId) {
         };
       }
 
+      // ─── 🔥 NEW: Convert "unknown" to "custom" if we have HTML ──────
+      if (detectionResult.ats_type === 'unknown' && fetchResult.html) {
+        detectionResult.ats_type = 'custom';
+        detectionResult.ats_confidence = Math.max(detectionResult.ats_confidence || 0, 0.5);
+        detectionResult.detection_method = 'unknown_to_custom_fallback';
+        console.log(`  [W${workerId}] ${company.Name} → unknown → custom (fallback)`);
+      }
+
       // ─── STEP 3: Merge HTTP metadata with detection ──────────────────
       const elapsed = Date.now() - startTime;
 
@@ -296,7 +312,6 @@ async function processCompany(company, workerId) {
         last_error: fetchResult.error ? fetchResult.error.message : null,
         last_error_type: fetchResult.error ? (fetchResult.error.code || fetchResult.error.name || 'Unknown') : null,
 
-        // ─── HTTP METADATA ──────────────────────────────────────────────
         career_page_http_status: fetchResult.status,
         career_page_redirects: fetchResult.redirects.length > 0 ? fetchResult.redirects : null,
         redirect_chain: fetchResult.redirects.length > 0 ? fetchResult.redirects : null,
@@ -520,7 +535,7 @@ async function printSummary(processed, results, elapsed, companies) {
 // ─── MAIN ─────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log('\n🔍 ATS Detection Runner (v5 — Paginated + Production Ready)');
+  console.log('\n🔍 ATS Detection Runner (v5 — Paginated + Unknown→Custom)');
   console.log(`   Concurrency : ${CONFIG.concurrency} workers`);
   console.log(`   Delay       : ${CONFIG.delayMs}ms`);
   console.log(`   Retries     : ${CONFIG.maxRetries}`);

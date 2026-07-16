@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 /**
  * Production‑Ready Matching & Embedding Webhook Server
- * 
- * Features:
- *   - Cache pre‑warming on startup (jobs and companies)
- *   - Concurrent request handling with custom semaphore
- *   - 60‑second timeout per request (adjustable via TIMEOUT_MS)
- *   - Detailed logging of each step
- *   - Returns career_page_url, last_crawled_at, crawl_status for each match
- *   - Improved company lookup by name (fallback when company_id missing)
+ *
+ * FIXES:
+ *   - apply_url uses job.apply_url ONLY (no fallback to career_page_url)
+ *   - top_k parameter is respected
+ *   - career_page_url is returned separately
+ *   - Improved logging for missing geolocation
+ *   - Cache TTL and concurrency configurable via .env
  */
 
 const express = require('express');
@@ -24,7 +23,7 @@ require('dotenv').config();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const MAX_CONCURRENT_MATCHES = parseInt(process.env.MAX_CONCURRENT_MATCHES || '5', 10);
-const JOB_CACHE_TTL_MS = parseInt(process.env.JOB_CACHE_TTL_MS || '300000', 10);
+const JOB_CACHE_TTL_MS = parseInt(process.env.JOB_CACHE_TTL_MS || '600000', 10); // 10 minutes
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || '60000', 10);
 
 // ─── Express app ──────────────────────────────────────────────────────
@@ -42,7 +41,7 @@ const supabase = createClient(
 // ─── Voyage AI ──────────────────────────────────────────────────────
 const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY;
 const VOYAGE_URL = 'https://api.voyageai.com/v1/embeddings';
-const VOYAGE_MODEL = 'voyage-3-large';
+const VOYAGE_MODEL = process.env.VOYAGE_MODEL || 'voyage-3-large';
 
 // ─── Custom Semaphore ──────────────────────────────────────────────
 class Semaphore {
@@ -94,22 +93,26 @@ async function getCachedJobs() {
     const jobs = [];
     let page = 0;
     const PAGE_SIZE = 1000;
-    let hasMore = true;
-    while (hasMore) {
+
+    while (true) {
         const startRow = page * PAGE_SIZE;
         const endRow = startRow + PAGE_SIZE - 1;
         const { data, error } = await supabase
             .from('jobs')
-            .select('id, title, company_id, location, location_lat, location_lng, remote_type, seniority_level, structured_skills, skill_embedding')
+            .select(
+                'id, title, company_id, company_name, apply_url, location, location_lat, location_lng, remote_type, seniority_level, structured_skills, skill_embedding'
+            )
             .not('skill_embedding', 'is', null)
             .order('id', { ascending: true })
             .range(startRow, endRow);
+
         if (error) throw error;
         if (!data || data.length === 0) break;
         jobs.push(...data);
         page++;
         if (data.length < PAGE_SIZE) break;
     }
+
     cachedJobs = jobs;
     jobsCacheTimestamp = now;
     console.log(`✅ Loaded ${jobs.length} jobs in ${Date.now() - start}ms`);
@@ -131,6 +134,7 @@ async function getCompaniesMap() {
         .from('companies')
         .select('"Id", "Name", "detected_career_url", "last_crawled_at", "crawl_status"');
     if (error) throw error;
+
     const byId = new Map();
     const byName = new Map();
     data.forEach(c => {
@@ -143,6 +147,7 @@ async function getCompaniesMap() {
         const key = c.Name.toLowerCase().trim();
         if (!byName.has(key)) byName.set(key, c);
     });
+
     companiesMap = { byId, byName };
     companiesCacheTimestamp = now;
     console.log(`✅ Loaded ${data.length} companies in ${Date.now() - start}ms`);
@@ -272,7 +277,7 @@ function extractCompanyNameFromTitle(title) {
 }
 
 // ─── Matching function ────────────────────────────────────────────────
-async function matchCandidate(candidateData, radius) {
+async function matchCandidate(candidateData, radius, topK = 10) {
     const { salesforce_contact_id, name, skill_scores, seniority_level, remote_preference, location, location_lat, location_lng } = candidateData;
 
     // 1. Check/update candidate in Supabase
@@ -337,13 +342,15 @@ async function matchCandidate(candidateData, radius) {
     }
     if (!skillEmbedding) throw new Error('Invalid candidate embedding');
 
-    // 3. Fetch jobs and companies from cache (will be fast after warm‑up)
+    // 3. Fetch jobs and companies from cache
     const jobs = await getCachedJobs();
     const companies = await getCompaniesMap();
 
     // 4. Match against jobs
     const startMatch = Date.now();
     const matches = [];
+    let missingGeolocationCount = 0;
+
     for (const job of jobs) {
         const sim = cosineSimilarity(skillEmbedding, job.skill_embedding);
         if (sim < 0.01) continue;
@@ -352,15 +359,17 @@ async function matchCandidate(candidateData, radius) {
         let include = false;
         let distance = null;
 
-        let candidateLat = location_lat;
-        let candidateLng = location_lng;
-        let jobLat = job.location_lat;
-        let jobLng = job.location_lng;
-
-        if (candidateLat && candidateLng && jobLat && jobLng) {
-            distance = haversine(candidateLat, candidateLng, jobLat, jobLng);
+        // Try to compute distance if both have coordinates
+        if (location_lat && location_lng && job.location_lat && job.location_lng) {
+            distance = haversine(location_lat, location_lng, job.location_lat, job.location_lng);
+        } else {
+            missingGeolocationCount++;
+            if (missingGeolocationCount <= 5) {
+                console.warn(`⚠️ Missing location data for job "${job.title}" (id: ${job.id}) or candidate. Distance will be NULL.`);
+            }
         }
 
+        // Decide inclusion
         if (isRemote) {
             include = true;
         } else if (distance !== null && distance <= radius) {
@@ -373,49 +382,54 @@ async function matchCandidate(candidateData, radius) {
 
         if (!include) continue;
 
-        // ─── Get company details (improved) ────────────────────────
-        let companyInfo = companies.byId.get(job.company_id);
-        let companyName = companyInfo?.Name || null;
-        let careerPageUrl = companyInfo?.career_page_url || null;
-        let lastCrawledAt = companyInfo?.last_crawled_at || null;
-        let crawlStatus = companyInfo?.crawl_status || null;
+        // ─── Company info ──────────────────────────────────────────────
+        let companyName = job.company_name || null;
+        let careerPageUrl = null;
+        let lastCrawledAt = null;
+        let crawlStatus = null;
 
-        // If not found by ID, try by extracted name
+        if (job.company_id) {
+            const companyInfo = companies.byId.get(job.company_id);
+            if (companyInfo) {
+                if (!companyName) companyName = companyInfo.Name || null;
+                careerPageUrl = companyInfo.career_page_url || null;
+                lastCrawledAt = companyInfo.last_crawled_at || null;
+                crawlStatus = companyInfo.crawl_status || null;
+            }
+        }
+
+        // Fallback: try to extract company from title
         if (!companyName) {
             const extracted = extractCompanyNameFromTitle(job.title);
             if (extracted) {
                 const key = extracted.toLowerCase().trim();
                 let matched = companies.byName.get(key);
+                if (!matched) {
+                    const cleanKey = key.replace(/\s*(gmbh|ag|kg|se|e\.v\.|ug|gbr|ohg)\s*$/, '').trim();
+                    if (cleanKey !== key) matched = companies.byName.get(cleanKey);
+                }
                 if (matched) {
                     companyName = matched.Name;
-                    careerPageUrl = matched.detected_career_url || null;
-                    lastCrawledAt = matched.last_crawled_at || null;
-                    crawlStatus = matched.crawl_status || null;
-                    console.log(`   🔍 Found company by name: "${companyName}" for job "${job.title}"`);
-                } else {
-                    // Try partial match (remove GmbH etc.)
-                    const cleanKey = key.replace(/\s*(gmbh|ag|kg|se|e\.v\.|ug|gbr|ohg)\s*$/, '').trim();
-                    if (cleanKey !== key) {
-                        const partialMatch = companies.byName.get(cleanKey);
-                        if (partialMatch) {
-                            companyName = partialMatch.Name;
-                            careerPageUrl = partialMatch.detected_career_url || null;
-                            lastCrawledAt = partialMatch.last_crawled_at || null;
-                            crawlStatus = partialMatch.crawl_status || null;
-                            console.log(`   🔍 Found company by partial match: "${companyName}" for job "${job.title}"`);
-                        }
-                    }
+                    careerPageUrl = careerPageUrl || matched.detected_career_url || null;
+                    lastCrawledAt = lastCrawledAt || matched.last_crawled_at || null;
+                    crawlStatus = crawlStatus || matched.crawl_status || null;
+                    console.log(`   🔍 Fallback name match: "${companyName}" for job "${job.title}"`);
                 }
             }
         }
 
+        // ─── FIX: apply_url uses job's own URL ONLY (no fallback) ─────
+        const applyUrl = job.apply_url || null;
+
         const topSkills = (job.structured_skills || []).slice(0, 5).join(', ');
+
         matches.push({
             job_id: job.id,
             job_title: job.title || 'Untitled',
             company_id: job.company_id,
             company_name: companyName,
-            career_page_url: careerPageUrl,
+            apply_url: applyUrl,                     // Job's own apply URL (or null)
+            career_page_url: careerPageUrl,          // Company's career page (separate)
             last_crawled_at: lastCrawledAt,
             crawl_status: crawlStatus,
             location: job.location,
@@ -428,11 +442,16 @@ async function matchCandidate(candidateData, radius) {
         });
     }
 
+    if (missingGeolocationCount > 0) {
+        console.warn(`⚠️ ${missingGeolocationCount} jobs had missing location coordinates. Distance filter may be inaccurate.`);
+        console.warn(`   Please run geocoding scripts: node scripts/geocode-jobs.js and node scripts/geocode-candidates.js`);
+    }
+
     matches.sort((a, b) => b.similarity_score - a.similarity_score);
-    const topMatches = matches.slice(0, 10);
+    const topMatches = matches.slice(0, topK);   // ✅ Respect topK
     console.log(`⏱️ Matching loop took ${Date.now() - startMatch}ms for ${jobs.length} jobs`);
 
-    // 5. Store matches (optional, but keep)
+    // 5. Store matches
     if (topMatches.length > 0) {
         await supabase
             .from('matches')
@@ -446,6 +465,8 @@ async function matchCandidate(candidateData, radius) {
             location_distance_km: m.location_distance_km,
             final_score: m.final_score,
             company_name: m.company_name,
+            apply_url: m.apply_url || null,
+            career_page_url: m.career_page_url || null,
             job_title: m.job_title,
             job_location: m.location,
             remote_type: m.remote_type,
@@ -502,7 +523,7 @@ app.post('/webhook/match-candidate', async (req, res) => {
             location,
             location_lat,
             location_lng
-        }, radius));
+        }, radius, top_k));   // ✅ top_k passed
 
         const result = await Promise.race([
             matchPromise,
