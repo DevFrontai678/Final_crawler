@@ -4,7 +4,12 @@
 # Runs every 48 hours via cron
 # SEQUENTIAL — each step waits for the previous to complete
 # ✅ INCLUDES: Reset ALL companies to 'pending' at the start
+# ✅ FIXED: Custom crawler processes all pending companies
+# ✅ REMOVED: run-google-jobs-candidate.js (not needed)
+# ✅ REMOVED: run-job-structuring-queue.js (use worker only)
 # ============================================================================
+
+set -e
 
 PROJECT_DIR="/home/customer-matching-crawler"
 LOG_DIR="$PROJECT_DIR/logs"
@@ -51,8 +56,9 @@ run_script() {
         log "✅ Completed: $script_name"
         return 0
     else
-        log "❌ Failed: $script_name (exit code: $?)"
-        return 1
+        local exit_code=$?
+        log "❌ Failed: $script_name (exit code: $exit_code)"
+        return $exit_code
     fi
 }
 
@@ -223,15 +229,14 @@ run_script "src/crawlers/softgarden-crawler-queue.js"
 # ─── STEP 6: Custom Crawler ──────────────────────────────────────────────
 run_script "src/crawlers/custom-crawler-queue.js"
 
-# ─── STEP 7: Google Jobs ──────────────────────────────────────────────────
+# ─── STEP 7: Google Jobs (Company-Based ONLY) ────────────────────────────
 run_script "scripts/run-google-jobs.js --concurrency 3 --resume"
-run_script "scripts/run-google-jobs-candidate.js --concurrency 3 --resume"
 
-# ─── STEP 8: Backfill + Geocode ───────────────────────────────────────────
+# ─── STEP 8: Backfill + Geocode ──────────────────────────────────────────
 run_script "scripts/backfill-locations-google.js"
 run_script "scripts/geocode-jobs.js"
 
-# ─── STEP 9: Job Structuring ──────────────────────────────────────────────
+# ─── STEP 9: Job Structuring (WORKER ONLY) ──────────────────────────────
 run_script "scripts/run-job-structuring-worker.js"
 
 # ─── STEP 10: Job Embeddings ──────────────────────────────────────────────
