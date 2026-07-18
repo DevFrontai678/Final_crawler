@@ -1,6 +1,7 @@
 /**
  * ============================================================================
  * PRODUCTION CUSTOM CRAWLER v15 - EXACT CITY EXTRACTION
+ * (Modified: Removed Anthropic, added built‑in skill extraction)
  * ============================================================================
  * FIXES:
  *   ✅ Location: extracts ONLY city name (e.g., "Worms" from "Lebenshilfe Worms")
@@ -15,7 +16,6 @@ const Redis = require('ioredis');
 const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
-const Anthropic = require('@anthropic-ai/sdk');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -45,7 +45,7 @@ const CONFIG = {
     QUEUE_POLL_INTERVAL_MS: 5000,
     RATE_LIMIT_MAX: parseInt(process.env.CRAWLER_RATE_LIMIT_MAX || '5', 10),
     RATE_LIMIT_DURATION_MS: parseInt(process.env.CRAWLER_RATE_LIMIT_DURATION_MS || '1000', 10),
-    SKILL_EXTRACTION_MODEL: process.env.SKILL_EXTRACTION_MODEL || 'claude-haiku-4-5-20251001',
+    // Removed SKILL_EXTRACTION_MODEL
     BATCH_INSERT_SIZE: 50,
     RETRY_EXTRACTION_ATTEMPTS: 3,
     PAGINATION_MAX_PAGES: 50,
@@ -151,15 +151,13 @@ const STOPWORDS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// CLIENTS
+// CLIENTS (Anthropic removed)
 // ---------------------------------------------------------------------------
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
     { realtime: { transport: ws } }
 );
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const redisConnection = new Redis({
     host: process.env.REDIS_HOST || 'localhost',
@@ -867,28 +865,73 @@ function cleanDescription(text) {
     return text.slice(0, 5000);
 }
 
-// ─── SKILL EXTRACTION ──────────────────────────────────────────────────────
-async function extractSkillsWithClaude(title, description) {
+// ─── 🔧 REPLACED SKILL EXTRACTION – NO ANTHROPIC ──────────────────────
+/**
+ * Extract skills using a curated list of common tech/professional terms.
+ * Returns an array of unique skill names (up to 25).
+ */
+function extractSkillsBuiltin(title, description) {
     if (!description || description.length < 100) return [];
-    try {
-        const response = await anthropic.messages.create({
-            model: CONFIG.SKILL_EXTRACTION_MODEL,
-            max_tokens: 400,
-            messages: [{
-                role: 'user',
-                content: `Extract only technical and professional skills from this job posting. Return ONLY a JSON array of skills in English.
-Job Title: ${title}
-Description: ${description.slice(0, 3000)}
-Return ONLY JSON array:`
-            }]
-        });
-        const text = response.content[0].text.trim().replace(/```json|```/g, '');
-        const skills = JSON.parse(text);
-        return Array.isArray(skills) ? skills.slice(0, 25) : [];
-    } catch (err) {
-        console.log(`[SKILLS] Extraction failed: ${err.message}`);
-        return [];
+
+    // Predefined list of skills (programming languages, frameworks, tools, etc.)
+    const skillKeywords = [
+        // Programming languages
+        'javascript', 'typescript', 'python', 'java', 'c#', 'c++', 'php', 'ruby', 'go', 'rust',
+        'swift', 'kotlin', 'scala', 'perl', 'r', 'matlab', 'dart', 'lua', 'haskell', 'elixir',
+        'clojure', 'groovy', 'objective-c', 'vba', 'sql', 'nosql', 'graphql',
+        // Web frameworks & libraries
+        'react', 'angular', 'vue', 'node.js', 'express', 'django', 'flask', 'spring', 'spring boot',
+        'asp.net', 'ruby on rails', 'laravel', 'symfony', 'jquery', 'bootstrap', 'tailwind',
+        'sass', 'less', 'webpack', 'babel', 'redux', 'mobx', 'next.js', 'nuxt', 'gatsby',
+        'ember', 'backbone', 'meteor', 'svelte', 'solidjs', 'qwik',
+        // Data & ML
+        'tensorflow', 'pytorch', 'keras', 'scikit-learn', 'pandas', 'numpy', 'matplotlib',
+        'seaborn', 'jupyter', 'spark', 'hadoop', 'airflow', 'mlflow', 'kubeflow', 'databricks',
+        'bigquery', 'redshift', 'snowflake', 'looker', 'tableau', 'power bi',
+        // DevOps & Cloud
+        'aws', 'azure', 'gcp', 'docker', 'kubernetes', 'jenkins', 'gitlab ci', 'github actions',
+        'circleci', 'terraform', 'ansible', 'chef', 'puppet', 'prometheus', 'grafana', 'elk',
+        'elasticsearch', 'logstash', 'kibana', 'splunk', 'datadog', 'new relic', 'istio', 'envoy',
+        'consul', 'vault', 'cloudformation', 'cdk', 'serverless', 'lambda', 'ec2', 's3', 'rds',
+        // Databases
+        'postgresql', 'mysql', 'mongodb', 'redis', 'cassandra', 'dynamodb', 'firestore',
+        'cockroachdb', 'timescaledb', 'influxdb', 'neo4j', 'elasticsearch',
+        // Methodologies & Practices
+        'agile', 'scrum', 'kanban', 'waterfall', 'devops', 'ci/cd', 'tdd', 'bdd', 'pair programming',
+        'code review', 'documentation', 'microservices', 'api design', 'rest', 'graphql',
+        'event-driven', 'domain-driven design', 'clean code', 'refactoring', 'security',
+        // Soft skills (often listed)
+        'leadership', 'communication', 'teamwork', 'problem solving', 'critical thinking',
+        'time management', 'adaptability', 'creativity', 'emotional intelligence',
+        'project management', 'planning', 'organization', 'coaching', 'mentoring',
+        // German specific
+        'agil', 'kanban', 'scrum', 'devops', 'docker', 'kubernetes', 'cloud', 'azure', 'aws',
+        'react', 'angular', 'vue', 'java', 'python', 'php', 'javascript', 'typescript',
+        'spring', 'django', 'laravel', 'symfony', 'postgresql', 'mysql', 'mongodb',
+        'leadership', 'führung', 'projektmanagement', 'kommunikation', 'teamwork',
+        // Other common technical terms
+        'git', 'svn', 'mercurial', 'vim', 'emacs', 'intellij', 'eclipse', 'vscode',
+        'api', 'rest', 'soap', 'oauth', 'jwt', 'saml', 'ldap', 'active directory',
+        'ci', 'cd', 'automation', 'scripting', 'linux', 'unix', 'windows', 'macos',
+        'ios', 'android', 'mobile', 'flutter', 'react native', 'xamarin', 'cordova',
+        'webassembly', 'wasm', 'rust', 'assembly', 'arduino', 'raspberry pi',
+        // Additional frameworks
+        'symfony', 'drupal', 'wordpress', 'typo3', 'joomla', 'shopware', 'magento',
+        'salesforce', 'sap', 'oracle', 'peoplesoft', 'dynamics', 'workday'
+    ];
+
+    const text = (title + ' ' + description).toLowerCase();
+    const found = new Set();
+
+    // Check each keyword, including multi-word phrases
+    for (const keyword of skillKeywords) {
+        if (text.includes(keyword.toLowerCase())) {
+            found.add(keyword);
+        }
     }
+
+    // Convert to array, limit to 25, and return
+    return Array.from(found).slice(0, 25);
 }
 
 // ─── DEDUPLICATION ──────────────────────────────────────────────────────────
@@ -1025,7 +1068,8 @@ async function processCompany(job) {
             if (seenInThisRun.has(externalJobId)) continue;
             seenInThisRun.add(externalJobId);
 
-            const skills = await extractSkillsWithClaude(title, description);
+            // Use built-in skill extractor instead of Claude
+            const skills = extractSkillsBuiltin(title, description);
 
             candidateJobs.push({
                 company_id: companyId,
@@ -1307,7 +1351,7 @@ function printSummary() {
 
 // ─── MAIN ──────────────────────────────────────────────────────────────────
 async function runCrawler() {
-    console.log('[START] Production Crawler v15 - EXACT CITY EXTRACTION');
+    console.log('[START] Production Crawler v15 - EXACT CITY EXTRACTION (no Anthropic)');
     console.log(`[CONFIG] Concurrency: ${CONFIG.CONCURRENCY} | Job timeout: ${CONFIG.JOB_TIMEOUT_MS}ms`);
 
     await resetStuckCompanies();

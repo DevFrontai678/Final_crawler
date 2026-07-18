@@ -4,6 +4,7 @@ const ws = require('ws');
 const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const crypto = require('crypto');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -11,7 +12,16 @@ const supabase = createClient(
     { realtime: { transport: ws } }
 );
 
-// ─── Remote Type Detection ──────────────────────────────────────────────
+// ─── HELPER: generate external_hash ──────────────────────────────────────
+function generateExternalHash(companyId, externalJobId) {
+    if (!companyId || !externalJobId) return null;
+    return crypto.createHash('sha256')
+        .update(`${companyId}:${externalJobId}`)
+        .digest('hex')
+        .slice(0, 64);
+}
+
+// ─── REMOTE TYPE DETECTION ──────────────────────────────────────────────
 function detectRemoteType(description) {
     const text = (description || '').toLowerCase();
     if (text.includes('remote') || text.includes('homeoffice') || text.includes('100% remote') || text.includes('full remote')) {
@@ -31,7 +41,7 @@ function isSkipFile(url) {
     return SKIP_EXTENSIONS.some(ext => lower.endsWith(ext) || lower.includes(ext + '?'));
 }
 
-// ─── SELF‑HEALING BROWSER INSTANCE ─────────────────────────────────────
+// ─── SELF‑HEALING BROWSER ──────────────────────────────────────────────
 let browserInstance = null;
 let browserInitPromise = null;
 
@@ -53,52 +63,52 @@ async function getBrowser() {
     return browserInitPromise;
 }
 
-// ─── OPTIMIZED CUSTOM CRAWLER ──────────────────────────────────────────
+// ─── OPTIMIZED FETCH ──────────────────────────────────────────────────
 async function customCrawlerFetchPage(url) {
     if (isSkipFile(url)) {
         console.log(`   ⏭️ Skipping non-HTML file: ${url}`);
         return null;
     }
 
-    // 1️⃣ Try Axios (fast)
     try {
         const response = await axios.get(url, {
             timeout: 10000,
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
         const contentType = response.headers['content-type'] || '';
-        if (contentType.includes('html') || response.data.length > 100) {
+        if (contentType.includes('html') && response.data.length > 1000) {
+            console.log(`   ✅ Fetched via Axios (${response.data.length} chars)`);
             return response.data;
         }
+        console.log(`   ⚠️ Axios returned empty or non-HTML, trying Playwright...`);
     } catch (axiosErr) {
-        if (axiosErr.code === 'ECONNREFUSED' || axiosErr.code === 'ENOTFOUND' || axiosErr.code === 'ETIMEDOUT') {
-            console.log(`   ⚠️ Network error (${axiosErr.code}) – skipping Playwright`);
-            return null;
-        }
-        console.log(`   ⚠️ Axios failed: ${axiosErr.message} – trying Playwright...`);
+        console.log(`   ⚠️ Axios failed: ${axiosErr.message}, trying Playwright...`);
     }
 
-    // 2️⃣ Fallback to Playwright
     try {
         const browser = await getBrowser();
         const page = await browser.newPage();
         await page.setExtraHTTPHeaders({
             'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
         });
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await page.goto(url, { waitUntil: 'networkidle', timeout: 20000 });
         const html = await page.content();
         await page.close();
-        return html;
+        if (html && html.length > 1000) {
+            console.log(`   ✅ Fetched via Playwright (${html.length} chars)`);
+            return html;
+        }
+        console.log(`   ⚠️ Playwright returned empty page`);
     } catch (pwErr) {
         console.log(`   ❌ Playwright failed: ${pwErr.message}`);
         if (pwErr.message.includes('closed') || pwErr.message.includes('Target page')) {
             browserInstance = null;
         }
-        return null;
     }
+    return null;
 }
 
-// ─── EXTRACT JOB LINKS – NO LIMIT (capped at 500 for safety) ──────────
+// ─── EXTRACT JOB LINKS ──────────────────────────────────────────────────
 function customCrawlerExtractLinks(html, baseUrl) {
     const $ = cheerio.load(html);
     const links = [];
@@ -110,7 +120,7 @@ function customCrawlerExtractLinks(html, baseUrl) {
         'praktikum', 'bewerbung', 'vacancies', 'vacancy',
         'mitarbeiter', 'fachkraft', 'führungskraft', 'leitung',
         'entwickler', 'engineer', 'manager', 'consultant',
-        'concludis', 'concludis-job'
+        'concludis', 'concludis-job', 'bewirb', 'join-us'
     ];
 
     $('a').each((_, el) => {
@@ -134,7 +144,6 @@ function customCrawlerExtractLinks(html, baseUrl) {
     const filtered = unique.filter(href =>
         !/impressum|datenschutz|agb|cookie|kontakt|about|team|news|blog|unternehmen|über-uns|karriere-übersicht/i.test(href)
     );
-    // ✅ NO LIMIT – return all, but cap at 500 to avoid memory issues (effectively unlimited)
     return filtered.length > 0 ? filtered.slice(0, 500) : unique.slice(0, 500);
 }
 
@@ -153,9 +162,8 @@ async function customCrawlerScrapeJob(url) {
         '.main-content', '#content', '.text-content', '.post-content',
         '.entry-content', '.job__description', '.job-listing__description',
         '[itemprop="description"]', '[itemprop="jobDescription"]',
-        '[class*="stellenanzeige"]', '[class*="stelle"]', '[class*="anzeige"]',
-        '[class*="aufgaben"]', '[class*="profil"]', '[class*="anforderung"]',
-        '.concludis-job-description', '.concludis-description'
+        '.concludis-job-description', '.concludis-description',
+        '.vacancy-description', '.job-description__text'
     ];
     let description = '';
     for (const selector of selectors) {
@@ -174,11 +182,31 @@ async function customCrawlerScrapeJob(url) {
             .join('\n')
             .slice(0, 5000);
     }
-    const location = $('.location, .office, .city, .job-location').first().text().trim() || null;
+
+    const locationSelectors = [
+        '.location', '.office', '.city', '.job-location',
+        '[itemprop="jobLocation"]', '.address', '.place',
+        '[class*="location"]', '[class*="office"]', '[class*="city"]',
+        '.job-location__text', '.vacancy-location'
+    ];
+    let location = null;
+    for (const sel of locationSelectors) {
+        const text = $(sel).text().trim();
+        if (text && text.length > 1 && text.length < 100) {
+            location = text;
+            break;
+        }
+    }
+    if (!location) {
+        const bodyText = $('body').text();
+        const match = bodyText.match(/(?:Ort|Standort|Location):\s*([^\n\r]+)/i);
+        if (match) location = match[1].trim();
+    }
+
     return { title, description, location };
 }
 
-// ─── PROCESS ONE COMPANY ──────────────────────────────────────────────
+// ─── PROCESS ONE CONCLUDIS COMPANY ────────────────────────────────────
 async function processConcludisCompany(company) {
     console.log(`\n🔍 Processing: ${company.Name}`);
     console.log(`   URL: ${company.detected_career_url}`);
@@ -186,7 +214,7 @@ async function processConcludisCompany(company) {
     let concludisDomain = null;
     let companySlug = null;
 
-    // ─── Detect slug from URL or page ────────────────────────────────
+    // ─── Detect slug from URL ──────────────────────────────────────────
     if (company.detected_career_url && company.detected_career_url.includes('concludis.de')) {
         let match = company.detected_career_url.match(/https?:\/\/([^.]+)\.concludis\.de/);
         if (match && match[1] !== 'www') {
@@ -306,10 +334,11 @@ async function processConcludisCompany(company) {
             }
             for (const item of items) {
                 const description = (item.description || item.jobDescription || '');
+                const location = item.location || item.office || item.city || null;
                 jobs.push({
                     external_job_id: String(item.id || item.jobId || Math.random()),
                     title: item.title || item.name || item.jobTitle || 'Untitled',
-                    location: item.location || item.office || item.city || null,
+                    location: location,
                     employment_type: item.employmentType || item.schedule || null,
                     remote_type: detectRemoteType(description),
                     raw_description: description.slice(0, 5000),
@@ -381,7 +410,7 @@ async function processConcludisCompany(company) {
         }
     }
 
-    // ─── LAYER 3: CUSTOM CRAWLER FALLBACK – UNLIMITED LINKS ──────────
+    // ─── LAYER 3: CUSTOM CRAWLER FALLBACK ──────────────────────────────
     if (jobs.length === 0) {
         console.log(`   🔄 Layer 3: Custom crawler fallback (original career page)...`);
         const html = await customCrawlerFetchPage(company.detected_career_url);
@@ -416,7 +445,14 @@ async function processConcludisCompany(company) {
         }
     }
 
-    return { company, slug: companySlug, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
+    // ─── Enrich jobs with company_name ────────────────────────────────
+    const enrichedJobs = jobs.map(job => ({
+        ...job,
+        company_name: company.Name,
+        external_hash: generateExternalHash(company.Id, job.external_job_id) || job.external_job_id
+    }));
+
+    return { company, jobs: enrichedJobs, error: jobs.length === 0 ? 'No jobs found' : null };
 }
 
 // ─── MAIN RUNNER ──────────────────────────────────────────────────────────
@@ -424,7 +460,8 @@ async function run() {
     const { data: companies, error } = await supabase
         .from('companies')
         .select('"Id", "Name", detected_career_url')
-        .eq('ats_type', 'concludis');
+        .eq('ats_type', 'concludis')
+        .eq('crawl_status', 'pending');
 
     if (error) {
         console.error('❌ Supabase error:', error.message);
@@ -444,6 +481,9 @@ async function run() {
             const result = await processConcludisCompany(company);
             if (result.jobs.length === 0) {
                 console.log(`   ⚠️ No jobs found for ${company.Name}`);
+                await supabase.from('companies')
+                    .update({ crawl_status: 'failed' })
+                    .eq('Id', company.Id);
                 continue;
             }
 
@@ -452,13 +492,16 @@ async function run() {
                     .from('jobs')
                     .upsert({
                         company_id: company.Id,
+                        company_name: job.company_name,
                         external_job_id: job.external_job_id,
+                        external_hash: job.external_hash,
                         title: job.title,
                         location: job.location,
                         employment_type: job.employment_type,
                         remote_type: job.remote_type,
                         raw_description: job.raw_description,
                         apply_url: job.apply_url,
+                        ats_source: 'concludis',   // ← FIXED
                         is_active: true,
                         first_seen_at: new Date(),
                         last_seen_at: new Date()
@@ -470,8 +513,14 @@ async function run() {
             }
             totalJobs += result.jobs.length;
             console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'completed' })
+                .eq('Id', company.Id);
         } catch (err) {
             console.error(`   ⚠️ Skipping ${company.Name}: ${err.message}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'failed' })
+                .eq('Id', company.Id);
         }
         await new Promise(r => setTimeout(r, 300));
     }

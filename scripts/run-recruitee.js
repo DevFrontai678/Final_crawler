@@ -4,12 +4,22 @@ const ws = require('ws');
 const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const crypto = require('crypto');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
     { realtime: { transport: ws } }
 );
+
+// ─── HELPER: generate external_hash ──────────────────────────────────────
+function generateExternalHash(companyId, externalJobId) {
+    if (!companyId || !externalJobId) return null;
+    return crypto.createHash('sha256')
+        .update(`${companyId}:${externalJobId}`)
+        .digest('hex')
+        .slice(0, 64);
+}
 
 // ─── Remote Type Detection ──────────────────────────────────────────────
 function detectRemoteType(description) {
@@ -25,12 +35,9 @@ function detectRemoteType(description) {
 
 // ─── CUSTOM CRAWLER HELPERS (IMPROVED) ────────────────────────────────
 
-/**
- * Generate a list of candidate career URLs to try for a given base domain.
- */
 function getPotentialCareerUrls(baseUrl) {
     const paths = [
-        '',                     // root (original URL)
+        '',
         '/careers',
         '/jobs',
         '/karriere',
@@ -47,7 +54,6 @@ function getPotentialCareerUrls(baseUrl) {
         '/open-positions',
         '/vacancies',
     ];
-    // Build absolute URLs, remove duplicates while preserving order
     const urlSet = new Set();
     const result = [];
     for (const path of paths) {
@@ -57,14 +63,11 @@ function getPotentialCareerUrls(baseUrl) {
                 urlSet.add(url);
                 result.push(url);
             }
-        } catch (_) { /* ignore invalid base */ }
+        } catch (_) {}
     }
     return result;
 }
 
-/**
- * Fetch a page with Playwright, using retries and a shorter timeout.
- */
 async function customCrawlerFetchPage(url, retries = 2) {
     let browser;
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -75,16 +78,14 @@ async function customCrawlerFetchPage(url, retries = 2) {
                 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             });
-            // Use 'domcontentloaded' instead of 'networkidle' for faster response
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-            // Wait a bit for any dynamic content (optional)
             await page.waitForSelector('a[href*="job"], a[href*="career"]', { timeout: 5000 }).catch(() => {});
             const html = await page.content();
             return html;
         } catch (err) {
             console.log(`   ⚠️ Attempt ${attempt+1} failed for ${url}: ${err.message}`);
             if (attempt === retries) break;
-            await new Promise(r => setTimeout(r, 2000 * (attempt + 1))); // exponential backoff
+            await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
         } finally {
             if (browser) await browser.close();
         }
@@ -92,9 +93,6 @@ async function customCrawlerFetchPage(url, retries = 2) {
     return null;
 }
 
-/**
- * Enhanced extraction of job links from HTML.
- */
 function customCrawlerExtractLinks(html, baseUrl) {
     const $ = cheerio.load(html);
     const links = new Set();
@@ -108,14 +106,12 @@ function customCrawlerExtractLinks(html, baseUrl) {
         'offer', 'offers', 'apply', 'bewerben'
     ];
 
-    // Containers that typically hold job listings
     const containers = [
         '.jobs', '.job-list', '.career-list', '.positions',
         '.vacancies', '.open-positions', '[class*="job"]',
         '[class*="career"]', '[class*="position"]', 'ul li a'
     ];
 
-    // 1. Prioritise links inside job containers
     containers.forEach(selector => {
         $(selector).find('a').each((_, el) => {
             const href = $(el).attr('href');
@@ -131,7 +127,6 @@ function customCrawlerExtractLinks(html, baseUrl) {
         });
     });
 
-    // 2. Fallback: any link with matching keywords
     $('a').each((_, el) => {
         const href = $(el).attr('href');
         const text = $(el).text().toLowerCase().trim();
@@ -145,7 +140,6 @@ function customCrawlerExtractLinks(html, baseUrl) {
         }
     });
 
-    // Filter out unwanted sections (impressum, datenschutz, etc.)
     const filtered = [...links].filter(href =>
         !/impressum|datenschutz|agb|cookie|kontakt|about|team|news|blog|unternehmen|über-uns/i.test(href)
     );
@@ -153,9 +147,6 @@ function customCrawlerExtractLinks(html, baseUrl) {
     return filtered.length ? filtered.slice(0, 50) : [...links].slice(0, 50);
 }
 
-/**
- * Scrape a single job page for title, description, location.
- */
 async function customCrawlerScrapeJob(url) {
     const html = await customCrawlerFetchPage(url);
     if (!html) return null;
@@ -293,7 +284,6 @@ async function processRecruiteeCompany(company) {
         `https://${companySlug}.recruitee.com/jobs.json`
     ];
 
-    let apiWorked = false;
     for (const apiUrl of apiUrls) {
         try {
             const response = await axios.get(apiUrl, {
@@ -318,7 +308,6 @@ async function processRecruiteeCompany(company) {
                 });
             }
             if (jobs.length > 0) {
-                apiWorked = true;
                 console.log(`   ✅ Layer 1 (API): Found ${jobs.length} jobs`);
                 break;
             }
@@ -411,13 +400,11 @@ async function processRecruiteeCompany(company) {
     if (jobs.length === 0) {
         console.log(`   🔄 Layer 3: Custom crawler fallback...`);
 
-        // Build a base URL from the detected career URL (or just use the domain)
         let baseUrl;
         try {
             const parsed = new URL(company.detected_career_url);
             baseUrl = parsed.origin;
         } catch (_) {
-            // fallback: use the URL as is
             baseUrl = company.detected_career_url;
         }
 
@@ -468,7 +455,14 @@ async function processRecruiteeCompany(company) {
         }
     }
 
-    return { company, slug: companySlug, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
+    // ─── Enrich jobs with company_name ────────────────────────────────
+    const enrichedJobs = jobs.map(job => ({
+        ...job,
+        company_name: company.Name,
+        external_hash: generateExternalHash(company.Id, job.external_job_id) || job.external_job_id
+    }));
+
+    return { company, jobs: enrichedJobs, error: jobs.length === 0 ? 'No jobs found' : null };
 }
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────
@@ -476,7 +470,8 @@ async function run() {
     const { data: companies, error } = await supabase
         .from('companies')
         .select('"Id", "Name", detected_career_url')
-        .eq('ats_type', 'recruitee');
+        .eq('ats_type', 'recruitee')
+        .eq('crawl_status', 'pending');
 
     if (error) {
         console.error('❌ Supabase error:', error.message);
@@ -492,33 +487,52 @@ async function run() {
 
     let totalJobs = 0;
     for (const company of companies) {
-        const result = await processRecruiteeCompany(company);
-        if (result.jobs.length === 0) continue;
-
-        for (const job of result.jobs) {
-            const { error: insertError } = await supabase
-                .from('jobs')
-                .upsert({
-                    company_id: company.Id,
-                    external_job_id: job.external_job_id,
-                    title: job.title,
-                    location: job.location,
-                    employment_type: job.employment_type,
-                    remote_type: job.remote_type,
-                    raw_description: job.raw_description,
-                    apply_url: job.apply_url,
-                    is_active: true,
-                    first_seen_at: new Date(),
-                    last_seen_at: new Date()
-                }, { onConflict: 'company_id,external_job_id' });
-
-            if (insertError) {
-                console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
+        try {
+            const result = await processRecruiteeCompany(company);
+            if (result.jobs.length === 0) {
+                console.log(`   ⚠️ No jobs found for ${company.Name}`);
+                await supabase.from('companies')
+                    .update({ crawl_status: 'failed' })
+                    .eq('Id', company.Id);
+                continue;
             }
+
+            for (const job of result.jobs) {
+                const { error: insertError } = await supabase
+                    .from('jobs')
+                    .upsert({
+                        company_id: company.Id,
+                        company_name: job.company_name,
+                        external_job_id: job.external_job_id,
+                        external_hash: job.external_hash,
+                        title: job.title,
+                        location: job.location,
+                        employment_type: job.employment_type,
+                        remote_type: job.remote_type,
+                        raw_description: job.raw_description,
+                        apply_url: job.apply_url,
+                        ats_source: 'recruitee',   // ← FIXED
+                        is_active: true,
+                        first_seen_at: new Date(),
+                        last_seen_at: new Date()
+                    }, { onConflict: 'company_id,external_job_id' });
+
+                if (insertError) {
+                    console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
+                }
+            }
+            totalJobs += result.jobs.length;
+            console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'completed' })
+                .eq('Id', company.Id);
+        } catch (err) {
+            console.error(`   ⚠️ Skipping ${company.Name}: ${err.message}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'failed' })
+                .eq('Id', company.Id);
         }
-        totalJobs += result.jobs.length;
-        console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 300));
     }
 
     console.log(`\n✅ Done! Total Recruitee jobs saved: ${totalJobs}`);

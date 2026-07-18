@@ -4,13 +4,23 @@ const ws = require('ws');
 const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const https = require('https'); // <-- Added for SSL ignore
+const https = require('https');
+const crypto = require('crypto');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
     { realtime: { transport: ws } }
 );
+
+// ─── HELPER: generate external_hash ──────────────────────────────────────
+function generateExternalHash(companyId, externalJobId) {
+    if (!companyId || !externalJobId) return null;
+    return crypto.createHash('sha256')
+        .update(`${companyId}:${externalJobId}`)
+        .digest('hex')
+        .slice(0, 64);
+}
 
 // ─── Remote Type Detection ──────────────────────────────────────────────
 function detectRemoteType(description) {
@@ -45,10 +55,9 @@ async function getBrowser() {
     }
     browserInitPromise = (async () => {
         try {
-            // Launch browser with ignoreHTTPSErrors: true to bypass SSL issues
             browserInstance = await chromium.launch({
                 headless: true,
-                ignoreHTTPSErrors: true   // <-- FIX: ignore SSL errors
+                ignoreHTTPSErrors: true
             });
             return browserInstance;
         } finally {
@@ -58,22 +67,19 @@ async function getBrowser() {
     return browserInitPromise;
 }
 
-// ─── OPTIMIZED CUSTOM CRAWLER (Axios with SSL ignore, Playwright with ignore) ──
+// ─── OPTIMIZED CUSTOM CRAWLER (Axios with SSL ignore) ──────────────────
 async function customCrawlerFetchPage(url) {
     if (isSkipFile(url)) {
         console.log(`   ⏭️ Skipping non-HTML file: ${url}`);
         return null;
     }
 
-    // 1️⃣ Axios with custom HTTPS agent that ignores SSL errors
     try {
-        const agent = new https.Agent({
-            rejectUnauthorized: false   // <-- FIX: ignore SSL certificate errors
-        });
+        const agent = new https.Agent({ rejectUnauthorized: false });
         const response = await axios.get(url, {
             timeout: 10000,
             headers: { 'User-Agent': 'Mozilla/5.0' },
-            httpsAgent: agent            // <-- use the agent
+            httpsAgent: agent
         });
         const contentType = response.headers['content-type'] || '';
         if (contentType.includes('html') || response.data.length > 100) {
@@ -87,14 +93,12 @@ async function customCrawlerFetchPage(url) {
         console.log(`   ⚠️ Axios failed: ${axiosErr.message} – trying Playwright...`);
     }
 
-    // 2️⃣ Playwright fallback (browser already has ignoreHTTPSErrors: true)
     try {
         const browser = await getBrowser();
         const page = await browser.newPage();
         await page.setExtraHTTPHeaders({
             'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
         });
-        // Playwright will ignore SSL errors because we set ignoreHTTPSErrors: true
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
         const html = await page.content();
         await page.close();
@@ -424,7 +428,14 @@ async function processOnApplyCompany(company) {
         }
     }
 
-    return { company, slug, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
+    // ─── Enrich jobs with company_name ────────────────────────────────
+    const enrichedJobs = jobs.map(job => ({
+        ...job,
+        company_name: company.Name,
+        external_hash: generateExternalHash(company.Id, job.external_job_id) || job.external_job_id
+    }));
+
+    return { company, jobs: enrichedJobs, error: jobs.length === 0 ? 'No jobs found' : null };
 }
 
 // ─── MAIN RUNNER ──────────────────────────────────────────────────────────
@@ -432,7 +443,8 @@ async function run() {
     const { data: companies, error } = await supabase
         .from('companies')
         .select('"Id", "Name", detected_career_url')
-        .eq('ats_type', 'onapply');
+        .eq('ats_type', 'onapply')
+        .eq('crawl_status', 'pending');
 
     if (error) {
         console.error('❌ Supabase error:', error.message);
@@ -452,6 +464,9 @@ async function run() {
             const result = await processOnApplyCompany(company);
             if (result.jobs.length === 0) {
                 console.log(`   ⚠️ No jobs found for ${company.Name}`);
+                await supabase.from('companies')
+                    .update({ crawl_status: 'failed' })
+                    .eq('Id', company.Id);
                 continue;
             }
 
@@ -460,13 +475,16 @@ async function run() {
                     .from('jobs')
                     .upsert({
                         company_id: company.Id,
+                        company_name: job.company_name,
                         external_job_id: job.external_job_id,
+                        external_hash: job.external_hash,
                         title: job.title,
                         location: job.location,
                         employment_type: job.employment_type,
                         remote_type: job.remote_type,
                         raw_description: job.raw_description,
                         apply_url: job.apply_url,
+                        ats_source: 'onapply',   // ← FIXED
                         is_active: true,
                         first_seen_at: new Date(),
                         last_seen_at: new Date()
@@ -478,8 +496,14 @@ async function run() {
             }
             totalJobs += result.jobs.length;
             console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'completed' })
+                .eq('Id', company.Id);
         } catch (err) {
             console.error(`   ⚠️ Skipping ${company.Name}: ${err.message}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'failed' })
+                .eq('Id', company.Id);
         }
         await new Promise(r => setTimeout(r, 300));
     }

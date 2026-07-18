@@ -24,8 +24,8 @@ console.log('═'.repeat(70));
 
 // ─── Claude ────────────────────────────────────────────────────────────
 if (stats.claude.calls > 0) {
-    const inputCost = (stats.claude.inputTokens / 1000000) * 0.25;
-    const outputCost = (stats.claude.outputTokens / 1000000) * 1.25;
+    const inputCost = (stats.claude.inputTokens / 1000000) * 3.00;   // Sonnet 4.6 input
+    const outputCost = (stats.claude.outputTokens / 1000000) * 15.00; // Sonnet 4.6 output
     console.log(`\n🧠 CLAUDE (${stats.claude.model || 'unknown'})`);
     console.log(`   Calls:          ${stats.claude.calls}`);
     console.log(`   Input Tokens:   ${stats.claude.inputTokens.toLocaleString()}`);
@@ -55,9 +55,10 @@ if (stats.scraperapi.calls > 0) {
 }
 
 // ─── Grand Total ────────────────────────────────────────────────────────
-const totalCost = ((stats.claude.totalTokens / 1000000) * 0.25) +
-                  (stats.scraperapi.calls * 0.005) +
-                  ((stats.voyage.totalTokens / 1000000) * 0.10);
+const totalCost = ((stats.claude.totalTokens / 1000000) * 3.00) +   // Sonnet 4.6 input
+                  ((stats.claude.outputTokens / 1000000) * 15.00) +
+                  (stats.voyage.totalTokens / 1000000) * 0.10 +
+                  (stats.scraperapi.calls * 0.005);
 
 console.log('\n' + '─'.repeat(70));
 console.log(`💰 GRAND TOTAL COST: $${totalCost.toFixed(4)}`);

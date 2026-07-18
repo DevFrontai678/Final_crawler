@@ -41,11 +41,12 @@ async function fetchJobsToEmbed() {
     let hasMore = true;
 
     while (hasMore) {
+        // 🔥 FIX: Include raw_description and use OR condition
         const { data: jobs, error } = await supabase
             .from('jobs')
-            .select('id, title, structured_skills, seniority_level, remote_type, location')
+            .select('id, title, structured_skills, seniority_level, remote_type, location, raw_description')
             .is('skill_embedding', null)
-            .not('structured_skills', 'is', null)
+            .or('structured_skills.not.is.null,raw_description.not.is.null')
             .order('id', { ascending: true })
             .range(page * limit, (page + 1) * limit - 1);
 
@@ -58,10 +59,12 @@ async function fetchJobsToEmbed() {
         }
     }
 
-    // Filter out jobs with empty structured_skills
-    return allJobs.filter(job =>
-        Array.isArray(job.structured_skills) && job.structured_skills.length > 0
-    );
+    // Filter out jobs that have neither non-empty skills nor non-empty description
+    return allJobs.filter(job => {
+        const hasSkills = Array.isArray(job.structured_skills) && job.structured_skills.length > 0;
+        const hasDesc = job.raw_description && job.raw_description.trim().length > 0;
+        return hasSkills || hasDesc;
+    });
 }
 
 // ─── ADD JOBS TO QUEUE ─────────────────────────────────────────────────────
@@ -87,13 +90,21 @@ async function addJobsToQueue() {
 
 // ─── CONVERT JOB TO TEXT ─────────────────────────────────────────────────
 function jobToText(job) {
-    const skills = Array.isArray(job.structured_skills)
-        ? job.structured_skills.join(', ')
-        : (job.structured_skills || '');
+    // 🔥 FIX: Use skills if present, otherwise fallback to raw_description
+    let skillsText;
+    if (Array.isArray(job.structured_skills) && job.structured_skills.length > 0) {
+        skillsText = job.structured_skills.join(', ');
+    } else if (job.raw_description) {
+        // Use first 1000 chars of raw description
+        skillsText = job.raw_description.slice(0, 1000);
+    } else {
+        skillsText = '';
+    }
+
     const level = job.seniority_level || '';
     const remote = job.remote_type || '';
     const location = job.location || '';
-    return `${job.title}. Skills: ${skills}. Level: ${level}. Remote: ${remote}. Location: ${location}`;
+    return `${job.title}. Skills: ${skillsText}. Level: ${level}. Remote: ${remote}. Location: ${location}`;
 }
 
 // ─── EMBED A BATCH ────────────────────────────────────────────────────────

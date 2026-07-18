@@ -4,12 +4,22 @@ const ws = require('ws');
 const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const crypto = require('crypto');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
     { realtime: { transport: ws } }
 );
+
+// ─── HELPER: generate external_hash ──────────────────────────────────────
+function generateExternalHash(companyId, externalJobId) {
+    if (!companyId || !externalJobId) return null;
+    return crypto.createHash('sha256')
+        .update(`${companyId}:${externalJobId}`)
+        .digest('hex')
+        .slice(0, 64);
+}
 
 // ─── Remote Type Detection ──────────────────────────────────────────────
 function detectRemoteType(description) {
@@ -24,7 +34,7 @@ function detectRemoteType(description) {
 }
 
 // ─── CUSTOM CRAWLER HELPERS ─────────────────────────────────────────────
-// These are copied from custom-crawler-queue.js to act as fallback
+// These act as a fallback for Rexx companies
 
 async function customCrawlerFetchPage(url) {
     let browser;
@@ -278,7 +288,14 @@ async function processRexxCompany(company) {
         }
     }
 
-    return { company, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
+    // ─── Enrich jobs with company_name ────────────────────────────────
+    const enrichedJobs = jobs.map(job => ({
+        ...job,
+        company_name: company.Name,
+        external_hash: generateExternalHash(company.Id, job.external_job_id) || job.external_job_id
+    }));
+
+    return { company, jobs: enrichedJobs, error: jobs.length === 0 ? 'No jobs found' : null };
 }
 
 // ─── Main Runner ──────────────────────────────────────────────────────────
@@ -286,7 +303,8 @@ async function run() {
     const { data: companies, error } = await supabase
         .from('companies')
         .select('"Id", "Name", detected_career_url')
-        .eq('ats_type', 'rexx');
+        .eq('ats_type', 'rexx')
+        .eq('crawl_status', 'pending');
 
     if (error) {
         console.error('❌ Supabase error:', error.message);
@@ -302,33 +320,52 @@ async function run() {
 
     let totalJobs = 0;
     for (const company of companies) {
-        const result = await processRexxCompany(company);
-        if (result.jobs.length === 0) continue;
-
-        for (const job of result.jobs) {
-            const { error: insertError } = await supabase
-                .from('jobs')
-                .upsert({
-                    company_id: company.Id,
-                    external_job_id: job.external_job_id,
-                    title: job.title,
-                    location: job.location,
-                    employment_type: job.employment_type,
-                    remote_type: job.remote_type,
-                    raw_description: job.raw_description,
-                    apply_url: job.apply_url,
-                    is_active: true,
-                    first_seen_at: new Date(),
-                    last_seen_at: new Date()
-                }, { onConflict: 'company_id,external_job_id' });
-
-            if (insertError) {
-                console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
+        try {
+            const result = await processRexxCompany(company);
+            if (result.jobs.length === 0) {
+                console.log(`   ⚠️ No jobs found for ${company.Name}`);
+                await supabase.from('companies')
+                    .update({ crawl_status: 'failed' })
+                    .eq('Id', company.Id);
+                continue;
             }
+
+            for (const job of result.jobs) {
+                const { error: insertError } = await supabase
+                    .from('jobs')
+                    .upsert({
+                        company_id: company.Id,
+                        company_name: job.company_name,
+                        external_job_id: job.external_job_id,
+                        external_hash: job.external_hash,
+                        title: job.title,
+                        location: job.location,
+                        employment_type: job.employment_type,
+                        remote_type: job.remote_type,
+                        raw_description: job.raw_description,
+                        apply_url: job.apply_url,
+                        ats_source: 'rexx',   // ← FIXED
+                        is_active: true,
+                        first_seen_at: new Date(),
+                        last_seen_at: new Date()
+                    }, { onConflict: 'company_id,external_job_id' });
+
+                if (insertError) {
+                    console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
+                }
+            }
+            totalJobs += result.jobs.length;
+            console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'completed' })
+                .eq('Id', company.Id);
+        } catch (err) {
+            console.error(`   ⚠️ Skipping ${company.Name}: ${err.message}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'failed' })
+                .eq('Id', company.Id);
         }
-        totalJobs += result.jobs.length;
-        console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 300));
     }
 
     console.log(`\n✅ Done! Total Rexx jobs saved: ${totalJobs}`);

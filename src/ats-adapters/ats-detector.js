@@ -6,7 +6,34 @@
 
 const axios = require('axios');
 const cheerio = require('cheerio');
+const fs = require('fs');
 require('dotenv').config();
+
+// ─── TOKEN LOGGING SETUP ──────────────────────────────────────────────────
+const TOKEN_LOG_FILE = './token-usage.log';
+
+// Token stats accumulator (per process)
+let tokenStats = {
+    claude: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, model: 'claude-sonnet-4-6' },
+    voyage: { calls: 0, totalTokens: 0, model: 'voyage-3-large' },
+    scraperapi: { calls: 0 }
+};
+
+function saveTokenStats() {
+    try {
+        fs.writeFileSync(TOKEN_LOG_FILE, JSON.stringify({
+            timestamp: new Date().toISOString(),
+            stats: tokenStats
+        }, null, 2));
+    } catch (e) {
+        console.error('⚠️ Failed to save token stats:', e.message);
+    }
+}
+
+// Save on exit
+process.on('SIGINT', () => { saveTokenStats(); process.exit(0); });
+process.on('SIGTERM', () => { saveTokenStats(); process.exit(0); });
+process.on('exit', saveTokenStats);
 
 // ─── URL PATTERNS ────────────────────────────────────────────────────────────
 const ATS_URL_PATTERNS = [
@@ -225,7 +252,7 @@ function deepScanHtml(html, pageUrl) {
   return null;
 }
 
-// ─── CLAUDE FALLBACK ─────────────────────────────────────────────────────────
+// ─── CLAUDE FALLBACK (with token logging) ──────────────────────────────────
 async function claudeFallback(html, pageUrl) {
   try {
     const Anthropic = require('@anthropic-ai/sdk');
@@ -260,6 +287,19 @@ async function claudeFallback(html, pageUrl) {
         content: `You are an expert at detecting Applicant Tracking Systems (ATS).\nAnalyze this career page data and identify which ATS is used.\n\n${context}\n\nReply with ONLY ONE WORD from this exact list:\n${VALID.join(', ')}\n\nUse "custom" if the company built their own job listing system.\nUse "unknown" if there are no jobs or no ATS detectable.`
       }]
     });
+
+    // ─── Token logging ──────────────────────────────────────────────────
+    const usage = response.usage;
+    if (usage) {
+      tokenStats.claude.calls++;
+      tokenStats.claude.inputTokens += usage.input_tokens || 0;
+      tokenStats.claude.outputTokens += usage.output_tokens || 0;
+      tokenStats.claude.totalTokens += (usage.input_tokens || 0) + (usage.output_tokens || 0);
+      if (response.model && !tokenStats.claude.model.includes(response.model)) {
+        tokenStats.claude.model = response.model;
+      }
+      saveTokenStats();
+    }
 
     const answer = response.content[0].text.trim().toLowerCase().split(/\s/)[0];
     console.log(`      ↳ Claude says: "${answer}"`);

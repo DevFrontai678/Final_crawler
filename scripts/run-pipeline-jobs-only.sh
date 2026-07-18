@@ -228,10 +228,6 @@ run_script "src/crawlers/softgarden-crawler-queue.js"
 
 # ─── STEP 6: Custom Crawler ──────────────────────────────────────────────
 run_script "src/crawlers/custom-crawler-queue.js"
-
-# ─── STEP 7: Google Jobs (Company-Based ONLY) ────────────────────────────
-run_script "scripts/run-google-jobs.js --concurrency 3 --resume"
-
 # ─── STEP 8: Backfill + Geocode ──────────────────────────────────────────
 run_script "scripts/backfill-locations-google.js"
 run_script "scripts/geocode-jobs.js"
@@ -241,9 +237,6 @@ run_script "scripts/run-job-structuring-worker.js"
 
 # ─── STEP 10: Job Embeddings ──────────────────────────────────────────────
 run_script "scripts/run-embeddings-queue.js --resume"
-
-# ─── STEP 11: Candidate Embeddings ────────────────────────────────────────
-run_script "scripts/run-candidate-embeddings-queue.js --resume"
 
 # ─── STEP 12: Stale Cleanup ──────────────────────────────────────────────
 cleanup_stale_records

@@ -4,12 +4,22 @@ const ws = require('ws');
 const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const crypto = require('crypto');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
     { realtime: { transport: ws } }
 );
+
+// ─── HELPER: generate external_hash ──────────────────────────────────────
+function generateExternalHash(companyId, externalJobId) {
+    if (!companyId || !externalJobId) return null;
+    return crypto.createHash('sha256')
+        .update(`${companyId}:${externalJobId}`)
+        .digest('hex')
+        .slice(0, 64);
+}
 
 // ─── Remote Type Detection ──────────────────────────────────────────────
 function detectRemoteType(description) {
@@ -24,8 +34,6 @@ function detectRemoteType(description) {
 }
 
 // ─── CUSTOM CRAWLER HELPERS ──────────────────────────────────────────────
-
-// FIX 1: Browser leak fix - browser ab har attempt mein finally block mein band hoga
 async function customCrawlerFetchPage(url, retries = 2) {
     for (let attempt = 0; attempt <= retries; attempt++) {
         let browser;
@@ -37,7 +45,7 @@ async function customCrawlerFetchPage(url, retries = 2) {
             });
             await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
             const html = await page.content();
-            await browser.close(); // explicit close on success
+            await browser.close();
             return html;
         } catch (err) {
             console.log(`   ⚠️ Playwright attempt ${attempt + 1} failed: ${err.message}`);
@@ -45,7 +53,6 @@ async function customCrawlerFetchPage(url, retries = 2) {
                 try { await browser.close(); } catch (_) {}
             }
             if (attempt === retries) {
-                console.log(`   🔄 Falling back to Axios for: ${url}`);
                 try {
                     const response = await axios.get(url, {
                         timeout: 15000,
@@ -144,7 +151,6 @@ async function processSmartRecruitersCompany(company) {
     let smartDomain = null;
     let companySlug = null;
 
-    // Step 1: Try to extract slug from detected_career_url directly
     if (company.detected_career_url && company.detected_career_url.includes('smartrecruiters.com')) {
         let match = company.detected_career_url.match(/https?:\/\/([^.]+)\.careers\.smartrecruiters\.com/);
         if (match && match[1] !== 'www') {
@@ -159,7 +165,6 @@ async function processSmartRecruitersCompany(company) {
         }
     }
 
-    // Step 2: If no slug yet, fetch the career page and look for SmartRecruiters references
     if (!companySlug) {
         try {
             const response = await axios.get(company.detected_career_url, {
@@ -209,24 +214,20 @@ async function processSmartRecruitersCompany(company) {
         }
     }
 
-    // FIX 2: Slug guess se pehle minimum length 4 karein, aur sirf meaningful words use karein
-    // "ni" jaise 2-char garbage slugs ko reject karo
     if (!companySlug) {
         const candidate = company.Name
             .toLowerCase()
-            .replace(/\s+/g, '')           // spaces hata do
-            .replace(/[^a-z0-9]/g, '')     // special chars hata do
-            .replace(/gmbh|ag|kg|co|ek|gmbhcokg/g, '') // legal suffixes hata do
+            .replace(/\s+/g, '')
+            .replace(/[^a-z0-9]/g, '')
+            .replace(/gmbh|ag|kg|co|ek|gmbhcokg/g, '')
             .trim();
 
-        // FIX: minimum 4 chars required, warna slug "ni", "ag" jaise meaningless banega
         if (candidate.length >= 4) {
             companySlug = candidate;
             smartDomain = `${companySlug}.careers.smartrecruiters.com`;
             console.log(`   ⚠️ Using guessed slug: ${companySlug}`);
         } else {
-            console.log(`   ❌ Could not find valid SmartRecruiters slug for ${company.Name} (candidate too short: "${candidate}") – skipping to custom crawler`);
-            // Slug nahi mila - seedha custom crawler pe jaao
+            console.log(`   ❌ Could not find valid SmartRecruiters slug for ${company.Name} (candidate too short) – using custom crawler fallback`);
             return await fallbackToCustomCrawler(company);
         }
     }
@@ -403,15 +404,22 @@ async function processSmartRecruitersCompany(company) {
         }
     }
 
-    // ─── LAYER 3: CUSTOM CRAWLER FALLBACK (sirf tab jab Layer 1 & 2 fail ho) ──
+    // ─── LAYER 3: CUSTOM CRAWLER FALLBACK ──────────────────────────────
     if (jobs.length === 0) {
         return await fallbackToCustomCrawler(company, jobs);
     }
 
-    return { company, slug: companySlug, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
+    // ─── Enrich jobs with company_name and external_hash ────────────────
+    const enrichedJobs = jobs.map(job => ({
+        ...job,
+        company_name: company.Name,
+        external_hash: generateExternalHash(company.Id, job.external_job_id) || job.external_job_id
+    }));
+
+    return { company, jobs: enrichedJobs, error: jobs.length === 0 ? 'No jobs found' : null };
 }
 
-// FIX 3: Custom crawler ko alag function mein nikaala - reusable aur clean
+// ─── Custom crawler fallback ──────────────────────────────────────────────
 async function fallbackToCustomCrawler(company, existingJobs = []) {
     const jobs = [...existingJobs];
     console.log(`   🔄 Layer 3: Custom crawler fallback...`);
@@ -434,7 +442,7 @@ async function fallbackToCustomCrawler(company, existingJobs = []) {
                         remote_type: detectRemoteType(jobData.description),
                         raw_description: jobData.description.slice(0, 5000),
                         apply_url: link,
-                        ats_source: 'custom_crawler'   // FIX: source correctly mark karo
+                        ats_source: 'smartrecruiters'   // ← FIXED: use the adapter's name
                     });
                     saved++;
                 }
@@ -451,14 +459,23 @@ async function fallbackToCustomCrawler(company, existingJobs = []) {
         console.log(`   ❌ Layer 3: Failed to fetch page`);
     }
 
-    return { company, slug: null, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
+    // ─── Enrich jobs with company_name and external_hash ────────────────
+    const enrichedJobs = jobs.map(job => ({
+        ...job,
+        company_name: company.Name,
+        external_hash: generateExternalHash(company.Id, job.external_job_id) || job.external_job_id
+    }));
+
+    return { company, jobs: enrichedJobs, error: jobs.length === 0 ? 'No jobs found' : null };
 }
 
+// ─── MAIN RUNNER ──────────────────────────────────────────────────────────
 async function run() {
     const { data: companies, error } = await supabase
         .from('companies')
         .select('"Id", "Name", detected_career_url')
-        .eq('ats_type', 'smartrecruiters');
+        .eq('ats_type', 'smartrecruiters')
+        .eq('crawl_status', 'pending');
 
     if (error) {
         console.error('❌ Supabase error:', error.message);
@@ -474,33 +491,52 @@ async function run() {
 
     let totalJobs = 0;
     for (const company of companies) {
-        const result = await processSmartRecruitersCompany(company);
-        if (result.jobs.length === 0) continue;
-
-        for (const job of result.jobs) {
-            const { error: insertError } = await supabase
-                .from('jobs')
-                .upsert({
-                    company_id: company.Id,
-                    external_job_id: job.external_job_id,
-                    title: job.title,
-                    location: job.location,
-                    employment_type: job.employment_type,
-                    remote_type: job.remote_type,
-                    raw_description: job.raw_description,
-                    apply_url: job.apply_url,
-                    is_active: true,
-                    first_seen_at: new Date(),
-                    last_seen_at: new Date()
-                }, { onConflict: 'company_id,external_job_id' });
-
-            if (insertError) {
-                console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
+        try {
+            const result = await processSmartRecruitersCompany(company);
+            if (result.jobs.length === 0) {
+                console.log(`   ⚠️ No jobs found for ${company.Name}`);
+                await supabase.from('companies')
+                    .update({ crawl_status: 'failed' })
+                    .eq('Id', company.Id);
+                continue;
             }
+
+            for (const job of result.jobs) {
+                const { error: insertError } = await supabase
+                    .from('jobs')
+                    .upsert({
+                        company_id: company.Id,
+                        company_name: job.company_name,
+                        external_job_id: job.external_job_id,
+                        external_hash: job.external_hash,
+                        title: job.title,
+                        location: job.location,
+                        employment_type: job.employment_type,
+                        remote_type: job.remote_type,
+                        raw_description: job.raw_description,
+                        apply_url: job.apply_url,
+                        ats_source: 'smartrecruiters',   // ← FIXED
+                        is_active: true,
+                        first_seen_at: new Date(),
+                        last_seen_at: new Date()
+                    }, { onConflict: 'company_id,external_job_id' });
+
+                if (insertError) {
+                    console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
+                }
+            }
+            totalJobs += result.jobs.length;
+            console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'completed' })
+                .eq('Id', company.Id);
+        } catch (err) {
+            console.error(`   ⚠️ Skipping ${company.Name}: ${err.message}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'failed' })
+                .eq('Id', company.Id);
         }
-        totalJobs += result.jobs.length;
-        console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 300));
     }
 
     console.log(`\n✅ Done! Total SmartRecruiters jobs saved: ${totalJobs}`);

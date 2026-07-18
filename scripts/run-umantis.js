@@ -4,6 +4,7 @@ const ws = require('ws');
 const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const crypto = require('crypto');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -11,14 +12,23 @@ const supabase = createClient(
     { realtime: { transport: ws } }
 );
 
+// ─── HELPER: generate external_hash ──────────────────────────────────────
+function generateExternalHash(companyId, externalJobId) {
+    if (!companyId || !externalJobId) return null;
+    return crypto.createHash('sha256')
+        .update(`${companyId}:${externalJobId}`)
+        .digest('hex')
+        .slice(0, 64);
+}
+
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
 const CONFIG = {
     PLAYWRIGHT_TIMEOUT: 15000,
     PLAYWRIGHT_RETRIES: 1,
     AXIOS_TIMEOUT: 10000,
     JOB_SCRAPE_CONCURRENCY: 5,
-    JOB_LINK_LIMIT: 60,           // increased — more links = more jobs
-    MIN_DESCRIPTION_LENGTH: 50,   // lowered from 100 — catch more jobs
+    JOB_LINK_LIMIT: 60,
+    MIN_DESCRIPTION_LENGTH: 50,
     DELAY_BETWEEN_COMPANIES: 500
 };
 
@@ -36,17 +46,6 @@ function isSkipFile(url) {
     if (!url) return true;
     const lower = url.toLowerCase();
     return SKIP_EXTENSIONS.some(ext => lower.endsWith(ext) || lower.includes(ext + '?'));
-}
-
-// ─── Check if domain is likely resolvable (skip known-bad patterns) ──────────
-function isValidDomain(url) {
-    try {
-        const host = new URL(url).hostname;
-        // recruiting.umantis.com alone (without subdomain path that resolves) often fails
-        // Only skip if host is exactly recruiting.umantis.com — those use path-based routing
-        // that many servers block. We'll still try but mark it.
-        return true;
-    } catch (_) { return false; }
 }
 
 // ─── Axios fetch ─────────────────────────────────────────────────────────────
@@ -147,7 +146,6 @@ function extractJobLinks(html, baseUrl) {
             fullUrl = href.startsWith('http') ? href : new URL(href, baseUrl).href;
         } catch (_) { return; }
 
-        // Remove fragments
         fullUrl = fullUrl.split('#')[0];
         if (!fullUrl) return;
 
@@ -158,7 +156,6 @@ function extractJobLinks(html, baseUrl) {
         if (matched) links.add(fullUrl);
     });
 
-    // Loose filter — only remove clearly non-job pages
     const filtered = [...links].filter(href =>
         !/impressum|datenschutz|agb|cookie|login|register|logout|passwort|password|\/en\/|\/fr\/|sitemap/i.test(href)
     );
@@ -176,12 +173,10 @@ async function scrapeJobPage(url) {
     const $ = cheerio.load(html);
     $('nav, footer, script, style, .cookie-banner, #cookie, noscript').remove();
 
-    // Title: prefer h1, fallback to <title>
     const title = $('h1').first().text().trim()
         || $('title').text().trim().split(/[-|–]/)[0].trim()
         || 'Untitled';
 
-    // Description selectors — ordered by specificity
     const descSelectors = [
         '[itemprop="description"]', '[itemprop="jobDescription"]',
         '.job-description', '.job-details', '#job-description',
@@ -200,10 +195,9 @@ async function scrapeJobPage(url) {
         if (!el.length) continue;
         const text = el.text().replace(/\s+/g, ' ').trim();
         if (text.length > description.length) description = text;
-        if (description.length > 500) break; // good enough, stop
+        if (description.length > 500) break;
     }
 
-    // Fallback: whole body
     if (description.length < CONFIG.MIN_DESCRIPTION_LENGTH) {
         description = $('body').text()
             .split('\n').map(l => l.trim()).filter(l => l.length > 20)
@@ -211,7 +205,6 @@ async function scrapeJobPage(url) {
             .join('\n').slice(0, 5000);
     }
 
-    // Still nothing useful — skip
     if (description.length < CONFIG.MIN_DESCRIPTION_LENGTH) return null;
 
     const location = $(
@@ -226,7 +219,6 @@ async function deepCrawlForJobLinks(startUrl) {
     const visited = new Set();
     let allJobLinks = new Set();
 
-    // Fetch start page
     const html = await smartFetchPage(startUrl);
     if (!html) return [];
     visited.add(startUrl);
@@ -234,8 +226,6 @@ async function deepCrawlForJobLinks(startUrl) {
     const firstLinks = extractJobLinks(html, startUrl);
     firstLinks.forEach(l => allJobLinks.add(l));
 
-    // Find intermediate listing pages (pages that are likely job LIST pages, not detail pages)
-    // e.g. /karriere, /jobs, /stellenangebote — pages WITHOUT numeric IDs
     const listingPagePatterns = [
         /\/(karriere|jobs?|careers?|stellen|stellenangebote|offene-stellen|vacancies?)\/?$/i,
         /\/(karriere|jobs?|careers?|stellen)\?/i
@@ -254,7 +244,6 @@ async function deepCrawlForJobLinks(startUrl) {
         if (visited.has(fullUrl)) return;
         if (isSkipFile(fullUrl)) return;
 
-        // Only same domain
         try {
             const startDomain = new URL(startUrl).hostname;
             const linkDomain = new URL(fullUrl).hostname;
@@ -266,11 +255,10 @@ async function deepCrawlForJobLinks(startUrl) {
         }
     });
 
-    // Scrape sub-listing pages for more job links
     for (const subUrl of [...subListingPages].slice(0, 5)) {
         if (visited.has(subUrl)) continue;
         visited.add(subUrl);
-        const subHtml = await axiosFetchPage(subUrl); // Axios only for sub-pages
+        const subHtml = await axiosFetchPage(subUrl);
         if (!subHtml) continue;
         const subLinks = extractJobLinks(subHtml, subUrl);
         subLinks.forEach(l => allJobLinks.add(l));
@@ -288,17 +276,14 @@ async function processUmantisCompany(company) {
     let umantisDomain = null;
     const url = company.detected_career_url || '';
 
-    // ── Slug detection ──────────────────────────────────────────────────────
     let m;
 
-    // Direct umantis subdomain: company.umantis.com
     m = url.match(/https?:\/\/([^./]+)\.umantis\.com/);
     if (m && !['www','recruiting'].includes(m[1])) {
         companySlug = m[1];
         umantisDomain = `${companySlug}.umantis.com`;
     }
 
-    // recruiting.umantis.com/CompanySlug
     if (!companySlug) {
         m = url.match(/umantis\.com\/([^\/?#\s]+)/);
         if (m && m[1] !== 'api') {
@@ -307,13 +292,11 @@ async function processUmantisCompany(company) {
         }
     }
 
-    // lumesse
     if (!companySlug) {
         m = url.match(/https?:\/\/([^./]+)\.lumesse\.com/);
         if (m && m[1] !== 'www') { companySlug = m[1]; umantisDomain = `${companySlug}.lumesse.com`; }
     }
 
-    // Scan career page HTML for embedded Umantis URLs
     if (!companySlug) {
         const html = await axiosFetchPage(url);
         if (html) {
@@ -339,7 +322,6 @@ async function processUmantisCompany(company) {
         }
     }
 
-    // Guess from company name
     if (!companySlug) {
         const guess = company.Name.toLowerCase()
             .replace(/[äöü]/g, c => ({ ä:'ae', ö:'oe', ü:'ue' }[c] || c))
@@ -359,9 +341,7 @@ async function processUmantisCompany(company) {
 
     const jobs = [];
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // LAYER 1: Umantis API
-    // ═══════════════════════════════════════════════════════════════════════
+    // ─── LAYER 1: Umantis API ──────────────────────────────────────────────
     const apiUrls = [
         `https://${companySlug}.umantis.com/api/jobs`,
         `https://${companySlug}.umantis.com/api/v1/jobs`,
@@ -414,11 +394,7 @@ async function processUmantisCompany(company) {
         } catch (_) {}
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // LAYER 2: Umantis domain HTML scraping
-    // Only try if domain looks like a real subdomain (company.umantis.com)
-    // Skip recruiting.umantis.com/* — those DNS-fail often
-    // ═══════════════════════════════════════════════════════════════════════
+    // ─── LAYER 2: Umantis domain HTML scraping ──────────────────────────────
     if (jobs.length === 0) {
         const isSubdomain = !umantisDomain.startsWith('recruiting.umantis.com');
         const pageUrl = umantisDomain.startsWith('http') ? umantisDomain : `https://${umantisDomain}`;
@@ -491,9 +467,7 @@ async function processUmantisCompany(company) {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // LAYER 3: Deep crawl company career page
-    // ═══════════════════════════════════════════════════════════════════════
+    // ─── LAYER 3: Deep crawl company career page ──────────────────────────────
     if (jobs.length === 0) {
         console.log(`   🔄 Layer 3: Deep crawl...`);
 
@@ -505,7 +479,6 @@ async function processUmantisCompany(company) {
             return { company, jobs: [], error: 'No jobs found' };
         }
 
-        // Scrape all links in parallel
         const scraped = await runWithConcurrency(allLinks, CONFIG.JOB_SCRAPE_CONCURRENCY, async (link) => {
             const data = await scrapeJobPage(link);
             if (!data) return null;
@@ -532,60 +505,82 @@ async function processUmantisCompany(company) {
         else console.log(`   ⚠️ Layer 3: No jobs found after scraping`);
     }
 
-    return { company, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
+    // ─── Enrich jobs with company_name and external_hash ────────────────
+    const enrichedJobs = jobs.map(job => ({
+        ...job,
+        company_name: company.Name,
+        external_hash: generateExternalHash(company.Id, job.external_job_id) || job.external_job_id
+    }));
+
+    return { company, jobs: enrichedJobs, error: jobs.length === 0 ? 'No jobs found' : null };
 }
 
-// ─── Save to Supabase ─────────────────────────────────────────────────────────
-async function saveJobs(company, jobs) {
-    let saved = 0;
-    for (const job of jobs) {
-        const { error } = await supabase.from('jobs').upsert({
-            company_id: company.Id,
-            external_job_id: job.external_job_id,
-            title: job.title,
-            location: job.location,
-            employment_type: job.employment_type,
-            remote_type: job.remote_type,
-            raw_description: job.raw_description,
-            apply_url: job.apply_url,
-            is_active: true,
-            first_seen_at: new Date(),
-            last_seen_at: new Date()
-        }, { onConflict: 'company_id,external_job_id' });
-
-        if (error) console.error(`   ❌ Save error "${job.title}": ${error.message}`);
-        else saved++;
-    }
-    return saved;
-}
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── MAIN RUNNER ──────────────────────────────────────────────────────────
 async function run() {
     const { data: companies, error } = await supabase
         .from('companies')
         .select('"Id", "Name", detected_career_url')
-        .eq('ats_type', 'umantis');
+        .eq('ats_type', 'umantis')
+        .eq('crawl_status', 'pending');
 
-    if (error) { console.error('❌ Supabase error:', error.message); return; }
-    if (!companies || companies.length === 0) { console.log('No Umantis companies found.'); return; }
+    if (error) {
+        console.error('❌ Supabase error:', error.message);
+        return;
+    }
+
+    if (!companies || companies.length === 0) {
+        console.log('No Umantis companies found.');
+        return;
+    }
 
     console.log(`📋 Processing ${companies.length} Umantis companies sequentially...\n`);
 
     let totalJobs = 0;
-    for (let i = 0; i < companies.length; i++) {
-        const company = companies[i];
-        console.log(`\n[${i + 1}/${companies.length}]`);
+    for (const company of companies) {
         try {
             const result = await processUmantisCompany(company);
             if (result.jobs.length === 0) {
-                console.log(`   ⚠️ No jobs for ${company.Name}`);
-            } else {
-                const saved = await saveJobs(company, result.jobs);
-                totalJobs += saved;
-                console.log(`   💾 Saved ${saved}/${result.jobs.length} jobs for ${company.Name}`);
+                console.log(`   ⚠️ No jobs found for ${company.Name}`);
+                await supabase.from('companies')
+                    .update({ crawl_status: 'failed' })
+                    .eq('Id', company.Id);
+                continue;
             }
+
+            for (const job of result.jobs) {
+                const { error: insertError } = await supabase
+                    .from('jobs')
+                    .upsert({
+                        company_id: company.Id,
+                        company_name: job.company_name,
+                        external_job_id: job.external_job_id,
+                        external_hash: job.external_hash,
+                        title: job.title,
+                        location: job.location,
+                        employment_type: job.employment_type,
+                        remote_type: job.remote_type,
+                        raw_description: job.raw_description,
+                        apply_url: job.apply_url,
+                        ats_source: 'umantis',   // ← FIXED
+                        is_active: true,
+                        first_seen_at: new Date(),
+                        last_seen_at: new Date()
+                    }, { onConflict: 'company_id,external_job_id' });
+
+                if (insertError) {
+                    console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
+                }
+            }
+            totalJobs += result.jobs.length;
+            console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'completed' })
+                .eq('Id', company.Id);
         } catch (err) {
-            console.error(`   ❌ Unexpected error for ${company.Name}: ${err.message}`);
+            console.error(`   ⚠️ Skipping ${company.Name}: ${err.message}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'failed' })
+                .eq('Id', company.Id);
         }
         await new Promise(r => setTimeout(r, CONFIG.DELAY_BETWEEN_COMPANIES));
     }

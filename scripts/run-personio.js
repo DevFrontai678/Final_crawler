@@ -32,7 +32,7 @@ async function run() {
     let totalJobs = 0;
     for (const company of companies) {
         const result = await processPersonioCompany(company);
-        
+
         if (result.error) {
             console.log(`   ❌ ${result.error}`);
             await supabase.from('crawl_logs').insert({
@@ -61,16 +61,23 @@ async function run() {
             continue;
         }
 
+        let missingDescCount = 0;
+        let missingLocationCount = 0;
+
         for (const job of result.jobs) {
+            if (!job.raw_description) missingDescCount++;
+            if (!job.location) missingLocationCount++;
+
             const { error: insertError } = await supabase
                 .from('jobs')
                 .upsert({
                     company_id: company.Id,
+                    company_name: job.company_name || company.Name || null, // ✅ ab genuinely save ho raha hai
                     external_job_id: job.external_job_id,
-                    title: job.title,
-                    location: job.location,
-                    employment_type: job.employment_type,
-                    raw_description: job.raw_description,
+                    title: job.title || null,
+                    location: job.location || null,          // ✅ empty string ki jagah explicit null
+                    employment_type: job.employment_type || null,
+                    raw_description: job.raw_description || null, // ✅ clean text, ya null agar na mile
                     apply_url: job.apply_url,
                     ats_source: job.ats_source || 'personio',
                     is_active: true,
@@ -82,9 +89,10 @@ async function run() {
                 console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
             }
         }
+
         totalJobs += result.jobs.length;
-        console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
-        
+        console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name} (missing desc: ${missingDescCount}, missing location: ${missingLocationCount})`);
+
         // Save to crawl_logs
         await supabase.from('crawl_logs').insert({
             company_id: company.Id,
@@ -92,11 +100,11 @@ async function run() {
             jobs_found: result.jobs.length,
             created_at: new Date()
         });
-        
+
         await supabase.from('companies')
             .update({ crawl_status: 'ats_detected' })
             .eq('Id', company.Id);
-            
+
         await new Promise(r => setTimeout(r, 500));
     }
 

@@ -4,12 +4,22 @@ const ws = require('ws');
 const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const crypto = require('crypto');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
     { realtime: { transport: ws } }
 );
+
+// ─── HELPER: generate external_hash ──────────────────────────────────────
+function generateExternalHash(companyId, externalJobId) {
+    if (!companyId || !externalJobId) return null;
+    return crypto.createHash('sha256')
+        .update(`${companyId}:${externalJobId}`)
+        .digest('hex')
+        .slice(0, 64);
+}
 
 // ─── Remote Type Detection ──────────────────────────────────────────────
 function detectRemoteType(description) {
@@ -175,18 +185,12 @@ async function customCrawlerScrapeJob(url) {
 
 // ─── SUCCESSFACTORS SPECIFIC ──────────────────────────────────────────
 
-/**
- * Attempt to find the base SuccessFactors URL from company data.
- * Returns an object { baseUrl, slug } or null.
- */
 function detectSuccessFactorsUrl(company) {
     let careerUrl = company.detected_career_url || '';
     let baseUrl = null;
     let slug = null;
 
-    // 1. If the URL already contains successfactors keywords
     if (careerUrl.includes('successfactors') || careerUrl.includes('sapsf') || careerUrl.includes('jobs.sap')) {
-        // Try to extract base domain: e.g., https://<company>.jobs.sap.com
         const match = careerUrl.match(/https?:\/\/([^\/]+)/);
         if (match) {
             baseUrl = match[0];
@@ -195,29 +199,24 @@ function detectSuccessFactorsUrl(company) {
         return { baseUrl, slug };
     }
 
-    // 2. Try to guess from company name (common pattern: https://<company>.jobs.sap.com)
-    // Remove special characters and spaces, convert to lowercase
     let candidate = company.Name
         .toLowerCase()
         .replace(/[^a-z0-9]/g, '')
         .replace(/gmbh|ag|kg|co|e\.k\./g, '')
         .trim();
     if (candidate.length > 3) {
-        // Try common patterns
         const patterns = [
             `https://${candidate}.jobs.sap.com`,
             `https://${candidate}.sapsf.com`,
             `https://careers.${candidate}.com`,
             `https://${candidate}.careers.sap.com`
         ];
-        // We'll return the first pattern as baseUrl; slug = candidate
         baseUrl = patterns[0];
         slug = candidate;
         console.log(`   ⚠️ Guessing SuccessFactors base URL: ${baseUrl}`);
         return { baseUrl, slug };
     }
 
-    // 3. If nothing found, fallback to the detected_career_url itself
     if (careerUrl) {
         baseUrl = careerUrl;
         slug = new URL(careerUrl).hostname.split('.')[0];
@@ -264,7 +263,6 @@ async function processSuccessFactorsCompany(company) {
             const data = response.data;
             let items = [];
 
-            // Try to parse common structures
             if (Array.isArray(data)) {
                 items = data;
             } else if (data.jobs && Array.isArray(data.jobs)) {
@@ -274,7 +272,6 @@ async function processSuccessFactorsCompany(company) {
             } else if (data.Jobs && Array.isArray(data.Jobs)) {
                 items = data.Jobs;
             } else if (apiUrl.includes('.xml') || apiUrl.includes('/feed')) {
-                // XML feed
                 const $xml = cheerio.load(data, { xmlMode: true });
                 const positions = $xml('job, position, item, entry');
                 if (positions.length > 0) {
@@ -303,7 +300,6 @@ async function processSuccessFactorsCompany(company) {
                 }
             }
 
-            // If JSON items found
             for (const item of items) {
                 const description = (item.description || item.jobDescription || item.job_description || '');
                 jobs.push({
@@ -337,13 +333,11 @@ async function processSuccessFactorsCompany(company) {
             const html = response.data;
             const $ = cheerio.load(html);
 
-            // Common selectors for job listings on SuccessFactors pages
             const jobSelectors = [
                 '.job', '.job-item', '.job-listing', '.job-card',
                 '.position', '.position-item', '.vacancy', '.vacancy-item',
                 '[data-job-id]', '[data-position-id]', '.job-offer',
                 'article.job', 'div.job', 'li.job',
-                // SuccessFactors specific
                 '.job-result', '.search-result', '.job-posting',
                 'tr.job', 'div[class*="job"]', 'li[class*="job"]'
             ];
@@ -419,7 +413,14 @@ async function processSuccessFactorsCompany(company) {
         }
     }
 
-    return { company, slug, jobs, error: jobs.length === 0 ? 'No jobs found' : null };
+    // ─── Enrich jobs with company_name and external_hash ────────────────
+    const enrichedJobs = jobs.map(job => ({
+        ...job,
+        company_name: company.Name,
+        external_hash: generateExternalHash(company.Id, job.external_job_id) || job.external_job_id
+    }));
+
+    return { company, jobs: enrichedJobs, error: jobs.length === 0 ? 'No jobs found' : null };
 }
 
 // ─── MAIN RUNNER ──────────────────────────────────────────────────────────
@@ -427,7 +428,8 @@ async function run() {
     const { data: companies, error } = await supabase
         .from('companies')
         .select('"Id", "Name", detected_career_url')
-        .eq('ats_type', 'successfactors'); // adjust if your column is named differently
+        .eq('ats_type', 'successfactors')
+        .eq('crawl_status', 'pending');
 
     if (error) {
         console.error('❌ Supabase error:', error.message);
@@ -447,6 +449,9 @@ async function run() {
             const result = await processSuccessFactorsCompany(company);
             if (result.jobs.length === 0) {
                 console.log(`   ⚠️ No jobs found for ${company.Name}`);
+                await supabase.from('companies')
+                    .update({ crawl_status: 'failed' })
+                    .eq('Id', company.Id);
                 continue;
             }
 
@@ -455,13 +460,16 @@ async function run() {
                     .from('jobs')
                     .upsert({
                         company_id: company.Id,
+                        company_name: job.company_name,
                         external_job_id: job.external_job_id,
+                        external_hash: job.external_hash,
                         title: job.title,
                         location: job.location,
                         employment_type: job.employment_type,
                         remote_type: job.remote_type,
                         raw_description: job.raw_description,
                         apply_url: job.apply_url,
+                        ats_source: 'successfactors',   // ← FIXED
                         is_active: true,
                         first_seen_at: new Date(),
                         last_seen_at: new Date()
@@ -473,8 +481,14 @@ async function run() {
             }
             totalJobs += result.jobs.length;
             console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'completed' })
+                .eq('Id', company.Id);
         } catch (err) {
             console.error(`   ⚠️ Skipping ${company.Name}: ${err.message}`);
+            await supabase.from('companies')
+                .update({ crawl_status: 'failed' })
+                .eq('Id', company.Id);
         }
         await new Promise(r => setTimeout(r, 300));
     }

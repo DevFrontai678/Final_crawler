@@ -21,6 +21,33 @@ async function closePersonioBrowser() {
   }
 }
 
+// ─── HELPER: STRIP HTML → CLEAN TEXT ──────────────────────────────────────
+function stripHtmlToText(html) {
+  if (!html) return '';
+  try {
+    const $ = cheerio.load(`<div>${html}</div>`);
+    return $('div')
+      .text()
+      .replace(/\r\n/g, '\n')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  } catch (e) {
+    return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+}
+
+function decodeCdata(str) {
+  if (!str) return '';
+  return str.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim();
+}
+
+function cleanOrNull(str) {
+  if (!str) return null;
+  const t = String(str).trim();
+  return t.length > 0 ? t : null;
+}
+
 // ─── HELPER: ACCEPT COOKIES ON PAGE ──────────────────────────────────────
 async function acceptCookies(page) {
   const cookieSelectors = [
@@ -55,34 +82,28 @@ async function acceptCookies(page) {
 }
 
 // ─── FETCH HTML WITH STRICT CONTENT VALIDATION + SCRAPERAPI ──────────────
-async function fetchHtmlWithFallback(url) {
-  // Helper function to check if HTML has Personio job content
+// 🔥 FIX: Added retry limit to prevent infinite loops
+async function fetchHtmlWithFallback(url, retryCount = 0) {
+  const MAX_RETRIES = 2;
+
   function hasPersonioJobContent(html) {
     const $ = cheerio.load(html);
-    
-    // Check for Personio job links
-    const hasPersonioLinks = 
-      html.includes('personio') || 
+    const hasPersonioLinks =
+      html.includes('personio') ||
       html.includes('jobs.personio.de') ||
       $('a[href*="personio"]').length > 0 ||
       $('iframe[src*="personio"]').length > 0;
-    
-    // Check for job cards/items
-    const hasJobItems = 
+    const hasJobItems =
       $('[data-position-id]').length > 0 ||
       $('.job-position, .position-item, [class*="job-"], [class*="position"]').length > 2;
-    
-    // Check for job keywords
-    const hasJobKeywords = 
+    const hasJobKeywords =
       html.includes('Stellenangebote') ||
       html.includes('Job offers') ||
       html.includes('Karriere') ||
       html.includes('Bewerbung');
-    
     return hasPersonioLinks && (hasJobItems || hasJobKeywords);
   }
 
-  // 1. Try static axios first
   let html = null;
   let staticSuccess = false;
 
@@ -95,6 +116,10 @@ async function fetchHtmlWithFallback(url) {
     html = response.data;
     staticSuccess = true;
   } catch (staticErr) {
+    if (staticErr.response?.status === 404) {
+      console.log(`    ⚠️ Static 404 for ${url} – skipping further attempts`);
+      return null;
+    }
     console.log(`    ⚠️ Static failed: ${staticErr.message}`);
   }
 
@@ -105,7 +130,11 @@ async function fetchHtmlWithFallback(url) {
     console.log(`    ⚠️ Static HTML but no real job content — trying Playwright...`);
   }
 
-  // 2. Try Playwright with cookie handling
+  if (retryCount >= MAX_RETRIES) {
+    console.log(`    ⚠️ Max retries reached for ${url}`);
+    return null;
+  }
+
   let context = null;
   let page = null;
   try {
@@ -133,7 +162,6 @@ async function fetchHtmlWithFallback(url) {
     if (context) await context.close().catch(() => {});
   }
 
-  // 3. 🔥 Last Resort: ScraperAPI
   try {
     console.log(`    🔄 Trying ScraperAPI fallback...`);
     const apiKey = process.env.SCRAPERAPI_API_KEY;
@@ -144,7 +172,7 @@ async function fetchHtmlWithFallback(url) {
 
     const encodedUrl = encodeURIComponent(url);
     const apiUrl = `https://api.scraperapi.com/?api_key=${apiKey}&url=${encodedUrl}&render=true&country_code=de&premium=true`;
-    
+
     const response = await axios.get(apiUrl, {
       timeout: 30000,
       headers: { 'Accept': 'text/html' }
@@ -168,18 +196,16 @@ async function fetchHtmlWithFallback(url) {
   return null;
 }
 
-// ─── EXTRACT PERSONIO SLUG (IMPROVED) ─────────────────────────────────────
+// ─── EXTRACT PERSONIO SLUG ────────────────────────────────────────────────
 async function extractPersonioSlug(careerPageUrl) {
   console.log(`    🔍 Extracting Personio slug...`);
 
-  // 1. Direct URL pattern check
   if (careerPageUrl.includes('personio')) {
     const match = careerPageUrl.match(/https?:\/\/([^.]+)\.(?:career\.)?personio\.(?:de|com)/);
     if (match) {
       console.log(`    ✅ Slug from URL: ${match[1]}`);
       return { type: 'subdomain', slug: match[1] };
     }
-    // Also check for jobs.personio.de
     const jobMatch = careerPageUrl.match(/https?:\/\/([^.]+)\.jobs\.personio\.(?:de|com)/);
     if (jobMatch) {
       console.log(`    ✅ Slug from jobs URL: ${jobMatch[1]}`);
@@ -187,7 +213,6 @@ async function extractPersonioSlug(careerPageUrl) {
     }
   }
 
-  // 2. Fetch page and search for Personio links (with cookie handling)
   try {
     const html = await fetchHtmlWithFallback(careerPageUrl);
     if (!html) {
@@ -197,7 +222,6 @@ async function extractPersonioSlug(careerPageUrl) {
 
     const $ = cheerio.load(html);
 
-    // Search in iframes, a tags, script tags
     let foundUrl = null;
     $('iframe[src*="personio"], a[href*="personio"], script[src*="personio"]').each((_, el) => {
       const src = $(el).attr('src') || $(el).attr('href') || '';
@@ -219,21 +243,20 @@ async function extractPersonioSlug(careerPageUrl) {
       }
     }
 
-    // Also try to find a link with "jobs.personio.de"
+    let slugFromJobsLink = null;
     $('a').each((_, el) => {
       const href = $(el).attr('href') || '';
       if (href.includes('jobs.personio.de')) {
         const match = href.match(/https?:\/\/([^.]+)\.jobs\.personio\.de/);
-        if (match) {
-          console.log(`    ✅ Slug from jobs link: ${match[1]}`);
-          return { type: 'subdomain', slug: match[1] };
-        }
+        if (match) slugFromJobsLink = match[1];
       }
     });
+    if (slugFromJobsLink) {
+      console.log(`    ✅ Slug from jobs link: ${slugFromJobsLink}`);
+      return { type: 'subdomain', slug: slugFromJobsLink };
+    }
 
-    // Check if the page itself is a Personio page
     if (html.includes('personio')) {
-      // Try to extract from script tags
       const scriptMatches = html.match(/https?:\/\/([^.]+)\.(?:career\.)?personio\.(?:de|com)/g);
       if (scriptMatches && scriptMatches.length > 0) {
         const m = scriptMatches[0].match(/https?:\/\/([^.]+)\.(?:career\.)?personio\.(?:de|com)/);
@@ -244,7 +267,6 @@ async function extractPersonioSlug(careerPageUrl) {
       }
     }
 
-    // Try to find Personio widget in data attributes
     const dataSlug = $('[data-personio-url]').attr('data-personio-url') ||
                      $('[data-company]').attr('data-company');
     if (dataSlug) {
@@ -252,7 +274,6 @@ async function extractPersonioSlug(careerPageUrl) {
       return { type: 'subdomain', slug: dataSlug };
     }
 
-    // Try to find from div with class containing personio
     const personioContainer = $('[class*="personio"]').first();
     if (personioContainer.length) {
       const containerText = personioContainer.text();
@@ -271,6 +292,33 @@ async function extractPersonioSlug(careerPageUrl) {
   return null;
 }
 
+// ─── PARSE jobDescriptions BLOCK FROM RAW XML ────────────────────────────
+function parseXmlJobDescriptions(positionXml) {
+  const block = positionXml.match(/<jobDescriptions>([\s\S]*?)<\/jobDescriptions>/i);
+  if (!block) return '';
+
+  const descItems = block[1].match(/<jobDescription>([\s\S]*?)<\/jobDescription>/gi) || [];
+  const parts = [];
+
+  for (const item of descItems) {
+    const nameMatch = item.match(/<name>([\s\S]*?)<\/name>/i);
+    const valueMatch = item.match(/<value>([\s\S]*?)<\/value>/i);
+    const heading = nameMatch ? decodeCdata(nameMatch[1]) : '';
+    const rawValue = valueMatch ? decodeCdata(valueMatch[1]) : '';
+    const cleanValue = stripHtmlToText(rawValue);
+
+    if (cleanValue) {
+      parts.push(heading ? `${heading}:\n${cleanValue}` : cleanValue);
+    }
+  }
+
+  if (parts.length === 0) {
+    return stripHtmlToText(decodeCdata(block[1]));
+  }
+
+  return parts.join('\n\n');
+}
+
 // ─── FETCH PERSONIO JOBS (with API fallbacks) ─────────────────────────────
 async function fetchPersonioJobs(slug) {
   const results = [];
@@ -279,7 +327,7 @@ async function fetchPersonioJobs(slug) {
   try {
     const xmlUrl = `https://${slug}.jobs.personio.de/xml`;
     console.log(`    📡 Trying XML API: ${xmlUrl}`);
-    
+
     const response = await axios.get(xmlUrl, {
       timeout: 15000,
       headers: { 'User-Agent': 'Mozilla/5.0' }
@@ -287,24 +335,24 @@ async function fetchPersonioJobs(slug) {
 
     const xml = response.data;
     const positions = xml.match(/<position[^>]*>([\s\S]*?)<\/position>/g) || [];
-    
+
     for (const pos of positions) {
       const getId = (tag) => {
         const match = pos.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i'));
         return match ? match[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim() : null;
       };
       const id = getId('id') || String(Math.random());
-      const title = getId('name') || getId('title') || 'Untitled';
-      const location = getId('office') || getId('location') || null;
-      const employmentType = getId('schedule') || null;
-      const description = getId('jobDescriptions') || getId('description') || '';
-      
+      const title = cleanOrNull(getId('name') || getId('title')) || 'Untitled';
+      const location = cleanOrNull(getId('office') || getId('location'));
+      const employmentType = cleanOrNull(getId('schedule'));
+      const description = cleanOrNull(parseXmlJobDescriptions(pos));
+
       results.push({
         external_job_id: id,
         title: title,
         location: location,
         employment_type: employmentType,
-        raw_description: description.slice(0, 5000),
+        raw_description: description ? description.slice(0, 8000) : null,
         apply_url: `https://${slug}.jobs.personio.de/job/${id}`,
         ats_source: 'personio'
       });
@@ -315,7 +363,9 @@ async function fetchPersonioJobs(slug) {
       return results;
     }
   } catch (err) {
-    if (err.response?.status === 429) {
+    if (err.response?.status === 404) {
+      console.log(`    ⚠️ XML API returned 404 – trying JSON API...`);
+    } else if (err.response?.status === 429) {
       console.log(`    ⚠️ XML API rate limited (429) – waiting 5s...`);
       await new Promise(r => setTimeout(r, 5000));
       // Retry once
@@ -333,16 +383,16 @@ async function fetchPersonioJobs(slug) {
             return match ? match[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim() : null;
           };
           const id = getId('id') || String(Math.random());
-          const title = getId('name') || getId('title') || 'Untitled';
-          const location = getId('office') || getId('location') || null;
-          const employmentType = getId('schedule') || null;
-          const description = getId('jobDescriptions') || getId('description') || '';
+          const title = cleanOrNull(getId('name') || getId('title')) || 'Untitled';
+          const location = cleanOrNull(getId('office') || getId('location'));
+          const employmentType = cleanOrNull(getId('schedule'));
+          const description = cleanOrNull(parseXmlJobDescriptions(pos));
           results.push({
             external_job_id: id,
             title: title,
             location: location,
             employment_type: employmentType,
-            raw_description: description.slice(0, 5000),
+            raw_description: description ? description.slice(0, 8000) : null,
             apply_url: `https://${slug}.jobs.personio.de/job/${id}`,
             ats_source: 'personio'
           });
@@ -378,12 +428,33 @@ async function fetchPersonioJobs(slug) {
     if (items.length > 0) {
       for (const item of items) {
         const attrs = item.attributes || {};
+        let location = null;
+        if (attrs.office?.attributes?.name) {
+          location = cleanOrNull(attrs.office.attributes.name);
+        } else if (Array.isArray(attrs.offices) && attrs.offices.length > 0) {
+          const names = attrs.offices
+            .map(o => o.attributes?.name)
+            .filter(Boolean);
+          if (names.length > 0) location = cleanOrNull(names.join(', '));
+        }
+
+        const rawDescs = Array.isArray(attrs.jobDescriptions) ? attrs.jobDescriptions : [];
+        const descParts = rawDescs
+          .map(d => {
+            const heading = cleanOrNull(d.name);
+            const clean = stripHtmlToText(d.value);
+            if (!clean) return null;
+            return heading ? `${heading}:\n${clean}` : clean;
+          })
+          .filter(Boolean);
+        const description = descParts.length > 0 ? descParts.join('\n\n') : null;
+
         results.push({
           external_job_id: String(item.id),
-          title: attrs.name || 'Untitled',
-          location: attrs.office?.attributes?.name || null,
-          employment_type: attrs.schedule || null,
-          raw_description: (attrs.jobDescriptions || []).map(d => d.value).join('\n').slice(0, 5000),
+          title: cleanOrNull(attrs.name) || 'Untitled',
+          location: location,
+          employment_type: cleanOrNull(attrs.schedule),
+          raw_description: description ? description.slice(0, 8000) : null,
           apply_url: `https://${slug}.jobs.personio.de/job/${item.id}`,
           ats_source: 'personio'
         });
@@ -392,42 +463,55 @@ async function fetchPersonioJobs(slug) {
       return results;
     }
   } catch (err) {
-    if (err.response?.status === 429) {
+    if (err.response?.status === 404) {
+      console.log(`    ⚠️ JSON API returned 404 – trying HTML scrape...`);
+    } else if (err.response?.status === 429) {
       console.log(`    ⚠️ JSON API rate limited (429) – skipping`);
     } else {
       console.log(`    ⚠️ JSON API failed: ${err.message}`);
     }
   }
 
-  // Method 3: HTML scraping (last resort)
+  // ─── Method 3: HTML scraping (last resort) ─────────────────────────────
+  // 🔥 FIX: Only scrape if we can find real job IDs. Skip fake IDs.
   if (results.length === 0) {
     try {
       const pageUrl = `https://${slug}.jobs.personio.de`;
       console.log(`    📡 Trying HTML scrape: ${pageUrl}`);
 
-      const html = await fetchHtmlWithFallback(pageUrl);
+      // Single fetch attempt
+      const html = await fetchHtmlWithFallback(pageUrl, 0);
       if (!html) {
-        console.log(`    ❌ Could not fetch page`);
+        console.log(`    ❌ Could not fetch page – skipping HTML scrape`);
         return results;
       }
 
       const $ = cheerio.load(html);
 
-      // Job listings parse karo
-      $('[data-position-id], .job-position, .position-item, [class*="job-"], [class*="position"]').each((_, el) => {
-        const id = $(el).attr('data-position-id') || 
-                   $(el).attr('data-id') || 
-                   $(el).find('a[href*="job/"]').attr('href')?.match(/job\/(\d+)/)?.[1] ||
-                   String(Math.random());
-        
+      // First, check if there are any job elements with real IDs
+      const hasJobElements = $('[data-position-id]').length > 0 || 
+                             $('a[href*="job/"]').length > 0 ||
+                             $('.job-position, .position-item').length > 0;
+
+      if (!hasJobElements) {
+        console.log(`    ⚠️ No job elements found on page – skipping HTML scrape`);
+        return results;
+      }
+
+      // Extract jobs using data-position-id (Personio's pattern)
+      $('[data-position-id]').each((_, el) => {
+        const id = $(el).attr('data-position-id');
+        // Only accept numeric IDs (not random strings)
+        if (!id || !/^\d+$/.test(id)) return;
+
         const title = $(el).find('h2, h3, .title, [class*="title"]').first().text().trim();
         const location = $(el).find('[class*="location"], [class*="office"]').first().text().trim();
 
         if (title) {
           results.push({
             external_job_id: id,
-            title,
-            location: location || null,
+            title: title || 'Untitled',
+            location: cleanOrNull(location),
             raw_description: null,
             apply_url: `https://${slug}.jobs.personio.de/job/${id}`,
             ats_source: 'personio'
@@ -435,12 +519,13 @@ async function fetchPersonioJobs(slug) {
         }
       });
 
-      // Also check regular links
+      // If no jobs found via data-position-id, try looking for links with job IDs
       if (results.length === 0) {
         $('a[href*="job/"]').each((_, el) => {
           const href = $(el).attr('href');
-          const id = href?.match(/job\/(\d+)/)?.[1];
-          if (id) {
+          const idMatch = href?.match(/job\/(\d+)/);
+          if (idMatch && idMatch[1]) {
+            const id = idMatch[1];
             const title = $(el).text().trim();
             results.push({
               external_job_id: id,
@@ -454,8 +539,55 @@ async function fetchPersonioJobs(slug) {
         });
       }
 
+      // If we found jobs with real IDs, try to enrich with detail pages (only if needed)
       if (results.length > 0) {
+        const detailCache = new Map();
+
+        for (const job of results) {
+          // Skip if we already have both description and location
+          if (job.raw_description && job.location) continue;
+
+          // Check cache
+          if (detailCache.has(job.apply_url)) {
+            const cached = detailCache.get(job.apply_url);
+            if (!job.raw_description) job.raw_description = cached.raw_description;
+            if (!job.location) job.location = cached.location;
+            continue;
+          }
+
+          try {
+            console.log(`    📡 Fetching detail: ${job.apply_url}`);
+            const detailHtml = await fetchHtmlWithFallback(job.apply_url, 1);
+            if (detailHtml) {
+              const $$ = cheerio.load(detailHtml);
+
+              if (!job.raw_description) {
+                const bodyText = $$('main, .job-description, [class*="description"], article').first().text();
+                job.raw_description = cleanOrNull(
+                  bodyText ? bodyText.replace(/\s+/g, ' ').trim().slice(0, 8000) : null
+                );
+              }
+
+              if (!job.location) {
+                const locText = $$('[class*="location"], [class*="office"]').first().text();
+                job.location = cleanOrNull(locText);
+              }
+
+              detailCache.set(job.apply_url, {
+                raw_description: job.raw_description,
+                location: job.location
+              });
+            }
+          } catch (detailErr) {
+            console.log(`    ⚠️ Detail fetch failed for ${job.apply_url}: ${detailErr.message}`);
+          }
+          await new Promise(r => setTimeout(r, 300));
+        }
+
         console.log(`    ✅ Found ${results.length} jobs via HTML scrape`);
+        return results;
+      } else {
+        console.log(`    ⚠️ No valid job IDs found in HTML scrape`);
         return results;
       }
     } catch (err) {
@@ -484,9 +616,16 @@ async function processPersonioCompany(company) {
 
   console.log(`   ✅ Slug: ${slugData.slug}`);
   const jobs = await fetchPersonioJobs(slugData.slug);
-  console.log(`   📋 Total jobs: ${jobs.length}`);
 
-  return { company, slug: slugData.slug, jobs, error: null };
+  // Enrich each job with the company name
+  const enrichedJobs = jobs.map(job => ({
+    ...job,
+    company_name: cleanOrNull(company.Name)
+  }));
+
+  console.log(`   📋 Total jobs: ${enrichedJobs.length}`);
+
+  return { company, slug: slugData.slug, jobs: enrichedJobs, error: null };
 }
 
 module.exports = {
