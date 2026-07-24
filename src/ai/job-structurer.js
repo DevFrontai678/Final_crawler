@@ -1,10 +1,11 @@
 /**
  * src/ai/job-structurer.js
- * 
- * Production-grade rule-based job structurer.
- * Extracts skills from job descriptions using a large, domain‑agnostic dictionary.
- * 
- * Performance: ~0.5ms per job.
+ *
+ * Hybrid rule‑based structurer:
+ * - Uses a curated list (skills-curated.json) + ESCO skills (skills-esco.json)
+ * - Falls back to noun‑phrase extraction with skill indicators
+ * - Caches results by description hash
+ * - No API calls – 100% free
  */
 
 'use strict';
@@ -13,88 +14,59 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-// ─── SKILL DICTIONARY ──────────────────────────────────────────────────────
+// ─── LOAD DICTIONARIES ──────────────────────────────────────────────────
 const SKILL_DICT = new Map();
 
-// 1. Base tech skills (fallback)
-const BASE_SKILLS = [
-    // Programming Languages
-    'python', 'javascript', 'java', 'c++', 'c#', 'ruby', 'php', 'go', 'rust',
-    'typescript', 'kotlin', 'swift', 'scala', 'perl', 'lua', 'r', 'matlab',
-    'sql', 'nosql', 'graphql', 'rest api', 'soap', 'json', 'xml',
-    // Frameworks & Libraries
-    'react', 'angular', 'vue', 'svelte', 'next.js', 'nuxt', 'gatsby',
-    'django', 'flask', 'spring', 'spring boot', 'hibernate', 'laravel',
-    'express', 'node.js', 'asp.net', '.net core', 'rails', 'phoenix',
-    // Cloud & DevOps
-    'aws', 'azure', 'gcp', 'docker', 'kubernetes', 'terraform', 'ansible',
-    'puppet', 'chef', 'jenkins', 'gitlab ci', 'github actions', 'circleci',
-    'linux', 'windows server', 'unix', 'bash', 'powershell', 'shell scripting',
-    // Databases
-    'mysql', 'postgresql', 'mongodb', 'redis', 'elasticsearch', 'cassandra',
-    'oracle', 'sql server', 'firebase', 'dynamodb', 'cosmos db',
-    // Data Science & AI
-    'machine learning', 'deep learning', 'nlp', 'computer vision', 'llm',
-    'tensorflow', 'pytorch', 'scikit-learn', 'pandas', 'numpy', 'spark',
-    'hadoop', 'kafka', 'airflow', 'mlflow', 'kubeflow',
-    // Security
-    'cybersecurity', 'network security', 'application security', 'penetration testing',
-    'siem', 'firewalls', 'vpn', 'zero trust', 'iam', 'pki',
-    // Project Management & Methodologies
-    'agile', 'scrum', 'kanban', 'waterfall', 'jira', 'confluence',
-    'project management', 'program management', 'portfolio management',
-    'risk management', 'change management', 'stakeholder management',
-    // Business & Soft Skills
-    'sales', 'marketing', 'business development', 'negotiation', 'communication',
-    'leadership', 'team building', 'coaching', 'mentoring', 'decision making',
-    // German-specific
-    'projektmanagement', 'vertrieb', 'marketing', 'buchhaltung', 'controlling',
-    'personalmanagement', 'einkauf', 'logistik', 'qualitätsmanagement',
-    // Healthcare, Education, Engineering
-    'healthcare', 'patient care', 'emr', 'education', 'teaching', 'engineering',
-    'mechanical engineering', 'electrical engineering', 'civil engineering',
-    // Add more as needed
-];
-
-// 2. Load custom dictionary from the generated JSON file
-let CUSTOM_SKILLS = [];
-try {
-    const dictPath = path.join(__dirname, 'skills-dictionary.json');
-    if (fs.existsSync(dictPath)) {
-        const raw = fs.readFileSync(dictPath, 'utf8');
-        const parsed = JSON.parse(raw);
-        CUSTOM_SKILLS = Object.keys(parsed);
-        console.log(`✅ Loaded ${CUSTOM_SKILLS.length} custom skills from dictionary.`);
-    } else {
-        console.warn('⚠️ skills-dictionary.json not found – using base skills only.');
+function loadDictionary(fileName) {
+    try {
+        const filePath = path.join(__dirname, fileName);
+        if (fs.existsSync(filePath)) {
+            const raw = fs.readFileSync(filePath, 'utf8');
+            const list = JSON.parse(raw);
+            list.forEach(s => SKILL_DICT.set(s.toLowerCase().trim(), s));
+            console.log(`✅ Loaded ${list.length} skills from ${fileName}`);
+        }
+    } catch (e) {
+        console.warn(`⚠️ Could not load ${fileName}:`, e.message);
     }
-} catch (e) {
-    console.warn('⚠️ Could not load custom skills-dictionary.json:', e.message);
 }
 
-// 3. Merge and populate SKILL_DICT (deduplicate)
-const ALL_SKILLS = [...BASE_SKILLS, ...CUSTOM_SKILLS];
-ALL_SKILLS.forEach(skill => {
-    const key = skill.toLowerCase().trim();
-    SKILL_DICT.set(key, key);
-});
+// Load both curated and ESCO dictionaries
+loadDictionary('skills-curated.json');
+loadDictionary('skills-esco.json');
 
-console.log(`📚 Total skills in dictionary: ${SKILL_DICT.size}`);
+console.log(`📚 Total skills loaded: ${SKILL_DICT.size}`);
 
-// ─── SYNONYMS ──────────────────────────────────────────────────────────────
-const SYNONYMS = {
-    'kubernetes': 'k8s',
-    'javascript': 'js',
-    'typescript': 'ts',
-    'machine learning': 'ml',
-    'deep learning': 'dl',
-    'natural language processing': 'nlp',
-    'cyber security': 'cybersecurity',
-    'project management': 'project manager',
-    'product management': 'product manager',
-};
+// ─── STOPWORDS ──────────────────────────────────────────────────────────
+const STOPWORDS = new Set([
+    'a', 'an', 'the', 'of', 'for', 'on', 'with', 'at', 'by', 'in', 'to',
+    'from', 'into', 'through', 'during', 'including', 'without', 'per',
+    'und', 'der', 'die', 'das', 'den', 'dem', 'des', 'ein', 'eine', 'einen',
+    'einer', 'eines', 'für', 'mit', 'auf', 'bei', 'zur', 'zum', 'durch',
+    'und', 'oder', 'von', 'mit', 'als', 'wie', 'ist', 'sind', 'werden',
+    'wurde', 'wird', 'haben', 'hat', 'hatte', 'sein', 'war', 'waren',
+    'wir', 'sie', 'ich', 'du', 'er', 'es', 'nicht', 'kein', 'keine',
+    'you', 'our', 'your', 'we', 'us', 'their', 'them', 'its', 'his', 'her',
+    'sich', 'einem', 'einen', 'einer', 'eines', 'der', 'die', 'das',
+    'karriere', 'jobs', 'career', 'careers', 'join', 'team', 'company',
+    'employees', 'work', 'working', 'job', 'position', 'stellen', 'stelle',
+    'bewerben', 'bewerbung', 'bewirb', 'apply', 'application', 'cv', 'resume',
+    'linkedin', 'xing', 'recruiting', 'hire', 'hiring', 'recruitment',
+]);
 
-// ─── PATTERNS ──────────────────────────────────────────────────────────────
+// ─── SKILL INDICATORS (for fallback extraction) ────────────────────────
+const SKILL_INDICATORS = [
+    'management', 'engineer', 'developer', 'analyst', 'consultant', 'specialist',
+    'expert', 'coordinator', 'supervisor', 'director', 'manager', 'leader',
+    'technician', 'operator', 'driver', 'care', 'nurse', 'doctor', 'teacher',
+    'instructor', 'trainer', 'sales', 'marketing', 'finance', 'accounting',
+    'logistics', 'warehouse', 'production', 'quality', 'maintenance',
+    'repair', 'installation', 'programming', 'design', 'testing',
+    'planning', 'administration', 'supervision', 'coaching', 'mentoring',
+    'research', 'communication', 'negotiation', 'leadership', 'problem solving',
+];
+
+// ─── PATTERNS ──────────────────────────────────────────────────────────
 const PATTERNS = {
     seniority: [
         { level: 'junior', keywords: ['junior', 'entry', 'einstieg', 'trainee', 'praktikant', 'werkstudent', 'berufsanfänger'] },
@@ -117,7 +89,7 @@ const PATTERNS = {
     city: /(?:in|Standort:|Ort:|Location:)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
 };
 
-// ─── CACHE ──────────────────────────────────────────────────────────────────
+// ─── CACHE ──────────────────────────────────────────────────────────────
 const descriptionCache = new Map();
 const CACHE_SIZE = 10000;
 
@@ -133,40 +105,65 @@ function setCachedResult(descHash, result) {
     descriptionCache.set(descHash, result);
 }
 
-// ─── EXTRACT SKILLS ────────────────────────────────────────────────────────
+// ─── EXTRACT SKILLS ────────────────────────────────────────────────────
 function extractSkills(text) {
     const lower = text.toLowerCase();
     const found = new Set();
 
-    const tokens = lower.split(/[\s,.;!?()"']+/).filter(t => t.length > 1);
-    
-    for (const token of tokens) {
-        if (SKILL_DICT.has(token)) {
-            found.add(token);
+    // Tokenize
+    const tokens = lower.split(/[\s,.;!?()"']+/).filter(t => t.length > 1 && !STOPWORDS.has(t));
+
+    // 1. Dictionary match (single, bigram, trigram)
+    for (const t of tokens) {
+        if (SKILL_DICT.has(t)) found.add(t);
+    }
+    for (let i = 0; i < tokens.length - 1; i++) {
+        const b = tokens[i] + ' ' + tokens[i+1];
+        if (SKILL_DICT.has(b)) found.add(b);
+        if (i < tokens.length - 2) {
+            const t = tokens[i] + ' ' + tokens[i+1] + ' ' + tokens[i+2];
+            if (SKILL_DICT.has(t)) found.add(t);
         }
     }
-    
-    for (let i = 0; i < tokens.length - 1; i++) {
-        const bigram = tokens[i] + ' ' + tokens[i+1];
-        if (SKILL_DICT.has(bigram)) {
-            found.add(bigram);
-        }
-        if (i < tokens.length - 2) {
-            const trigram = tokens[i] + ' ' + tokens[i+1] + ' ' + tokens[i+2];
-            if (SKILL_DICT.has(trigram)) {
-                found.add(trigram);
+
+    // 2. Fallback: extract phrases with skill indicators
+    if (found.size === 0) {
+        for (let i = 0; i < tokens.length - 1; i++) {
+            const w1 = tokens[i], w2 = tokens[i+1];
+            if (!STOPWORDS.has(w1) && !STOPWORDS.has(w2) && w1.length > 2 && w2.length > 2 && !/\d/.test(w1+w2)) {
+                const bigram = w1 + ' ' + w2;
+                const hasIndicator = SKILL_INDICATORS.some(ind => w1.includes(ind) || w2.includes(ind) || bigram.includes(ind));
+                if (hasIndicator) {
+                    found.add(bigram);
+                }
+            }
+            if (i < tokens.length - 2) {
+                const w3 = tokens[i+2];
+                if (!STOPWORDS.has(w3) && w3.length > 2) {
+                    const trigram = w1 + ' ' + w2 + ' ' + w3;
+                    const hasIndicator = SKILL_INDICATORS.some(ind => trigram.includes(ind));
+                    if (hasIndicator && !/\d/.test(trigram)) {
+                        found.add(trigram);
+                    }
+                }
             }
         }
     }
 
-    const result = [];
-    for (const skill of found) {
-        result.push(SYNONYMS[skill] || skill);
+    // 3. Last resort: any 2‑word phrase that is not all digits/stopwords
+    if (found.size === 0) {
+        for (let i = 0; i < tokens.length - 1; i++) {
+            const w1 = tokens[i], w2 = tokens[i+1];
+            if (!STOPWORDS.has(w1) && !STOPWORDS.has(w2) && w1.length > 2 && w2.length > 2 && !/\d/.test(w1+w2)) {
+                found.add(w1 + ' ' + w2);
+            }
+        }
     }
-    return result;
+
+    return [...found].slice(0, 10);
 }
 
-// ─── MATCH PATTERNS ──────────────────────────────────────────────────────
+// ─── HELPERS FOR OTHER FIELDS ────────────────────────────────────────
 function matchPattern(text, patterns) {
     const lower = text.toLowerCase();
     for (const p of patterns) {
@@ -177,7 +174,6 @@ function matchPattern(text, patterns) {
     return null;
 }
 
-// ─── EXTRACT CITY ────────────────────────────────────────────────────────
 function extractCity(text) {
     const match = text.match(PATTERNS.city);
     if (match) {
@@ -189,14 +185,13 @@ function extractCity(text) {
     return null;
 }
 
-// ─── MAIN STRUCTURE FUNCTION ──────────────────────────────────────────────
+// ─── MAIN STRUCTURE FUNCTION ──────────────────────────────────────────
 async function structureJob(job) {
     const title = job.title || '';
     const description = job.raw_description || '';
     const fullText = `${title} ${description}`;
-    
-    const descHash = crypto.createHash('md5').update(description).digest('hex');
-    
+    const descHash = crypto.createHash('md5').update(description || '').digest('hex');
+
     const cached = getCachedResult(descHash);
     if (cached) return cached;
 
@@ -216,7 +211,7 @@ async function structureJob(job) {
         job_category: null,
     };
 
-    if (description.length > 50) {
+    if (description && description.length > 50) {
         setCachedResult(descHash, result);
     }
 

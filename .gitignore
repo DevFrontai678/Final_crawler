@@ -7,3 +7,28 @@ dist/
 *.save.*
 .env
 salesforce-lwc/server.key
+# Pipeline locks & checkpoints
+.pipeline.lock
+.pipeline-checkpoint
+.cycle-start-time
+
+# Backups
+*.backup
+*.bak
+*.save
+*.save.*
+
+# SSL certificates
+*.pem
+*.crt
+*.key
+
+# Logs
+logs/
+*.log
+
+# ESCO dictionary (if too large >100MB)
+src/ai/skills-dictionary.json
+src/ai/esco-skills-*.json
+# But we may want to keep skills-esco.json if small enough
+src/ai/skills-esco.json

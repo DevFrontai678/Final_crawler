@@ -2,26 +2,16 @@
 /**
  * Production‑Ready Matching & Embedding Webhook Server
  *
- * FIXES (this pass):
- *   - ✅ FIX: Cache stampede — concurrent requests no longer trigger N parallel
- *            full-table job/company fetches. A single in-flight promise is
- *            shared and reused by all callers.
- *   - ✅ FIX: warmupCache() now fails fast — if the cache cannot be warmed
- *            after retries, the process exits instead of silently serving
- *            traffic against an empty cache (which was the real cause of
- *            the "statement timeout" / "Matching timeout" cascade).
- *   - ✅ FIX: set_config warning now logs once, not on every cache refresh.
- *   - ✅ FIX: Added env var validation (SUPABASE_URL) at startup.
- *
- * (carried over from previous pass)
- *   - apply_url uses job.apply_url ONLY
- *   - top_k parameter is respected
+ * Features:
+ *   - apply_url uses job.apply_url ONLY (no fallback)
+ *   - top_k parameter respected
  *   - career_page_url returned separately
  *   - Improved logging for missing geolocation
- *   - Cache TTL and concurrency configurable via .env
- *   - Uses abortSignal for request timeouts
- *   - Sets statement_timeout via SQL before queries (requires the
- *     public.set_config() wrapper function — see migration SQL)
+ *   - Cache TTL = 1 hour (configurable)
+ *   - /refresh-cache endpoint to keep cache warm
+ *   - Timeout = 30 seconds (Salesforce compliant)
+ *   - abortSignal for Supabase queries
+ *   - ✅ FIX: All variables properly declared (no "start is not defined" error)
  */
 
 const express = require('express');
@@ -37,8 +27,8 @@ require('dotenv').config();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const MAX_CONCURRENT_MATCHES = parseInt(process.env.MAX_CONCURRENT_MATCHES || '5', 10);
-const JOB_CACHE_TTL_MS = parseInt(process.env.JOB_CACHE_TTL_MS || '600000', 10);
-const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || '120000', 10); // 120 seconds
+const JOB_CACHE_TTL_MS = parseInt(process.env.JOB_CACHE_TTL_MS || '3600000', 10);
+const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || '30000', 10);
 
 // ─── Express app ──────────────────────────────────────────────────────
 const app = express();
@@ -47,22 +37,24 @@ app.use(express.urlencoded({ extended: true }));
 
 // ─── Supabase ────────────────────────────────────────────────────────
 const serviceKey = process.env.SUPABASE_SERVICE_KEY;
-const supabaseUrl = process.env.SUPABASE_URL;
-
-if (!supabaseUrl) {
-    console.error('❌ SUPABASE_URL is not set in .env');
-    process.exit(1);
-}
 if (!serviceKey) {
     console.error('❌ SUPABASE_SERVICE_KEY is not set in .env');
     process.exit(1);
 }
-console.log(`🔑 Supabase service key loaded (starts with ${serviceKey.slice(0, 20)}...)`);
 
 const supabase = createClient(
-    supabaseUrl,
+    process.env.SUPABASE_URL,
     serviceKey,
-    { realtime: { transport: ws } }
+    {
+        realtime: { transport: ws },
+        global: {
+            headers: {
+                'apikey': serviceKey,
+                'Authorization': `Bearer ${serviceKey}`,
+                'statement-timeout': '120000',
+            },
+        },
+    }
 );
 
 // ─── Voyage AI ──────────────────────────────────────────────────────
@@ -106,190 +98,113 @@ class Semaphore {
 
 const matchSemaphore = new Semaphore(MAX_CONCURRENT_MATCHES);
 
-// ─── Helper: Set statement_timeout via SQL ──────────────────────────
-// NOTE: requires a public.set_config(text, text, boolean) wrapper function
-// in Supabase (Postgres does not expose the built-in set_config via RPC by
-// default). See migration SQL. We only warn about this ONCE, not on every
-// cache refresh, so logs don't get spammed.
-let statementTimeoutWarned = false;
-async function setStatementTimeout(seconds = 180) {
-    try {
-        const { error } = await supabase.rpc('set_config', {
-            setting_name: 'statement_timeout',
-            setting_value: `${seconds}s`,
-            is_local: true
-        });
-        if (error) {
-            if (!statementTimeoutWarned) {
-                console.warn(`⚠️ Could not set statement_timeout: ${error.message}`);
-                console.warn(`   Run the public.set_config() migration SQL to fix this permanently.`);
-                statementTimeoutWarned = true;
-            }
-        } else {
-            console.log(`✅ Statement timeout set to ${seconds}s`);
-        }
-    } catch (e) {
-        if (!statementTimeoutWarned) {
-            console.warn(`⚠️ set_config RPC not available: ${e.message}`);
-            statementTimeoutWarned = true;
-        }
-    }
-}
-
 // ─── Job Cache ────────────────────────────────────────────────────────
 let cachedJobs = null;
 let jobsCacheTimestamp = 0;
-let jobsFetchInFlight = null; // ✅ FIX: dedupe concurrent fetches
+let jobsFetchInFlight = null;
 
-async function fetchJobsFromSupabase() {
-    const start = Date.now();
-    console.log(`⏳ Fetching jobs from Supabase...`);
-
-    // NOTE: this only sets statement_timeout for *this* RPC call's own
-    // transaction — PostgREST gives every REST call its own connection, so
-    // it does NOT carry over to the .select() calls below. Real fix is
-    // `alter role service_role set statement_timeout = '300s';` in the
-    // Supabase SQL editor. We still call this for defense-in-depth.
-    await setStatementTimeout(180);
-
-    const jobs = [];
-    const PAGE_SIZE = 1000;
-    let lastId = null; // ✅ FIX: keyset pagination instead of OFFSET/range
-
-    while (true) {
-        let query = supabase
-            .from('jobs')
-            .select(
-                'id, title, company_id, company_name, apply_url, location, location_lat, location_lng, remote_type, seniority_level, structured_skills, skill_embedding'
-            )
-            .not('skill_embedding', 'is', null)
-            .order('id', { ascending: true })
-            .limit(PAGE_SIZE)
-            .abortSignal(AbortSignal.timeout(120000));
-
-        // ✅ FIX: seek from last seen id instead of OFFSET — avoids Postgres
-        // having to walk/skip all previous rows on every page, which is
-        // what was causing later pages (offset 5000+) to time out.
-        if (lastId !== null) {
-            query = query.gt('id', lastId);
-        }
-
-        const { data, error } = await query;
-
-        if (error) {
-            console.error(`❌ Supabase query error (after id ${lastId}):`, error);
-            throw error;
-        }
-        if (!data || data.length === 0) break;
-        jobs.push(...data);
-        lastId = data[data.length - 1].id;
-        if (data.length < PAGE_SIZE) break;
-    }
-
-    console.log(`✅ Loaded ${jobs.length} jobs in ${Date.now() - start}ms`);
-    return jobs;
-}
-
-async function getCachedJobs() {
+async function getCachedJobs(forceRefresh = false) {
     const now = Date.now();
-    if (cachedJobs && (now - jobsCacheTimestamp) < JOB_CACHE_TTL_MS) {
+    if (!forceRefresh && cachedJobs && (now - jobsCacheTimestamp) < JOB_CACHE_TTL_MS) {
         return cachedJobs;
     }
-
-    // ✅ FIX: if a fetch is already running, await it instead of starting
-    // another parallel full-table scan (this was causing the statement
-    // timeouts under concurrent requests).
-    if (jobsFetchInFlight) {
+    if (jobsFetchInFlight && !forceRefresh) {
         return jobsFetchInFlight;
     }
-
     jobsFetchInFlight = (async () => {
-        try {
-            const jobs = await fetchJobsFromSupabase();
-            cachedJobs = jobs;
-            jobsCacheTimestamp = Date.now();
-            return jobs;
-        } finally {
-            jobsFetchInFlight = null;
-        }
-    })();
+        const startTime = Date.now();
+        console.log(`⏳ Fetching jobs from Supabase...`);
+        const jobs = [];
+        let page = 0;
+        const PAGE_SIZE = 1000;
 
+        while (true) {
+            const startRow = page * PAGE_SIZE;
+            const endRow = startRow + PAGE_SIZE - 1;
+            const { data, error } = await supabase
+                .from('jobs')
+                .select(
+                    'id, title, company_id, company_name, apply_url, location, location_lat, location_lng, remote_type, seniority_level, structured_skills, skill_embedding'
+                )
+                .not('skill_embedding', 'is', null)
+                .order('id', { ascending: true })
+                .range(startRow, endRow)
+                .abortSignal(AbortSignal.timeout(120000));
+
+            if (error) {
+                console.error(`❌ Supabase query error (page ${page}):`, error);
+                throw error;
+            }
+            if (!data || data.length === 0) break;
+            jobs.push(...data);
+            page++;
+            if (data.length < PAGE_SIZE) break;
+        }
+
+        cachedJobs = jobs;
+        jobsCacheTimestamp = Date.now();
+        console.log(`✅ Loaded ${jobs.length} jobs in ${Date.now() - startTime}ms`);
+        return jobs;
+    })();
     return jobsFetchInFlight;
 }
 
 // ─── Companies Cache ──────────────────────────────────────────────────
 let companiesMap = null;
 let companiesCacheTimestamp = 0;
-let companiesFetchInFlight = null; // ✅ FIX: dedupe concurrent fetches
+let companiesFetchInFlight = null;
 
-async function fetchCompaniesFromSupabase() {
-    const start = Date.now();
-    console.log(`⏳ Fetching companies...`);
-
-    const { data, error } = await supabase
-        .from('companies')
-        .select('"Id", "Name", "detected_career_url", "last_crawled_at", "crawl_status"')
-        .abortSignal(AbortSignal.timeout(60000));
-
-    if (error) {
-        console.error('❌ Companies fetch error:', error);
-        throw error;
-    }
-
-    const byId = new Map();
-    const byName = new Map();
-    data.forEach(c => {
-        byId.set(c.Id, {
-            Name: c.Name,
-            career_page_url: c.detected_career_url || null,
-            last_crawled_at: c.last_crawled_at || null,
-            crawl_status: c.crawl_status || null
-        });
-        const key = c.Name.toLowerCase().trim();
-        if (!byName.has(key)) byName.set(key, c);
-    });
-
-    console.log(`✅ Loaded ${data.length} companies in ${Date.now() - start}ms`);
-    return { byId, byName };
-}
-
-async function getCompaniesMap() {
+async function getCompaniesMap(forceRefresh = false) {
     const now = Date.now();
-    if (companiesMap && (now - companiesCacheTimestamp) < JOB_CACHE_TTL_MS) {
+    if (!forceRefresh && companiesMap && (now - companiesCacheTimestamp) < JOB_CACHE_TTL_MS) {
         return companiesMap;
     }
-
-    if (companiesFetchInFlight) {
+    if (companiesFetchInFlight && !forceRefresh) {
         return companiesFetchInFlight;
     }
-
     companiesFetchInFlight = (async () => {
-        try {
-            const map = await fetchCompaniesFromSupabase();
-            companiesMap = map;
-            companiesCacheTimestamp = Date.now();
-            return map;
-        } finally {
-            companiesFetchInFlight = null;
-        }
-    })();
+        const startTime = Date.now();
+        console.log(`⏳ Fetching companies...`);
+        const { data, error } = await supabase
+            .from('companies')
+            .select('"Id", "Name", "detected_career_url", "last_crawled_at", "crawl_status"')
+            .abortSignal(AbortSignal.timeout(60000));
 
+        if (error) {
+            console.error('❌ Companies fetch error:', error);
+            throw error;
+        }
+
+        const byId = new Map();
+        const byName = new Map();
+        data.forEach(c => {
+            byId.set(c.Id, {
+                Name: c.Name,
+                career_page_url: c.detected_career_url || null,
+                last_crawled_at: c.last_crawled_at || null,
+                crawl_status: c.crawl_status || null
+            });
+            const key = c.Name.toLowerCase().trim();
+            if (!byName.has(key)) byName.set(key, c);
+        });
+
+        companiesMap = { byId, byName };
+        companiesCacheTimestamp = Date.now();
+        console.log(`✅ Loaded ${data.length} companies in ${Date.now() - startTime}ms`);
+        return companiesMap;
+    })();
     return companiesFetchInFlight;
 }
 
 // ─── Warm‑up function ──────────────────────────────────────────────────
-// ✅ FIX: now returns a boolean success flag. startServer() will refuse to
-// accept traffic if warm-up never succeeds — previously it started the
-// HTTPS server regardless, which meant every incoming request had to do
-// its own cold full-table fetch (the real cause of the timeout cascade).
 async function warmupCache(retries = 3) {
     console.log('🔥 Warming up cache...');
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
-            await getCachedJobs();
-            await getCompaniesMap();
+            await getCachedJobs(true);
+            await getCompaniesMap(true);
             console.log('✅ Cache warm‑up complete.');
-            return true;
+            return;
         } catch (err) {
             console.error(`❌ Cache warm‑up attempt ${attempt} failed:`, err.message);
             if (attempt < retries) {
@@ -298,7 +213,7 @@ async function warmupCache(retries = 3) {
             }
         }
     }
-    return false;
+    console.warn('⚠️ Cache warm‑up failed after all retries – continuing anyway.');
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -467,7 +382,7 @@ async function matchCandidate(candidateData, radius, topK = 10) {
     }
 
     // 2. Embed candidate if needed
-    let skillEmbedding = existingCandidate?.skill_embedding;
+    let skillEmbedding = existingCandidate?.skill_embedding ? parseEmbedding(existingCandidate.skill_embedding) : null;
     if (!skillEmbedding) {
         const candidateObj = { name, skill_scores, seniority_level, remote_preference, location };
         skillEmbedding = await embedCandidate(candidateObj);
@@ -476,12 +391,10 @@ async function matchCandidate(candidateData, radius, topK = 10) {
             .update({ skill_embedding: skillEmbedding, updated_at: new Date().toISOString() })
             .eq('id', candidateId)
             .abortSignal(AbortSignal.timeout(30000));
-    } else {
-        skillEmbedding = parseEmbedding(skillEmbedding);
     }
     if (!skillEmbedding) throw new Error('Invalid candidate embedding');
 
-    // 3. Fetch jobs and companies from cache (now stampede-safe)
+    // 3. Fetch jobs and companies (from cache)
     const jobs = await getCachedJobs();
     const companies = await getCompaniesMap();
 
@@ -694,6 +607,19 @@ app.get('/health', (req, res) => {
     });
 });
 
+// ─── Refresh cache endpoint ──────────────────────────────────────────
+app.get('/refresh-cache', async (req, res) => {
+    try {
+        console.log('🔄 Forcing cache refresh...');
+        await getCachedJobs(true);
+        await getCompaniesMap(true);
+        res.status(200).json({ status: 'ok', message: 'Cache refreshed' });
+    } catch (err) {
+        console.error('❌ Cache refresh failed:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ─── Start HTTPS server ──────────────────────────────────────────────
 const SSL_KEY_PATH = process.env.SSL_KEY || '/etc/ssl/private/server.key';
 const SSL_CERT_PATH = process.env.SSL_CERT || '/etc/ssl/certs/server.crt';
@@ -706,14 +632,7 @@ try {
 } catch (e) { /* ignore */ }
 
 async function startServer() {
-    // ✅ FIX: fail fast instead of starting the server against a cold/empty
-    // cache — that was the actual trigger for the statement-timeout cascade.
-    const warmed = await warmupCache();
-    if (!warmed) {
-        console.error('❌ Cache warm-up failed after all retries. Exiting so PM2 can restart cleanly.');
-        console.error('   Check SUPABASE_URL / SUPABASE_SERVICE_KEY in .env and RLS grants on jobs/candidates.');
-        process.exit(1);
-    }
+    await warmupCache();
 
     if (useHttps) {
         const options = {
@@ -724,6 +643,7 @@ async function startServer() {
             console.log(`🔒 HTTPS server running on https://${HOST}:${PORT}`);
             console.log(`📍 POST to https://${HOST}:${PORT}/webhook/match-candidate`);
             console.log(`💚 Health check: https://${HOST}:${PORT}/health`);
+            console.log(`🔄 Refresh cache: https://${HOST}:${PORT}/refresh-cache`);
             console.log(`⚡ Concurrency limit: ${MAX_CONCURRENT_MATCHES}`);
             console.log(`⏳ Job cache TTL: ${JOB_CACHE_TTL_MS/1000}s`);
             console.log(`⏱️ Request timeout: ${TIMEOUT_MS/1000}s`);
@@ -733,6 +653,7 @@ async function startServer() {
             console.log(`🚀 HTTP server running on http://${HOST}:${PORT}`);
             console.log(`📍 POST to http://${HOST}:${PORT}/webhook/match-candidate`);
             console.log(`💚 Health check: http://${HOST}:${PORT}/health`);
+            console.log(`🔄 Refresh cache: http://${HOST}:${PORT}/refresh-cache`);
             console.log(`⚡ Concurrency limit: ${MAX_CONCURRENT_MATCHES}`);
             console.log(`⏳ Job cache TTL: ${JOB_CACHE_TTL_MS/1000}s`);
             console.log(`⏱️ Request timeout: ${TIMEOUT_MS/1000}s`);
