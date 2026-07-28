@@ -191,4 +191,4 @@ Run_script scripts/run-embeddings-queue.js --resume
 
 - Data flows: Salesforce (candidates/accounts) → Supabase (structured storage) → Claude/Voyage AI (structuring + embeddings) → matching engine (pgvector) → results written back to Salesforce.
 - n8n orchestrates the end-to-end pipeline and is deployed on a Contabo server.
-- This project is designed from the start to scale to 7,000-8,000 partner accounts, not just the current 200-account pilot.
+- This project is designed from the start to scale to 7,000-8,000 partner accounts.
