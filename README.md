@@ -153,7 +153,7 @@ customer-matching-crawler/
    ```
 ## n8n Workflow
 
-Part 1 – Data Intake & CV Processing
+**Part 1 – Data Intake & CV Processing**
 1. Webhook triggers the workflow when a request comes in.
 2. Get an account and Get a row fetch the relevant Salesforce account/ supabase candidate record.
 3. Candidate Google Job Search (a new workflow call using the webhook that retrieves matching jobs, store in supabase GOOGLE JOB SEARCH TABLE and sends them via email).
@@ -165,7 +165,7 @@ Part 1 – Data Intake & CV Processing
  - If no: Formatting Results Without CV
 7. Both paths go into Merge, then JSON Format to standardize the output.
 
-Part 2 – Matching & Storage
+**Part 2 – Matching & Storage**
 8. Add Candidates Data saves candidate info into Supabase (create row) candidate table.
 9. Embedding & Matches generates embeddings and finds job matches and then store them into matches table into Supabase.
 10. Split Matches Results breaks results into individual item.
