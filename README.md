@@ -40,8 +40,7 @@ This repository is part of a larger three-module project:
 - Write match results back to Salesforce
 - Parse candidate CVs (PDF) from Salesforce attachments and extract work history, employers, education, and additional skills via Claude
 - Combine structured Salesforce fields with PDF content into a unified candidate profile
-- Implement geocoding (Google Maps Geocoding OpenStreetMap Nominatim)
-- Replace city-based filtering with precise distance calculation (PostGIS or Haversine)
+- Implement geocoding (OpenStreetMap)
 - Replace n8n Schedule Trigger with a Webhook Trigger for a full end-to-end flow
 
 ### Week 3: Google Jobs + Scale + Lead Gen Foundation + Cost Analysis
@@ -50,14 +49,12 @@ This repository is part of a larger three-module project:
 - Complete the generic Playwright crawler for all 143 custom career pages, with parallel processing, a queue system, and retry logic (target: 80%+ success rate)
 - Add ATS adapters for Greenhouse, Lever, Workday, and others
 - Filter out recruiting/staffing agencies from match results
-- Deliver a cost analysis (low/high estimate) covering Claude API, Voyage AI, SerpAPI, scraping services, server, and Supabase costs for 30-50 users at 1,000 requests/month
 
 ### Scaling to 7,000-8,000 Partner Accounts
 
 - ATS detection across all accounts
-- Implement a priority queue (BullMQ or n8n queue): daily / every 3-4 days / weekly crawl tiers
+- Implement a priority queue (BullMQ)
 - Cache ATS detection results (90 days) and deduplicate jobs
-- Optimize Supabase indexing for large-scale queries
 
 ## Repository Structure
 
@@ -145,12 +142,26 @@ customer-matching-crawler/
 5. Run ATS detection on the seeded companies:
    ```bash
    node scripts/run-ats-detection.js
-   ```
-6. Generate embeddings and run the matching engine:
-   ```bash
-   node scripts/run-embeddings.js
-   node scripts/run-matching.js
-   ```
+6. Adapters (SEQUENTIAL) 
+run_all_adapter_scripts
+
+7. Softgarden Crawler 
+run_script src/crawlers/softgarden-crawler-queue.js
+
+8. Custom Crawler 
+run_script src/crawlers/custom-crawler-queue.js
+
+9. Backfill + Geocode 
+run_script "scripts/backfill-locations-google.js
+run_script scripts/geocode-jobs.js
+
+10. Job Structuring (WORKER ONLY) 
+run_script scripts/run-job-structuring-worker.js
+
+11. Job Embeddings 
+Run_script scripts/run-embeddings-queue.js --resume
+  ```
+  
 ## n8n Workflow
 
 **Part 1 – Data Intake & CV Processing**
