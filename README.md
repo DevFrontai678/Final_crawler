@@ -166,6 +166,7 @@ customer-matching-crawler/
 7. Both paths go into Merge, then JSON Format to standardize the output.
 
 **Part 2 – Matching & Storage**
+
 8. Add Candidates Data saves candidate info into Supabase (create row) candidate table.
 9. Embedding & Matches generates embeddings and finds job matches and then store them into matches table into Supabase.
 10. Split Matches Results breaks results into individual item.
