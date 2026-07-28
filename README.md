@@ -166,26 +166,28 @@ Run_script scripts/run-embeddings-queue.js --resume
 
 **Part 1 – Data Intake & CV Processing**
 1. Webhook triggers the workflow when a request comes in.
-2. Get an account and Get a row fetch the relevant Salesforce account/ supabase candidate record.
-3. Candidate Google Job Search (a new workflow call using the webhook that retrieves matching jobs, store in supabase GOOGLE JOB SEARCH TABLE and sends them via email).
-4. An If node checks a condition and branches into for the candidate:
+2. Get an account fetches the relevant Salesforce account record.
+3. Get MCG IDs – retrieves the MCQ (question set) IDs linked to that account.
+4. Split Out – breaks the MCQ IDs into individual items so each one can be processed separately.
+5. Candidate Google Job Search (a new workflow call using the webhook that retrieves matching jobs, stored in supabase GOOGLE JOB SEARCH TABLE and sends them via email).
+6. An If node checks a condition and branches into for the candidate:
  - Delete Previous Matches and Delete Previous Candidate Data (clears old match/candidate records before regenerating)
-5. Both branches merge into Get Attachments, which checks if a CV file exists.
-6. CV attached? decision:
+7. Both branches merge into Get Attachments, which checks if a CV file exists.
+8. CV attached? decision:
  - If yes: Get CV ID → Download PDFs → Extract from File → Parse CV's Based on MCQ → Format Results
  - If no: Formatting Results Without CV
-7. Both paths go into Merge, then JSON Format to standardize the output.
+9. Both paths go into Merge, then JSON Format to standardize the output.
 
 **Part 2 – Matching & Storage**
 
-8. Add Candidates Data saves candidate info into Supabase (create row) candidate table.
-9. Embedding & Matches generates embeddings and finds job matches and then store them into matches table into Supabase.
-10. Split Matches Results breaks results into individual item.
-11. Go to Customer Job Advert Crawl Detail (a sub-workflow that check the company status which is crawled or not if not it will create a new crawl details for the relevant company).
-12. Another workflow call for checking the skill fields which are matched with the candidate and salesforce skills. After matching, common skills will be stored in (Candidate Salesforce Matched skills) table in Supabase.
-13. Matches then get Summarized and Combined, feeding into Candidate Job Matching Profile in salesforce.
-14. Aggregate compiles everything, then Matches - Done sends a notification/message.
-15. Finally, Respond to Webhook sends the response back to whoever triggered the workflow.
+10. Add Candidates Data saves candidate info into Supabase (create row) candidate table.
+11. Embedding & Matches generates embeddings and finds job matches and then store them into matches table into Supabase.
+12. Split Matches Results breaks results into individual item.
+13. Go to Customer Job Advert Crawl Detail (a sub-workflow that check the company status which is crawled or not if not it will create a new crawl details for the relevant company).
+14. Another workflow call for checking the skill fields which are matched with the candidate and salesforce skills. After matching, common skills will be stored in (Candidate Salesforce Matched skills) table in Supabase.
+15. Matches then get Summarized and Combined, feeding into Candidate Job Matching Profile in salesforce.
+16. Aggregate compiles everything, then Matches - Done sends a notification/message.
+17. Finally, Respond to Webhook sends the response back to whoever triggered the workflow.
 
 ## Notes
 
