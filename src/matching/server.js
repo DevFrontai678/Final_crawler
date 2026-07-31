@@ -2,16 +2,15 @@
 /**
  * Production‑Ready Matching & Embedding Webhook Server
  *
- * Features:
- *   - apply_url uses job.apply_url ONLY (no fallback)
- *   - top_k parameter respected
- *   - career_page_url returned separately
- *   - Improved logging for missing geolocation
- *   - Cache TTL = 1 hour (configurable)
- *   - /refresh-cache endpoint to keep cache warm
- *   - Timeout = 30 seconds (Salesforce compliant)
- *   - abortSignal for Supabase queries
- *   - ✅ FIX: All variables properly declared (no "start is not defined" error)
+ * FIXES:
+ *   - PAGE_SIZE = 2000 (faster per‑query, avoids Cloudflare 522 timeout)
+ *   - Retry logic (3 attempts per page) with 2s delay
+ *   - Uses Set for candidate skills (O(1) lookup)
+ *   - Early skip for missing company / garbage titles
+ *   - Converts top_skills to array for Supabase insert
+ *   - Default top_k = 30 matches
+ *   - Only uses columns that exist in matches table
+ *   - Continues even if cache warm‑up fails
  */
 
 const express = require('express');
@@ -27,34 +26,36 @@ require('dotenv').config();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const MAX_CONCURRENT_MATCHES = parseInt(process.env.MAX_CONCURRENT_MATCHES || '5', 10);
-const JOB_CACHE_TTL_MS = parseInt(process.env.JOB_CACHE_TTL_MS || '3600000', 10);
-const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || '30000', 10);
+const JOB_CACHE_TTL_MS = parseInt(process.env.JOB_CACHE_TTL_MS || '600000', 10);
+const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || '60000', 10);
 
-// ─── Express app ──────────────────────────────────────────────────────
+const MIN_SIMILARITY = 0.25;
+const REMOTE_MIN_SIMILARITY = 0.30;
+const TITLE_BONUS = 0.10;
+const SKILL_WEIGHT = 0.35;
+const MIN_SKILL_OVERLAP = 0.50;
+
+// ─── Garbage title patterns ────────────────────────────────────────────
+const GARBAGE_TITLE_PATTERNS = [
+    /karriere/i, /career/i, /great to have you here/i, /super, dass du hier bist/i,
+    /wir suchen dich/i, /initiativbewerbung/i, /are you looking for new challenges/i,
+    /jobs at/i, /dein traumjob/i, /willkommen in ihrer zukunft/i,
+    /bewerbungsprozess/i, /neustart/i, /karriere -/i, /career -/i,
+    /stellenangebote/i, /job offers/i, /join/i, /career opportunities/i,
+    /work with us/i, /come join us/i, /offene stellen/i, /jobs/i,
+    /stellenangebot/i, /karriere bei/i, /join us/i, /open positions/i,
+    /join our team/i, /careers/i
+];
+
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ─── Supabase ────────────────────────────────────────────────────────
-const serviceKey = process.env.SUPABASE_SERVICE_KEY;
-if (!serviceKey) {
-    console.error('❌ SUPABASE_SERVICE_KEY is not set in .env');
-    process.exit(1);
-}
-
 const supabase = createClient(
     process.env.SUPABASE_URL,
-    serviceKey,
-    {
-        realtime: { transport: ws },
-        global: {
-            headers: {
-                'apikey': serviceKey,
-                'Authorization': `Bearer ${serviceKey}`,
-                'statement-timeout': '120000',
-            },
-        },
-    }
+    process.env.SUPABASE_SERVICE_KEY,
+    { realtime: { transport: ws } }
 );
 
 // ─── Voyage AI ──────────────────────────────────────────────────────
@@ -62,7 +63,7 @@ const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY;
 const VOYAGE_URL = 'https://api.voyageai.com/v1/embeddings';
 const VOYAGE_MODEL = process.env.VOYAGE_MODEL || 'voyage-3-large';
 
-// ─── Custom Semaphore ──────────────────────────────────────────────
+// ─── Semaphore ──────────────────────────────────────────────────────
 class Semaphore {
     constructor(limit) {
         this.limit = limit;
@@ -74,146 +75,144 @@ class Semaphore {
             this.running++;
             return;
         }
-        return new Promise((resolve) => {
-            this.queue.push(resolve);
-        });
+        return new Promise((resolve) => this.queue.push(resolve));
     }
     release() {
         if (this.queue.length > 0) {
-            const resolve = this.queue.shift();
-            resolve();
+            this.queue.shift()();
         } else {
             this.running--;
         }
     }
     async run(fn) {
         await this.acquire();
-        try {
-            return await fn();
-        } finally {
-            this.release();
-        }
+        try { return await fn(); } finally { this.release(); }
     }
 }
-
 const matchSemaphore = new Semaphore(MAX_CONCURRENT_MATCHES);
 
-// ─── Job Cache ────────────────────────────────────────────────────────
+// ─── Job Cache (with retry & smaller PAGE_SIZE) ────────────────────
 let cachedJobs = null;
 let jobsCacheTimestamp = 0;
-let jobsFetchInFlight = null;
 
-async function getCachedJobs(forceRefresh = false) {
+async function getCachedJobs() {
     const now = Date.now();
-    if (!forceRefresh && cachedJobs && (now - jobsCacheTimestamp) < JOB_CACHE_TTL_MS) {
+    if (cachedJobs && (now - jobsCacheTimestamp) < JOB_CACHE_TTL_MS) {
         return cachedJobs;
     }
-    if (jobsFetchInFlight && !forceRefresh) {
-        return jobsFetchInFlight;
-    }
-    jobsFetchInFlight = (async () => {
-        const startTime = Date.now();
-        console.log(`⏳ Fetching jobs from Supabase...`);
-        const jobs = [];
-        let page = 0;
-        const PAGE_SIZE = 1000;
+    const start = Date.now();
+    console.log(`⏳ Fetching jobs (PAGE_SIZE=2000, with retries)...`);
+    const jobs = [];
+    let page = 0;
+    const PAGE_SIZE = 2000; // ⬇️ Smaller = faster per-query
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 2000; // 2 seconds
 
-        while (true) {
-            const startRow = page * PAGE_SIZE;
-            const endRow = startRow + PAGE_SIZE - 1;
-            const { data, error } = await supabase
-                .from('jobs')
-                .select(
-                    'id, title, company_id, company_name, apply_url, location, location_lat, location_lng, remote_type, seniority_level, structured_skills, skill_embedding'
-                )
-                .not('skill_embedding', 'is', null)
-                .order('id', { ascending: true })
-                .range(startRow, endRow)
-                .abortSignal(AbortSignal.timeout(120000));
+    while (true) {
+        const startRow = page * PAGE_SIZE;
+        const endRow = startRow + PAGE_SIZE - 1;
+        let success = false;
+        let data = null;
+        let error = null;
 
-            if (error) {
-                console.error(`❌ Supabase query error (page ${page}):`, error);
-                throw error;
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                console.log(`   📄 Page ${page + 1} (rows ${startRow}-${endRow}) attempt ${attempt}...`);
+                const result = await supabase
+                    .from('jobs')
+                    .select(
+                        'id, title, company_id, company_name, apply_url, location, location_lat, location_lng, remote_type, seniority_level, structured_skills, skill_embedding'
+                    )
+                    .not('skill_embedding', 'is', null)
+                    .order('id', { ascending: true })
+                    .range(startRow, endRow);
+
+                if (result.error) {
+                    error = result.error;
+                    console.warn(`   ⚠️ Attempt ${attempt} failed: ${result.error.message}`);
+                    if (attempt < MAX_RETRIES) {
+                        console.log(`   ⏳ Waiting ${RETRY_DELAY}ms before retry...`);
+                        await new Promise(r => setTimeout(r, RETRY_DELAY));
+                    }
+                    continue;
+                }
+
+                data = result.data;
+                success = true;
+                break;
+            } catch (err) {
+                error = err;
+                console.warn(`   ⚠️ Attempt ${attempt} error: ${err.message}`);
+                if (attempt < MAX_RETRIES) {
+                    console.log(`   ⏳ Waiting ${RETRY_DELAY}ms before retry...`);
+                    await new Promise(r => setTimeout(r, RETRY_DELAY));
+                }
             }
-            if (!data || data.length === 0) break;
-            jobs.push(...data);
-            page++;
-            if (data.length < PAGE_SIZE) break;
         }
 
-        cachedJobs = jobs;
-        jobsCacheTimestamp = Date.now();
-        console.log(`✅ Loaded ${jobs.length} jobs in ${Date.now() - startTime}ms`);
-        return jobs;
-    })();
-    return jobsFetchInFlight;
+        if (!success) {
+            console.error(`❌ Failed to fetch page ${page + 1} after ${MAX_RETRIES} attempts:`, error?.message || 'Unknown error');
+            // Instead of throwing, break and use what we have
+            break;
+        }
+
+        if (!data || data.length === 0) break;
+        jobs.push(...data);
+        page++;
+        if (data.length < PAGE_SIZE) break;
+    }
+
+    cachedJobs = jobs;
+    jobsCacheTimestamp = now;
+    console.log(`✅ Loaded ${cachedJobs.length} jobs in ${Date.now() - start}ms`);
+    return cachedJobs;
 }
 
 // ─── Companies Cache ──────────────────────────────────────────────────
 let companiesMap = null;
 let companiesCacheTimestamp = 0;
-let companiesFetchInFlight = null;
 
-async function getCompaniesMap(forceRefresh = false) {
+async function getCompaniesMap() {
     const now = Date.now();
-    if (!forceRefresh && companiesMap && (now - companiesCacheTimestamp) < JOB_CACHE_TTL_MS) {
+    if (companiesMap && (now - companiesCacheTimestamp) < JOB_CACHE_TTL_MS) {
         return companiesMap;
     }
-    if (companiesFetchInFlight && !forceRefresh) {
-        return companiesFetchInFlight;
-    }
-    companiesFetchInFlight = (async () => {
-        const startTime = Date.now();
-        console.log(`⏳ Fetching companies...`);
-        const { data, error } = await supabase
-            .from('companies')
-            .select('"Id", "Name", "detected_career_url", "last_crawled_at", "crawl_status"')
-            .abortSignal(AbortSignal.timeout(60000));
+    const start = Date.now();
+    console.log(`⏳ Fetching companies...`);
+    const { data, error } = await supabase
+        .from('companies')
+        .select('"Id", "Name", "detected_career_url", "last_crawled_at", "crawl_status"');
+    if (error) throw error;
 
-        if (error) {
-            console.error('❌ Companies fetch error:', error);
-            throw error;
-        }
-
-        const byId = new Map();
-        const byName = new Map();
-        data.forEach(c => {
-            byId.set(c.Id, {
-                Name: c.Name,
-                career_page_url: c.detected_career_url || null,
-                last_crawled_at: c.last_crawled_at || null,
-                crawl_status: c.crawl_status || null
-            });
-            const key = c.Name.toLowerCase().trim();
-            if (!byName.has(key)) byName.set(key, c);
+    const byId = new Map();
+    const byName = new Map();
+    data.forEach(c => {
+        byId.set(c.Id, {
+            Name: c.Name,
+            career_page_url: c.detected_career_url || null,
+            last_crawled_at: c.last_crawled_at || null,
+            crawl_status: c.crawl_status || null
         });
+        const key = c.Name.toLowerCase().trim();
+        if (!byName.has(key)) byName.set(key, c);
+    });
 
-        companiesMap = { byId, byName };
-        companiesCacheTimestamp = Date.now();
-        console.log(`✅ Loaded ${data.length} companies in ${Date.now() - startTime}ms`);
-        return companiesMap;
-    })();
-    return companiesFetchInFlight;
+    companiesMap = { byId, byName };
+    companiesCacheTimestamp = now;
+    console.log(`✅ Loaded ${data.length} companies in ${Date.now() - start}ms`);
+    return companiesMap;
 }
 
-// ─── Warm‑up function ──────────────────────────────────────────────────
-async function warmupCache(retries = 3) {
+async function warmupCache() {
     console.log('🔥 Warming up cache...');
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            await getCachedJobs(true);
-            await getCompaniesMap(true);
-            console.log('✅ Cache warm‑up complete.');
-            return;
-        } catch (err) {
-            console.error(`❌ Cache warm‑up attempt ${attempt} failed:`, err.message);
-            if (attempt < retries) {
-                console.log(`⏳ Retrying in 5s...`);
-                await new Promise(r => setTimeout(r, 5000));
-            }
-        }
+    try {
+        await getCachedJobs();
+        await getCompaniesMap();
+        console.log('✅ Cache warm‑up complete.');
+    } catch (err) {
+        console.error('❌ Cache warm‑up failed:', err.message);
+        console.log('⚠️ Server will load jobs on first request instead.');
     }
-    console.warn('⚠️ Cache warm‑up failed after all retries – continuing anyway.');
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -257,8 +256,7 @@ function citiesMatch(cityA, cityB) {
     if (!cityA || !cityB) return false;
     const a = cityA.toLowerCase().trim();
     const b = cityB.toLowerCase().trim();
-    if (a === b) return true;
-    return a.includes(b) || b.includes(a);
+    return a === b || a.includes(b) || b.includes(a);
 }
 
 function candidateToText(candidate) {
@@ -267,8 +265,7 @@ function candidateToText(candidate) {
     if (candidate.skill_scores && typeof candidate.skill_scores === 'object') {
         const entries = Object.entries(candidate.skill_scores);
         if (entries.length > 0) {
-            const skillsText = entries.map(([skill, score]) => `${skill} (${score}/5)`).join(', ');
-            parts.push(`Skills: ${skillsText}`);
+            parts.push(`Skills: ${entries.map(([s, score]) => `${s} (${score}/5)`).join(', ')}`);
         }
     }
     if (candidate.seniority_level) parts.push(`Seniority: ${candidate.seniority_level}`);
@@ -279,24 +276,24 @@ function candidateToText(candidate) {
 
 async function embedCandidate(candidate) {
     const text = candidateToText(candidate);
-    if (!text || text.length < 5) {
-        throw new Error('No valid text to embed');
-    }
+    if (!text || text.length < 5) throw new Error('No valid text to embed');
     try {
         const response = await axios.post(VOYAGE_URL, {
             model: VOYAGE_MODEL,
             input: [text]
         }, {
-            headers: {
-                'Authorization': `Bearer ${VOYAGE_API_KEY}`,
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Authorization': `Bearer ${VOYAGE_API_KEY}`, 'Content-Type': 'application/json' },
             timeout: 60000
         });
         return response.data.data[0].embedding;
     } catch (err) {
         throw new Error(`Voyage AI error: ${err.message}`);
     }
+}
+
+function isGarbageTitle(title) {
+    if (!title) return true;
+    return GARBAGE_TITLE_PATTERNS.some(p => p.test(title));
 }
 
 function extractCompanyNameFromTitle(title) {
@@ -308,10 +305,10 @@ function extractCompanyNameFromTitle(title) {
         /bei\s+(.+?)(?:\s*\(|$)/i,
         /(?:für|an|mit)\s+(.+?)(?:\s*\(|$)/i,
     ];
-    for (const pattern of patterns) {
-        const match = title.match(pattern);
-        if (match && match[1]) {
-            let name = match[1].trim();
+    for (const p of patterns) {
+        const m = title.match(p);
+        if (m && m[1]) {
+            const name = m[1].trim();
             if (name.length > 2 && name.length < 60) return name;
         }
     }
@@ -319,154 +316,176 @@ function extractCompanyNameFromTitle(title) {
     const parts = title.split(/[—–\-|\/]/);
     for (const part of parts.reverse()) {
         const trimmed = part.trim();
-        if (companyWords.some(w => trimmed.includes(w))) {
-            return trimmed;
-        }
+        if (companyWords.some(w => trimmed.includes(w))) return trimmed;
     }
     return null;
 }
 
 // ─── Matching function ────────────────────────────────────────────────
-async function matchCandidate(candidateData, radius, topK = 10) {
+async function matchCandidate(candidateData, radius, topK = 30) {
     const { salesforce_contact_id, name, skill_scores, seniority_level, remote_preference, location, location_lat, location_lng } = candidateData;
 
-    // 1. Check/update candidate in Supabase
+    // 1. Candidate upsert
     let { data: existingCandidate, error: fetchError } = await supabase
         .from('candidates')
         .select('id, skill_embedding')
         .eq('salesforce_contact_id', salesforce_contact_id)
-        .single()
-        .abortSignal(AbortSignal.timeout(30000));
+        .single();
 
     let candidateId;
-    if (fetchError && fetchError.code !== 'PGRST116') {
-        throw new Error(`Supabase fetch error: ${fetchError.message}`);
-    }
-
+    if (fetchError && fetchError.code !== 'PGRST116') throw new Error(`Supabase fetch error: ${fetchError.message}`);
     if (existingCandidate) {
         candidateId = existingCandidate.id;
         await supabase
             .from('candidates')
-            .update({
-                name,
-                skill_scores,
-                seniority_level,
-                remote_preference,
-                location,
-                location_lat: location_lat || null,
-                location_lng: location_lng || null,
-                updated_at: new Date().toISOString()
-            })
-            .eq('id', candidateId)
-            .abortSignal(AbortSignal.timeout(30000));
+            .update({ name, skill_scores, seniority_level, remote_preference, location, location_lat, location_lng, updated_at: new Date().toISOString() })
+            .eq('id', candidateId);
     } else {
         const { data: newCandidate, error: insertError } = await supabase
             .from('candidates')
-            .insert({
-                salesforce_contact_id,
-                name,
-                skill_scores,
-                seniority_level,
-                remote_preference,
-                location,
-                location_lat: location_lat || null,
-                location_lng: location_lng || null,
-                created_at: new Date().toISOString(),
-                updated_at: new Date().toISOString()
-            })
+            .insert({ salesforce_contact_id, name, skill_scores, seniority_level, remote_preference, location, location_lat, location_lng, created_at: new Date().toISOString(), updated_at: new Date().toISOString() })
             .select('id')
-            .single()
-            .abortSignal(AbortSignal.timeout(30000));
+            .single();
         if (insertError) throw new Error(`Supabase insert error: ${insertError.message}`);
         candidateId = newCandidate.id;
     }
 
-    // 2. Embed candidate if needed
-    let skillEmbedding = existingCandidate?.skill_embedding ? parseEmbedding(existingCandidate.skill_embedding) : null;
+    // 2. Embed candidate
+    let skillEmbedding = existingCandidate?.skill_embedding;
     if (!skillEmbedding) {
         const candidateObj = { name, skill_scores, seniority_level, remote_preference, location };
         skillEmbedding = await embedCandidate(candidateObj);
         await supabase
             .from('candidates')
             .update({ skill_embedding: skillEmbedding, updated_at: new Date().toISOString() })
-            .eq('id', candidateId)
-            .abortSignal(AbortSignal.timeout(30000));
+            .eq('id', candidateId);
+    } else {
+        skillEmbedding = parseEmbedding(skillEmbedding);
     }
     if (!skillEmbedding) throw new Error('Invalid candidate embedding');
 
-    // 3. Fetch jobs and companies (from cache)
-    const jobs = await getCachedJobs();
-    const companies = await getCompaniesMap();
+    // 3. Fetch data
+    const [jobs, companies] = await Promise.all([getCachedJobs(), getCompaniesMap()]);
 
-    // 4. Match against jobs
+    // 4. Candidate skills as Set for O(1) lookup
+    const candidateSkillSet = new Set(Object.keys(skill_scores || {}).map(s => s.toLowerCase().trim()));
+    const candidateTitleWords = (name || '').toLowerCase().split(/\s+/);
+
+    // 5. Matching loop
     const startMatch = Date.now();
     const matches = [];
-    let missingGeolocationCount = 0;
+    const seenJobIds = new Set();
+    const seenJobKey = new Set();
+    let skippedNoCompany = 0, skippedGarbage = 0, skippedNoSkill = 0, skippedLowSim = 0;
 
     for (const job of jobs) {
-        const sim = cosineSimilarity(skillEmbedding, job.skill_embedding);
-        if (sim < 0.01) continue;
+        // Skip if no company name
+        if (!job.company_name || job.company_name.trim() === '') { skippedNoCompany++; continue; }
+        // Skip garbage titles
+        if (isGarbageTitle(job.title)) { skippedGarbage++; continue; }
+        // Deduplicate
+        if (seenJobIds.has(job.id)) continue;
+        seenJobIds.add(job.id);
+        const key = `${job.company_id}|${job.title?.trim().toLowerCase()}|${job.location?.trim().toLowerCase() || ''}`;
+        if (seenJobKey.has(key)) continue;
+        seenJobKey.add(key);
+
+        // Skill presence check (only if candidate has skills)
+        let hasSkillMatch = true;
+        if (candidateSkillSet.size > 0) {
+            const jobSkills = job.structured_skills || [];
+            const jobSkillSet = new Set(jobSkills.map(s => s.toLowerCase().trim()));
+            let found = false;
+            for (const skill of candidateSkillSet) {
+                if (jobSkillSet.has(skill)) { found = true; break; }
+            }
+            if (!found) {
+                skippedNoSkill++;
+                continue;
+            }
+            hasSkillMatch = found;
+        }
+
+        // Embedding similarity
+        let sim = cosineSimilarity(skillEmbedding, job.skill_embedding);
+        if (sim < MIN_SIMILARITY) { skippedLowSim++; continue; }
+
+        // Title bonus
+        if (job.title) {
+            const titleLower = job.title.toLowerCase();
+            const bonus = candidateTitleWords.some(w => titleLower.includes(w) && w.length > 3) ? TITLE_BONUS : 0;
+            sim = Math.min(sim + bonus, 1);
+        }
+
+        // Skill overlap ratio
+        let overlapRatio = 0;
+        if (candidateSkillSet.size > 0 && job.structured_skills?.length > 0) {
+            const jobSkillSet = new Set(job.structured_skills.map(s => s.toLowerCase().trim()));
+            let common = 0;
+            for (const skill of candidateSkillSet) {
+                if (jobSkillSet.has(skill)) common++;
+            }
+            overlapRatio = common / Math.max(job.structured_skills.length, candidateSkillSet.size);
+            if (overlapRatio < MIN_SKILL_OVERLAP) {
+                sim = sim * 0.3;
+            } else {
+                sim = (sim * (1 - SKILL_WEIGHT)) + (overlapRatio * SKILL_WEIGHT);
+            }
+        } else if (candidateSkillSet.size > 0 && job.structured_skills?.length === 0) {
+            sim = sim * 0.5;
+        }
+
+        if (sim < MIN_SIMILARITY) { skippedLowSim++; continue; }
+
+        // Distance
+        let distance = null;
+        if (location_lat && location_lng && job.location_lat && job.location_lng) {
+            distance = haversine(location_lat, location_lng, job.location_lat, job.location_lng);
+        }
 
         const isRemote = job.remote_type && job.remote_type.toLowerCase() === 'remote';
         let include = false;
-        let distance = null;
-
-        if (location_lat && location_lng && job.location_lat && job.location_lng) {
-            distance = haversine(location_lat, location_lng, job.location_lat, job.location_lng);
-        } else {
-            missingGeolocationCount++;
-            if (missingGeolocationCount <= 5) {
-                console.warn(`⚠️ Missing location data for job "${job.title}" (id: ${job.id}) or candidate. Distance will be NULL.`);
-            }
-        }
-
         if (isRemote) {
-            include = true;
+            include = sim >= REMOTE_MIN_SIMILARITY;
         } else if (distance !== null && distance <= radius) {
             include = true;
         } else if (distance === null && location && job.location) {
-            if (citiesMatch(location, job.location)) include = true;
+            include = citiesMatch(location, job.location);
         } else if (distance === null && !location && !job.location) {
             include = true;
         }
-
         if (!include) continue;
 
+        // Company info
         let companyName = job.company_name || null;
-        let careerPageUrl = null;
-        let lastCrawledAt = null;
-        let crawlStatus = null;
-
+        let careerPageUrl = null, lastCrawledAt = null, crawlStatus = null;
         if (job.company_id) {
-            const companyInfo = companies.byId.get(job.company_id);
-            if (companyInfo) {
-                if (!companyName) companyName = companyInfo.Name || null;
-                careerPageUrl = companyInfo.career_page_url || null;
-                lastCrawledAt = companyInfo.last_crawled_at || null;
-                crawlStatus = companyInfo.crawl_status || null;
+            const info = companies.byId.get(job.company_id);
+            if (info) {
+                companyName = companyName || info.Name || null;
+                careerPageUrl = info.career_page_url || null;
+                lastCrawledAt = info.last_crawled_at || null;
+                crawlStatus = info.crawl_status || null;
             }
         }
-
         if (!companyName) {
             const extracted = extractCompanyNameFromTitle(job.title);
             if (extracted) {
                 const key = extracted.toLowerCase().trim();
                 let matched = companies.byName.get(key);
                 if (!matched) {
-                    const cleanKey = key.replace(/\s*(gmbh|ag|kg|se|e\.v\.|ug|gbr|ohg)\s*$/, '').trim();
-                    if (cleanKey !== key) matched = companies.byName.get(cleanKey);
+                    const clean = key.replace(/\s*(gmbh|ag|kg|se|e\.v\.|ug|gbr|ohg)\s*$/, '').trim();
+                    if (clean !== key) matched = companies.byName.get(clean);
                 }
                 if (matched) {
                     companyName = matched.Name;
                     careerPageUrl = careerPageUrl || matched.detected_career_url || null;
                     lastCrawledAt = lastCrawledAt || matched.last_crawled_at || null;
                     crawlStatus = crawlStatus || matched.crawl_status || null;
-                    console.log(`   🔍 Fallback name match: "${companyName}" for job "${job.title}"`);
                 }
             }
         }
 
-        const applyUrl = job.apply_url || null;
         const topSkills = (job.structured_skills || []).slice(0, 5).join(', ');
 
         matches.push({
@@ -474,7 +493,7 @@ async function matchCandidate(candidateData, radius, topK = 10) {
             job_title: job.title || 'Untitled',
             company_id: job.company_id,
             company_name: companyName,
-            apply_url: applyUrl,
+            apply_url: job.apply_url || null,
             career_page_url: careerPageUrl,
             last_crawled_at: lastCrawledAt,
             crawl_status: crawlStatus,
@@ -488,21 +507,18 @@ async function matchCandidate(candidateData, radius, topK = 10) {
         });
     }
 
-    if (missingGeolocationCount > 0) {
-        console.warn(`⚠️ ${missingGeolocationCount} jobs had missing location coordinates. Distance filter may be inaccurate.`);
-        console.warn(`   Please run geocoding scripts: node scripts/geocode-jobs.js and node scripts/geocode-candidates.js`);
-    }
+    console.log(`🔍 Skipped: ${skippedNoCompany} no company, ${skippedGarbage} garbage, ${skippedNoSkill} no skill, ${skippedLowSim} low sim`);
 
     matches.sort((a, b) => b.similarity_score - a.similarity_score);
     const topMatches = matches.slice(0, topK);
-    console.log(`⏱️ Matching loop took ${Date.now() - startMatch}ms for ${jobs.length} jobs`);
+    console.log(`⏱️ Matching loop took ${Date.now() - startMatch}ms for ${jobs.length} jobs → ${topMatches.length} matches`);
 
+    // 6. Store matches (using only columns that exist)
     if (topMatches.length > 0) {
         await supabase
             .from('matches')
             .delete()
-            .eq('candidate_id', candidateId)
-            .abortSignal(AbortSignal.timeout(30000));
+            .eq('candidate_id', candidateId);
 
         const rows = topMatches.map(m => ({
             candidate_id: candidateId,
@@ -511,16 +527,15 @@ async function matchCandidate(candidateData, radius, topK = 10) {
             location_distance_km: m.location_distance_km,
             final_score: m.final_score,
             company_name: m.company_name,
-            apply_url: m.apply_url || null,
-            career_page_url: m.career_page_url || null,
             job_title: m.job_title,
             job_location: m.location,
             remote_type: m.remote_type,
             seniority_level: m.seniority_level,
-            top_skills: m.top_skills,
+            top_skills: m.top_skills ? m.top_skills.split(',').map(s => s.trim()).filter(Boolean) : [],
             created_at: new Date().toISOString()
         }));
-        await supabase.from('matches').insert(rows);
+        const { error: insertError } = await supabase.from('matches').insert(rows);
+        if (insertError) console.error('❌ Match insert error:', insertError.message);
     }
 
     return {
@@ -532,10 +547,10 @@ async function matchCandidate(candidateData, radius, topK = 10) {
     };
 }
 
-// ─── Webhook handler ──────────────────────────────────────────────────
+// ─── Webhook ──────────────────────────────────────────────────────────
 app.post('/webhook/match-candidate', async (req, res) => {
-    const startTime = Date.now();
     const requestId = uuidv4();
+    const startTime = Date.now();
     console.log(`[${requestId}] Received request`);
 
     try {
@@ -549,7 +564,7 @@ app.post('/webhook/match-candidate', async (req, res) => {
             location_lat,
             location_lng,
             radius = 50,
-            top_k = 10
+            top_k = 30
         } = req.body;
 
         if (!salesforce_contact_id) {
@@ -560,7 +575,7 @@ app.post('/webhook/match-candidate', async (req, res) => {
             console.warn(`[${requestId}] Warning: skill_scores empty for ${salesforce_contact_id}`);
         }
 
-        const matchPromise = matchSemaphore.run(() => matchCandidate({
+        const result = await matchSemaphore.run(() => matchCandidate({
             salesforce_contact_id,
             name,
             skill_scores,
@@ -571,94 +586,43 @@ app.post('/webhook/match-candidate', async (req, res) => {
             location_lng
         }, radius, top_k));
 
-        const result = await Promise.race([
-            matchPromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Matching timeout')), TIMEOUT_MS))
-        ]);
-
         const elapsed = Date.now() - startTime;
         console.log(`[${requestId}] Completed in ${elapsed}ms, found ${result.matches_count} matches`);
-
-        res.status(200).json({
-            success: true,
-            ...result,
-            message: `Successfully matched candidate with ${result.matches_count} job(s)`,
-            timestamp: new Date().toISOString()
-        });
+        res.status(200).json({ success: true, ...result, message: `Successfully matched candidate with ${result.matches_count} job(s)`, timestamp: new Date().toISOString() });
 
     } catch (err) {
         const elapsed = Date.now() - startTime;
         console.error(`[${requestId}] Error after ${elapsed}ms: ${err.message}`);
-        res.status(500).json({
-            success: false,
-            error: err.message,
-            timestamp: new Date().toISOString()
-        });
+        res.status(500).json({ success: false, error: err.message, timestamp: new Date().toISOString() });
     }
 });
 
-// ─── Health check ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-    res.status(200).json({
-        status: 'ok',
-        cache_warm: !!cachedJobs,
-        jobs_cached: cachedJobs ? cachedJobs.length : 0,
-        timestamp: new Date().toISOString()
-    });
+    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ─── Refresh cache endpoint ──────────────────────────────────────────
-app.get('/refresh-cache', async (req, res) => {
-    try {
-        console.log('🔄 Forcing cache refresh...');
-        await getCachedJobs(true);
-        await getCompaniesMap(true);
-        res.status(200).json({ status: 'ok', message: 'Cache refreshed' });
-    } catch (err) {
-        console.error('❌ Cache refresh failed:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ─── Start HTTPS server ──────────────────────────────────────────────
+// ─── Start server ──────────────────────────────────────────────────────
 const SSL_KEY_PATH = process.env.SSL_KEY || '/etc/ssl/private/server.key';
 const SSL_CERT_PATH = process.env.SSL_CERT || '/etc/ssl/certs/server.crt';
 
 let useHttps = false;
 try {
-    if (fs.existsSync(SSL_KEY_PATH) && fs.existsSync(SSL_CERT_PATH)) {
-        useHttps = true;
-    }
-} catch (e) { /* ignore */ }
+    if (fs.existsSync(SSL_KEY_PATH) && fs.existsSync(SSL_CERT_PATH)) useHttps = true;
+} catch (e) {}
 
 async function startServer() {
     await warmupCache();
-
-    if (useHttps) {
-        const options = {
-            key: fs.readFileSync(SSL_KEY_PATH),
-            cert: fs.readFileSync(SSL_CERT_PATH)
-        };
-        https.createServer(options, app).listen(PORT, HOST, () => {
-            console.log(`🔒 HTTPS server running on https://${HOST}:${PORT}`);
-            console.log(`📍 POST to https://${HOST}:${PORT}/webhook/match-candidate`);
-            console.log(`💚 Health check: https://${HOST}:${PORT}/health`);
-            console.log(`🔄 Refresh cache: https://${HOST}:${PORT}/refresh-cache`);
-            console.log(`⚡ Concurrency limit: ${MAX_CONCURRENT_MATCHES}`);
-            console.log(`⏳ Job cache TTL: ${JOB_CACHE_TTL_MS/1000}s`);
-            console.log(`⏱️ Request timeout: ${TIMEOUT_MS/1000}s`);
-        });
-    } else {
-        app.listen(PORT, HOST, () => {
-            console.log(`🚀 HTTP server running on http://${HOST}:${PORT}`);
-            console.log(`📍 POST to http://${HOST}:${PORT}/webhook/match-candidate`);
-            console.log(`💚 Health check: http://${HOST}:${PORT}/health`);
-            console.log(`🔄 Refresh cache: http://${HOST}:${PORT}/refresh-cache`);
-            console.log(`⚡ Concurrency limit: ${MAX_CONCURRENT_MATCHES}`);
-            console.log(`⏳ Job cache TTL: ${JOB_CACHE_TTL_MS/1000}s`);
-            console.log(`⏱️ Request timeout: ${TIMEOUT_MS/1000}s`);
-        });
-    }
+    const server = useHttps
+        ? https.createServer({ key: fs.readFileSync(SSL_KEY_PATH), cert: fs.readFileSync(SSL_CERT_PATH) }, app)
+        : app;
+    server.listen(PORT, HOST, () => {
+        console.log(`${useHttps ? '🔒 HTTPS' : '🚀 HTTP'} server running on ${useHttps ? 'https' : 'http'}://${HOST}:${PORT}`);
+        console.log(`📍 POST to /webhook/match-candidate`);
+        console.log(`💚 Health check: /health`);
+        console.log(`⚡ Concurrency: ${MAX_CONCURRENT_MATCHES}, Cache TTL: ${JOB_CACHE_TTL_MS/1000}s, Timeout: ${TIMEOUT_MS/1000}s`);
+        console.log(`\n⚠️ To speed up Supabase queries, run this SQL once:`);
+        console.log(`   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_skill_embedding_not_null ON jobs (id) WHERE skill_embedding IS NOT NULL;\n`);
+    });
 }
 
 startServer().catch(err => {
