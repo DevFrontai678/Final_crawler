@@ -1,18 +1,16 @@
 #!/usr/bin/env node
 /**
  * ═══════════════════════════════════════════════════════════════════════
- *  PRODUCTION MATCHING ENGINE – v5.1
+ *  PRODUCTION MATCHING ENGINE – v5.2
  * ═══════════════════════════════════════════════════════════════════════
  *
- *  Returns up to 30 jobs per candidate.
- *  All filters are relaxed – every job that passes garbage/company filters
- *  is considered. Scoring is based on:
- *    1. Embedding similarity (40%)
- *    2. Skill overlap (20%) – even if zero, still contributes 0
- *    3. Title match (20%)
- *    4. Base score (20%) – ensures every passing job gets a positive score
+ *  Weights:
+ *    - Embedding (profile): 40%
+ *    - Skills: 30%
+ *    - Title match: 30%
  *
- *  Division‑specific tuning is available but minSkillOverlap is 0 for all.
+ *  All jobs passing filters are considered and scored.
+ *  No minimum skill overlap required (minSkillOverlap = 0).
  */
 
 const express = require('express');
@@ -31,40 +29,42 @@ const MAX_CONCURRENT_MATCHES = parseInt(process.env.MAX_CONCURRENT_MATCHES || '2
 const JOB_CACHE_TTL_MS = parseInt(process.env.JOB_CACHE_TTL_MS || '600000', 10);
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || '120000', 10);
 
-// ─── Division‑specific tuning (all minOverlap = 0) ────────────────────
+// ─── Weights (sum = 1.0) ──────────────────────────────────────────────
+const SIMILARITY_WEIGHT = 0.40;
+const SKILL_WEIGHT = 0.30;
+const TITLE_WEIGHT = 0.30;          // ⬆️ increased
+const TITLE_BONUS = 0.05;
+
+// ─── Division‑specific config (only skillWeight matters) ──────────────
 const DIVISION_CONFIG = {
   IT: {
     minSkillOverlap: 0.0,
-    skillWeight: 0.20,
+    skillWeight: SKILL_WEIGHT,
     requireSkillMatch: false,
   },
   Construction: {
     minSkillOverlap: 0.0,
-    skillWeight: 0.20,
+    skillWeight: SKILL_WEIGHT,
     requireSkillMatch: false,
   },
   Legal: {
     minSkillOverlap: 0.0,
-    skillWeight: 0.20,
+    skillWeight: SKILL_WEIGHT,
     requireSkillMatch: false,
   },
   Accounting: {
     minSkillOverlap: 0.0,
-    skillWeight: 0.20,
+    skillWeight: SKILL_WEIGHT,
     requireSkillMatch: false,
   },
   default: {
     minSkillOverlap: 0.0,
-    skillWeight: 0.20,
+    skillWeight: SKILL_WEIGHT,
     requireSkillMatch: false,
   },
 };
 
-const SIMILARITY_WEIGHT = 0.40;
-const TITLE_WEIGHT = 0.20;
-const TITLE_BONUS = 0.05;
-
-// ─── Garbage title patterns ──────────────────────────────────────────
+// ─── Garbage patterns (unchanged) ──────────────────────────────────────
 const GARBAGE_TITLE_PATTERNS = [
   /karriere/i, /career/i, /great to have you here/i, /super, dass du hier bist/i,
   /wir suchen dich/i, /initiativbewerbung/i, /are you looking for new challenges/i,
@@ -96,7 +96,7 @@ function isGarbageTitle(title) {
   return GARBAGE_TITLE_PATTERNS.some(p => p.test(trimmed));
 }
 
-// ─── Stopwords ──────────────────────────────────────────────────────
+// ─── Stopwords (unchanged) ──────────────────────────────────────────
 const STOPWORDS = new Set([
   'der', 'die', 'das', 'und', 'oder', 'für', 'mit', 'von', 'zu', 'im', 'am',
   'als', 'auch', 'auf', 'bei', 'durch', 'in', 'nach', 'um', 'über', 'unter',
@@ -325,7 +325,7 @@ async function warmupCache(retries = 3) {
   return false;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────
+// ─── Helpers (unchanged) ──────────────────────────────────────────
 function parseEmbedding(embedding) {
   if (!embedding) return null;
   if (Array.isArray(embedding)) return embedding;
@@ -651,17 +651,20 @@ async function matchCandidate(candidateData, radius, topK = 30) {
       continue;
     }
 
-    // Embedding
+    // Embedding similarity
     let sim = cosineSimilarity(skillEmbedding, job.skill_embedding);
     if (sim < 0.01) continue;
 
-    // Final score
-    const skillWeight = config.skillWeight;
+    // ─── Final score (using updated weights) ──────────────────────────
+    const skillWeight = config.skillWeight; // = SKILL_WEIGHT (0.30)
     let finalScore = (sim * SIMILARITY_WEIGHT) +
                      (overlapRatio * skillWeight) +
                      (titleScore * TITLE_WEIGHT);
-    finalScore = Math.max(finalScore, 0.01);
 
+    // Ensure at least a tiny positive score
+    finalScore = Math.max(finalScore, 0.001);
+
+    // Title bonus (extra if exact keyword match)
     if (job.title && positionKeywords.length > 0) {
       const titleLower = job.title.toLowerCase();
       for (const kw of positionKeywords) {
@@ -672,7 +675,7 @@ async function matchCandidate(candidateData, radius, topK = 30) {
       }
     }
 
-    if (finalScore < 0.01) continue;
+    if (finalScore < 0.001) continue;
 
     // Distance
     const isRemote = job.remote_type && job.remote_type.toLowerCase() === 'remote';
@@ -899,7 +902,7 @@ async function startServer() {
     console.log(`📍 POST to /webhook/match-candidate`);
     console.log(`💚 Health check: /health`);
     console.log(`⚡ Concurrency: ${MAX_CONCURRENT_MATCHES}, Cache TTL: ${JOB_CACHE_TTL_MS/1000}s, Timeout: ${TIMEOUT_MS/1000}s`);
-    console.log(`✅ Perfect Matching Engine v5.1 – minSkillOverlap = 0 for all divisions.`);
+    console.log(`✅ Weights: Profile 40% | Skills 30% | Title 30%`);
   });
 }
 
