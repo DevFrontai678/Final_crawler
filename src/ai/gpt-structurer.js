@@ -1,8 +1,8 @@
 /**
  * src/ai/gpt-structurer.js
  *
- * Strict GPT-4.1 Mini structurer.
- * Skips only obvious non‑jobs. Always infers skills from title.
+ * Strict GPT-4o-mini structurer.
+ * FIXED: extracts title from description even if title is null.
  */
 
 const OpenAI = require('openai');
@@ -10,7 +10,7 @@ const crypto = require('crypto');
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = 'gpt-4.1-mini';
+const OPENAI_MODEL = 'gpt-4o-mini';
 
 if (!OPENAI_API_KEY) {
     console.error('❌ OPENAI_API_KEY is not set in .env');
@@ -36,9 +36,19 @@ function setCachedResult(descHash, result) {
     descriptionCache.set(descHash, result);
 }
 
-// ─── 🔥 LESS AGGRESSIVE PRE‑FILTER ──────────────────────────────────────
-function isObviousNonJob(title) {
-    const lower = title.toLowerCase();
+// ─── PRE-FILTER (FIXED: don't skip null titles if description exists) ───
+function isObviousNonJob(title, description) {
+    const hasTitle = title && String(title).trim().length >= 3;
+    const hasDescription = description && String(description).trim().length >= 50;
+
+    // Only skip if BOTH are missing/invalid
+    if (!hasTitle && !hasDescription) return true;
+
+    // If title is null but description exists → DON'T skip (let GPT extract)
+    if (!hasTitle && hasDescription) return false;
+
+    // If title exists, check for garbage patterns
+    const lower = String(title).toLowerCase();
     const obvious = [
         '404', 'fehler', 'error', 'page not found',
         'empfohlen', 'recommended', 'produkte', 'products',
@@ -49,23 +59,23 @@ function isObviousNonJob(title) {
     for (const pattern of obvious) {
         if (lower.includes(pattern)) return true;
     }
-    // Only skip if title is extremely short and generic
-    if (title.length < 3) return true;
     return false;
 }
 
-// ─── PROMPT ──────────────────────────────────────────────────────────────
+// ─── PROMPT (STRONGER title extraction) ─────────────────────────────────
 function buildPrompt(title, description) {
+    const hasValidTitle = title && String(title).trim() && title !== 'null' && String(title).length > 3;
+
     return `
 You are an expert HR data analyst. Extract structured information from this job posting.
 
-**Job Title:** ${title || 'Not provided'}
+**Job Title (from crawler):** ${hasValidTitle ? title : '❌ MISSING — MUST extract from description'}
 **Job Description:**
 ${description || 'No description provided.'}
 
 Return ONLY valid JSON:
 {
-  "cleaned_title": "standardised job title (e.g., Senior Backend Engineer)",
+  "cleaned_title": "standardised job title (MUST be 3+ words)",
   "skills": ["skill1", "skill2", ...],
   "seniority_level": "junior|mid|senior|lead|executive",
   "employment_type": "fulltime|parttime|contract|internship",
@@ -74,7 +84,7 @@ Return ONLY valid JSON:
 }
 
 Rules:
-- cleaned_title: remove location, company name, "m/w/d", fluff – just the role.
+- cleaned_title: **CRITICAL** — If original title is missing, extract the job role from the FIRST LINES of the description. Never return null, empty, or the string "null".
 - skills: Extract real skills. If description is short, infer from title. ALWAYS include at least 3 skills.
 - If seniority unclear → "mid". If remote unclear → "onsite". If employment unclear → "fulltime".
 - Return ONLY JSON. No extra text.
@@ -100,20 +110,33 @@ async function extractWithGPT(title, description) {
         const parsed = JSON.parse(content);
 
         let skills = Array.isArray(parsed.skills) ? parsed.skills.slice(0, 15) : [];
+
         // Filter blacklist
-        const blacklist = ['professional experience', 'general professional skills', 'team player', 'communication', 'problem solving', 'teamwork', 'collaboration', 'leadership', 'time management', 'flexibility', 'adaptability'];
+        const blacklist = [
+            'professional experience', 'general professional skills', 'team player',
+            'communication', 'problem solving', 'teamwork', 'collaboration',
+            'leadership', 'time management', 'flexibility', 'adaptability'
+        ];
         skills = skills.filter(s => {
-            const lower = s.toLowerCase().trim();
+            const lower = String(s).toLowerCase().trim();
             return lower.length > 1 && !blacklist.includes(lower);
         });
 
-        // 🔥 Ensure at least 3 skills – infer from title if needed
+        // Ensure at least 3 skills — infer from title if needed
         if (skills.length < 3) {
-            const inferred = inferSkillsFromTitle(title);
+            const inferred = inferSkillsFromTitle(title || parsed.cleaned_title || '');
             for (const skill of inferred) {
                 if (!skills.includes(skill)) skills.push(skill);
                 if (skills.length >= 5) break;
             }
+        }
+
+        // Ensure cleaned_title is never null/empty
+        let cleanedTitle = parsed.cleaned_title;
+        if (!cleanedTitle || cleanedTitle === 'null' || String(cleanedTitle).trim().length < 3) {
+            cleanedTitle = title && String(title).trim().length >= 3
+                ? title
+                : extractTitleFromDescription(description);
         }
 
         return {
@@ -122,7 +145,7 @@ async function extractWithGPT(title, description) {
             remote_type: parsed.remote_type || 'onsite',
             employment_type: parsed.employment_type || 'fulltime',
             location_city: parsed.location_city || null,
-            cleaned_title: parsed.cleaned_title || title || 'Untitled',
+            cleaned_title: cleanedTitle
         };
     } catch (err) {
         console.warn(`⚠️ GPT extraction failed: ${err.message}`);
@@ -130,9 +153,33 @@ async function extractWithGPT(title, description) {
     }
 }
 
-// ─── TITLE‑BASED SKILL INFERENCE ──────────────────────────────────────
+// ─── FALLBACK: Extract title from first lines of description ────────────
+function extractTitleFromDescription(description) {
+    if (!description || typeof description !== 'string') return 'Untitled';
+
+    const lines = description
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l.length >= 5 && l.length <= 120)
+        .filter(l => !/^(impressum|datenschutz|agb|cookie|menu|navigation)/i.test(l));
+
+    if (lines.length > 0) {
+        // Take first meaningful line
+        let firstLine = lines[0]
+            .replace(/^[\s\-•*#:]+/, '')
+            .replace(/^(stellenangebot|job|position|stelle|wir suchen|we are looking for)[:\s]+/i, '')
+            .trim();
+        if (firstLine.length >= 5) {
+            return firstLine.slice(0, 200);
+        }
+    }
+    return 'Untitled';
+}
+
+// ─── TITLE-BASED SKILL INFERENCE ──────────────────────────────────────
 function inferSkillsFromTitle(title) {
-    const lower = title.toLowerCase();
+    if (!title) return ['Professional Skills', 'Teamwork', 'Communication'];
+    const lower = String(title).toLowerCase();
     const map = {
         'entwickler|developer|programmierer|coder|engineer': ['Programming', 'Software Development', 'Git', 'Agile', 'Testing'],
         'backend': ['Python', 'Java', 'SQL', 'API Design', 'Microservices'],
@@ -179,29 +226,32 @@ async function structureJob(job) {
     if (cached) return cached;
 
     // Only skip obvious garbage
-    if (isObviousNonJob(title)) {
-        console.log(`⏭️ Skipping non‑job: "${title}"`);
+    if (isObviousNonJob(title, description)) {
+        console.log(`⏭️ Skipping non-job: "${title}"`);
         return {
             skills: [],
             seniority_level: 'mid',
             remote_type: 'onsite',
             employment_type: 'fulltime',
             location_city: null,
-            cleaned_title: title,
+            cleaned_title: title || extractTitleFromDescription(description)
         };
     }
 
     let result = await extractWithGPT(title, description);
 
     if (!result) {
-        const skills = inferSkillsFromTitle(title);
+        const fallbackTitle = (title && String(title).trim().length >= 3)
+            ? title
+            : extractTitleFromDescription(description);
+        const skills = inferSkillsFromTitle(fallbackTitle);
         result = {
             skills,
             seniority_level: 'mid',
             remote_type: 'onsite',
             employment_type: 'fulltime',
             location_city: null,
-            cleaned_title: title || 'Untitled',
+            cleaned_title: fallbackTitle
         };
     }
 

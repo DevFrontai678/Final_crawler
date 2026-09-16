@@ -32,3 +32,9 @@ src/ai/skills-dictionary.json
 src/ai/esco-skills-*.json
 # But we may want to keep skills-esco.json if small enough
 src/ai/skills-esco.json
+.env.*
+!.env.example
+
+# Local crawler logs and backup files
+wget-log*
+*.backup-*

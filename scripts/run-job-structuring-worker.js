@@ -1,21 +1,28 @@
 /**
- * run-job-structuring-worker.js
- * Uses GPT-4.1 Mini – no fallback.
+ * scripts/run-job-structuring-worker.js
+ * WORKER: BullMQ queue se jobs uthata hai, GPT-4o-mini se structure karta hai,
+ * aur Supabase mein title + structured_skills + seniority save karta hai.
+ *
+ * FIXED: saves `title` from GPT's cleaned_title when original title is null.
  */
 
 // 🔥 CRITICAL: Load environment variables FIRST
 require('dotenv').config();
 
-const { Worker, MetricsTime } = require('bullmq');
+const { Worker } = require('bullmq');
 const Redis = require('ioredis');
 const { createClient } = require('@supabase/supabase-js');
 const { structureJob } = require('../src/ai/gpt-structurer');
 const ws = require('ws');
 
-const QUEUE_NAME    = 'job-structuring';
-const CONCURRENCY   = Number(process.env.WORKER_CONCURRENCY) || 10;
+// ─── CONFIG ─────────────────────────────────────────────────────────────
+const QUEUE_NAME = 'job-structuring';
+const CONCURRENCY = Number(
+    process.env.WORKER_CONCURRENCY ||
+    process.env.JOB_STRUCTURING_CONCURRENCY
+) || 2;
 
-// ─── Clients ───────────────────────────────────────────────────────────────
+// ─── CLIENTS ────────────────────────────────────────────────────────────
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
@@ -25,87 +32,118 @@ const supabase = createClient(
 const redis = new Redis({
     host: process.env.REDIS_HOST || 'localhost',
     port: Number(process.env.REDIS_PORT) || 6379,
-    maxRetriesPerRequest: null,
+    maxRetriesPerRequest: null
 });
 
-// ─── Stats tracker ─────────────────────────────────────────────────────────
-const stats = { success: 0, failed: 0, startTime: Date.now() };
+// ─── STATS ──────────────────────────────────────────────────────────────
+const stats = { success: 0, failed: 0, skipped: 0, startTime: Date.now() };
 
 function printStats() {
-    const elapsed    = ((Date.now() - stats.startTime) / 1000 / 60).toFixed(1);
-    const total      = stats.success + stats.failed;
-    const rate       = total > 0 ? (total / ((Date.now() - stats.startTime) / 1000)).toFixed(1) : 0;
+    const elapsed = ((Date.now() - stats.startTime) / 1000 / 60).toFixed(1);
+    const total = stats.success + stats.failed + stats.skipped;
+    const rate = total > 0 ? (total / ((Date.now() - stats.startTime) / 1000)).toFixed(1) : 0;
     console.log(
-        `\n📊  Stats — Elapsed: ${elapsed}m | ✅ ${stats.success} | ❌ ${stats.failed} | Rate: ${rate} jobs/s\n`
+        `\n📊 Stats — Elapsed: ${elapsed}m | ✅ ${stats.success} | ❌ ${stats.failed} | ⏭️ ${stats.skipped} | Rate: ${rate} jobs/s\n`
     );
 }
 
-setInterval(printStats, 30_000);
-
-// ─── Worker ────────────────────────────────────────────────────────────────
+// ─── WORKER ─────────────────────────────────────────────────────────────
 const worker = new Worker(
     QUEUE_NAME,
     async (job) => {
         const { jobId, title, raw_description } = job.data;
 
-        const structured = await structureJob({ id: jobId, title, raw_description });
+        try {
+            // 1. Structure the job with GPT-4o-mini
+            const result = await structureJob({
+                title,
+                raw_description
+            });
 
-        if (!structured) {
-            console.warn(`⚠️  GPT returned null for: "${title}" – job will be skipped.`);
-            return;
+            if (!result) {
+                stats.skipped++;
+                console.log(`⏭️ Skipped job ${jobId} (no result)`);
+                return { jobId, status: 'skipped' };
+            }
+
+            // 2. Build update object
+            const updates = {
+                structured_skills: result.skills && result.skills.length > 0 ? result.skills : null,
+                seniority_level: result.seniority_level,
+                remote_type: result.remote_type,
+                employment_type: result.employment_type
+            };
+
+            // 3. 🔥 CRITICAL FIX: Save title if original is null/empty
+            const originalTitle = title ? String(title).trim() : '';
+            const hasValidTitle = originalTitle && originalTitle !== 'null' && originalTitle.length >= 3;
+
+            if (!hasValidTitle && result.cleaned_title && result.cleaned_title.length >= 3) {
+                updates.title = result.cleaned_title;
+                console.log(`🏷️  Title extracted: "${result.cleaned_title}"`);
+            }
+
+            // 4. Save to Supabase
+            const { error } = await supabase
+                .from('jobs')
+                .update(updates)
+                .eq('id', jobId);
+
+            if (error) {
+                throw new Error(`Supabase update failed: ${error.message}`);
+            }
+
+            stats.success++;
+            console.log(`✅ Job ${jobId} — ${result.skills.length} skills | ${result.seniority_level}`);
+
+            if (stats.success % 25 === 0) printStats();
+
+            return { jobId, status: 'success', skills: result.skills.length };
+        } catch (err) {
+            stats.failed++;
+            console.error(`❌ Job ${jobId} failed: ${err.message}`);
+            throw err;
         }
-
-        const { error: updateError } = await supabase
-            .from('jobs')
-            .update({
-                structured_skills: structured.skills          || [],
-                seniority_level:   structured.seniority_level || null,
-                remote_type:       structured.remote_type     || null,
-                employment_type:   structured.employment_type || null,
-                location:          structured.location_city   || null,
-                last_seen_at:      new Date().toISOString(),
-            })
-            .eq('id', jobId);
-
-        if (updateError) {
-            throw new Error(`Supabase update failed: ${updateError.message}`);
-        }
-
-        const skillsCount = structured.skills?.length || 0;
-        console.log(`✅  "${title}" — ${skillsCount} skills | ${structured.seniority_level || '?'} | ${structured.remote_type || '?'}`);
     },
     {
-        connection:  redis,
-        concurrency: CONCURRENCY,
-        metrics: { maxDataPoints: MetricsTime.ONE_WEEK },
+        connection: redis,
+        concurrency: CONCURRENCY
     }
 );
 
-// ─── Event handlers ────────────────────────────────────────────────────────
-worker.on('completed', () => { stats.success++; });
+// ─── EVENT HANDLERS ─────────────────────────────────────────────────────
+worker.on('ready', () => {
+    console.log(`🚀 Worker ready | Concurrency: ${CONCURRENCY} | Queue: "${QUEUE_NAME}"`);
+    console.log(`   Model: gpt-4o-mini\n`);
+});
 
 worker.on('failed', (job, err) => {
-    stats.failed++;
-    console.error(`❌  FAILED: "${job?.data?.title}" — Attempt ${job?.attemptsMade}/${job?.opts?.attempts} — ${err.message}`);
+    console.error(`❌ Job ${job?.id} failed after ${job?.attemptsMade} attempts: ${err.message}`);
 });
 
 worker.on('error', (err) => {
-    console.error('🔥  Worker error:', err);
+    console.error(`❌ Worker error: ${err.message}`);
 });
 
-// ─── Startup ───────────────────────────────────────────────────────────────
-console.log(`\n🏃  Worker started (GPT-4.1 Mini only) | Concurrency: ${CONCURRENCY} | Queue: "${QUEUE_NAME}"\n`);
-console.log('  Press Ctrl+C to close\n');
-
-// ─── Graceful shutdown ─────────────────────────────────────────────────────
-async function shutdown(signal) {
-    console.log(`\n⚠️  ${signal} received — shutting down…`);
+// ─── GRACEFUL SHUTDOWN ──────────────────────────────────────────────────
+async function shutdown() {
+    console.log('\n⏹️  Shutting down gracefully...');
     printStats();
-    await worker.close();
-    await redis.quit();
-    console.log('👋  Worker stopped.\n');
+    try { await worker.close(); } catch (e) {}
+    try { await redis.quit(); } catch (e) {}
     process.exit(0);
 }
 
-process.on('SIGINT',  () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+process.on('unhandledRejection', (reason) => {
+    console.error('❌ Unhandled rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('❌ Uncaught exception:', err);
+    process.exit(1);
+});
+
+console.log(`🚀 Worker started | Concurrency: ${CONCURRENCY} | Queue: "${QUEUE_NAME}"`);
