@@ -3,7 +3,7 @@
 const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 
-const DEFAULT_PROXY_URL = 'socks5h://127.0.0.1:40000';
+const DEFAULT_PROXY_URL = null;
 
 let cachedProxyUrl = null;
 let cachedAgent = null;
