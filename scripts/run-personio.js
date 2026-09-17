@@ -2,6 +2,7 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
 const { processPersonioCompany, closePersonioBrowser } = require('../src/ats-adapters/personio-adapter');
+const { enrichJobForStorage } = require('../src/utils/job-enrichment');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -68,19 +69,23 @@ async function run() {
             if (!job.raw_description) missingDescCount++;
             if (!job.location) missingLocationCount++;
 
+            const storageJob = await enrichJobForStorage({
+                company_id: company.Id,
+                company_name: job.company_name || company.Name || null,
+                external_job_id: job.external_job_id,
+                title: job.title || null,
+                location: job.location || null,
+                employment_type: job.employment_type || null,
+                raw_description: job.raw_description || null,
+                apply_url: job.apply_url,
+                ats_source: job.ats_source || 'personio',
+                is_active: true
+            });
+
             const { error: insertError } = await supabase
                 .from('jobs')
                 .upsert({
-                    company_id: company.Id,
-                    company_name: job.company_name || company.Name || null, // ✅ ab genuinely save ho raha hai
-                    external_job_id: job.external_job_id,
-                    title: job.title || null,
-                    location: job.location || null,          // ✅ empty string ki jagah explicit null
-                    employment_type: job.employment_type || null,
-                    raw_description: job.raw_description || null, // ✅ clean text, ya null agar na mile
-                    apply_url: job.apply_url,
-                    ats_source: job.ats_source || 'personio',
-                    is_active: true,
+                    ...storageJob,
                     first_seen_at: new Date(),
                     last_seen_at: new Date()
                 }, { onConflict: 'company_id,external_job_id' });

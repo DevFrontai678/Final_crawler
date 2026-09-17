@@ -5,6 +5,8 @@ const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
+const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
+const { enrichJobForStorage } = require('../src/utils/job-enrichment');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -44,7 +46,7 @@ async function customCrawlerFetchPage(url) {
         await page.setExtraHTTPHeaders({
             'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
         });
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+        await page.goto(url, { waitUntil: 'networkidle', timeout: CRAWLER_TIMEOUTS.NAVIGATION_TIMEOUT_MS });
         const html = await page.content();
         return html;
     } catch (err) {
@@ -139,7 +141,7 @@ async function processRexxCompany(company) {
     // ─── LAYER 1: Try Rexx API ──────────────────────────────────────────
     let rexxApiUrl = null;
     try {
-        const html = await axios.get(careerUrl, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } })
+        const html = await axios.get(careerUrl, { timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS, headers: { 'User-Agent': 'Mozilla/5.0' } })
             .then(res => res.data)
             .catch(() => null);
         if (html) {
@@ -167,7 +169,7 @@ async function processRexxCompany(company) {
         try {
             const apiUrl = `${rexxApiUrl}/api/v1/jobs`;
             const response = await axios.get(apiUrl, {
-                timeout: 15000,
+                timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
                 headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
             });
             const data = response.data;
@@ -198,8 +200,8 @@ async function processRexxCompany(company) {
     if (jobs.length === 0) {
         console.log(`   🔄 Layer 2: Rexx-specific scraping...`);
         try {
-            const html = await axios.get(careerUrl, {
-                timeout: 15000,
+        const html = await axios.get(careerUrl, {
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
                 headers: { 'User-Agent': 'Mozilla/5.0' }
             }).then(res => res.data).catch(() => null);
             if (html) {
@@ -222,7 +224,7 @@ async function processRexxCompany(company) {
                 let scraped = 0;
                 for (const link of uniqueLinks) {
                     const jobHtml = await axios.get(link, {
-                        timeout: 15000,
+                        timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
                         headers: { 'User-Agent': 'Mozilla/5.0' }
                     }).then(res => res.data).catch(() => null);
                     if (!jobHtml) continue;
@@ -331,21 +333,25 @@ async function run() {
             }
 
             for (const job of result.jobs) {
+                const storageJob = await enrichJobForStorage({
+                    company_id: company.Id,
+                    company_name: job.company_name || company.Name || null,
+                    external_job_id: job.external_job_id,
+                    external_hash: job.external_hash,
+                    title: job.title,
+                    location: job.location,
+                    employment_type: job.employment_type,
+                    remote_type: job.remote_type,
+                    raw_description: job.raw_description,
+                    apply_url: job.apply_url,
+                    ats_source: 'rexx',
+                    is_active: true
+                });
+
                 const { error: insertError } = await supabase
                     .from('jobs')
                     .upsert({
-                        company_id: company.Id,
-                        company_name: job.company_name,
-                        external_job_id: job.external_job_id,
-                        external_hash: job.external_hash,
-                        title: job.title,
-                        location: job.location,
-                        employment_type: job.employment_type,
-                        remote_type: job.remote_type,
-                        raw_description: job.raw_description,
-                        apply_url: job.apply_url,
-                        ats_source: 'rexx',   // ← FIXED
-                        is_active: true,
+                        ...storageJob,
                         first_seen_at: new Date(),
                         last_seen_at: new Date()
                     }, { onConflict: 'company_id,external_job_id' });

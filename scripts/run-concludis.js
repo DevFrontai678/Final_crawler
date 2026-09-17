@@ -5,6 +5,8 @@ const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
+const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
+const { enrichJobForStorage } = require('../src/utils/job-enrichment');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -72,7 +74,7 @@ async function customCrawlerFetchPage(url) {
 
     try {
         const response = await axios.get(url, {
-            timeout: 10000,
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
         const contentType = response.headers['content-type'] || '';
@@ -91,7 +93,7 @@ async function customCrawlerFetchPage(url) {
         await page.setExtraHTTPHeaders({
             'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'
         });
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 20000 });
+        await page.goto(url, { waitUntil: 'networkidle', timeout: CRAWLER_TIMEOUTS.NAVIGATION_TIMEOUT_MS });
         const html = await page.content();
         await page.close();
         if (html && html.length > 1000) {
@@ -232,7 +234,7 @@ async function processConcludisCompany(company) {
     if (!companySlug) {
         try {
             const response = await axios.get(company.detected_career_url, {
-                timeout: 10000,
+                timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
                 headers: { 'User-Agent': 'Mozilla/5.0' }
             });
             const html = response.data;
@@ -296,7 +298,7 @@ async function processConcludisCompany(company) {
     for (const apiUrl of apiEndpoints) {
         try {
             const response = await axios.get(apiUrl, {
-                timeout: 10000,
+                timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
                 headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
             });
             const data = response.data;
@@ -361,7 +363,7 @@ async function processConcludisCompany(company) {
         try {
             const pageUrl = concludisDomain.startsWith('http') ? concludisDomain : `https://${concludisDomain}`;
             const response = await axios.get(pageUrl, {
-                timeout: 10000,
+                timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
                 headers: { 'User-Agent': 'Mozilla/5.0' }
             });
             const html = response.data;
@@ -488,21 +490,25 @@ async function run() {
             }
 
             for (const job of result.jobs) {
+                const storageJob = await enrichJobForStorage({
+                    company_id: company.Id,
+                    company_name: job.company_name || company.Name || null,
+                    external_job_id: job.external_job_id,
+                    external_hash: job.external_hash,
+                    title: job.title,
+                    location: job.location,
+                    employment_type: job.employment_type,
+                    remote_type: job.remote_type,
+                    raw_description: job.raw_description,
+                    apply_url: job.apply_url,
+                    ats_source: 'concludis',
+                    is_active: true
+                });
+
                 const { error: insertError } = await supabase
                     .from('jobs')
                     .upsert({
-                        company_id: company.Id,
-                        company_name: job.company_name,
-                        external_job_id: job.external_job_id,
-                        external_hash: job.external_hash,
-                        title: job.title,
-                        location: job.location,
-                        employment_type: job.employment_type,
-                        remote_type: job.remote_type,
-                        raw_description: job.raw_description,
-                        apply_url: job.apply_url,
-                        ats_source: 'concludis',   // ← FIXED
-                        is_active: true,
+                        ...storageJob,
                         first_seen_at: new Date(),
                         last_seen_at: new Date()
                     }, { onConflict: 'company_id,external_job_id' });

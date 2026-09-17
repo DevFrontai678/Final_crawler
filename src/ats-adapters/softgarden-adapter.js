@@ -2,13 +2,14 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const pdfParse = require('pdf-parse');
 require('dotenv').config();
+const { CRAWLER_TIMEOUTS } = require('../utils/crawler-timeouts');
 
 // ─── PDF HELPERS ──────────────────────────────────────────────────────────
 async function downloadAndParsePDF(pdfUrl) {
     try {
         const response = await axios.get(pdfUrl, {
             responseType: 'arraybuffer',
-            timeout: 30000,
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
         const pdfBuffer = Buffer.from(response.data);
@@ -157,7 +158,7 @@ function extractCompanyNameFromJob(job, fallback) {
 // ─── AGGRESSIVE CAREER PAGE DISCOVERY ────────────────────────────────────
 async function fetchHtmlForDiscovery(url) {
     try {
-        const response = await axios.get(url, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' }, maxRedirects: 5 });
+        const response = await axios.get(url, { timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS, headers: { 'User-Agent': 'Mozilla/5.0' }, maxRedirects: 5 });
         return response.data;
     } catch (err) {
         return null;
@@ -317,16 +318,16 @@ async function extractConfigWithPlaywright(url) {
                 } catch (e) {}
             }
         });
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+        await page.goto(url, { waitUntil: 'networkidle', timeout: CRAWLER_TIMEOUTS.NAVIGATION_TIMEOUT_MS });
         // Accept cookies
         try {
             const acceptBtn = await page.locator('button:has-text("Accept"), button:has-text("Zustimmen"), button:has-text("Alle akzeptieren")').first();
-            if (await acceptBtn.isVisible({ timeout: 2000 })) {
+                if (await acceptBtn.isVisible({ timeout: CRAWLER_TIMEOUTS.VISIBILITY_TIMEOUT_MS })) {
                 await acceptBtn.click();
                 console.log('    🍪 Accepted cookies');
             }
         } catch (e) {}
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(CRAWLER_TIMEOUTS.WAIT_TIMEOUT_MS);
         if (capturedConfig) return capturedConfig;
         const html = await page.content();
         const htmlConfig = parseConfigFromHtml(html);
@@ -377,7 +378,7 @@ async function extractSoftgardenConfig(url) {
     try {
         console.log(`    Static fetch: ${url}`);
         const response = await axios.get(url, {
-            timeout: 15000,
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
             headers: { 'User-Agent': 'Mozilla/5.0' },
             maxRedirects: 5
         });
@@ -406,7 +407,7 @@ async function extractSoftgardenIds(careerPageUrl) {
             return directConfig;
         }
         const response = await axios.get(careerPageUrl, {
-            timeout: 15000,
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
             headers: { 'User-Agent': 'Mozilla/5.0' },
             maxRedirects: 5
         });
@@ -450,7 +451,7 @@ async function fetchJobsFeedJson(baseUrl) {
     try {
         const feedUrl = `${baseUrl.replace(/\/$/, '')}/jobs.feed.json`;
         const response = await axios.get(feedUrl, {
-            timeout: 10000,
+            timeout: CRAWLER_TIMEOUTS.SELECTOR_TIMEOUT_MS,
             headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
         });
         const data = response.data;
@@ -486,7 +487,7 @@ async function discoverSoftgardenFeedMap(careerPageUrl) {
     let feedMap = await fetchJobsFeedJson(careerPageUrl);
     if (feedMap.size > 0) return feedMap;
     try {
-        const response = await axios.get(careerPageUrl, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const response = await axios.get(careerPageUrl, { timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS, headers: { 'User-Agent': 'Mozilla/5.0' } });
         const html = response.data;
         const $ = cheerio.load(html);
         const allLinks = [];
@@ -518,7 +519,7 @@ async function getSoftgardenSubdomain(careerPageUrl) {
     let match = careerPageUrl.match(/https?:\/\/([^.]+)\.career\.softgarden\.(?:de|io)/);
     if (match && !isExcludedSlug(match[1])) return match[1];
     try {
-        const response = await axios.get(careerPageUrl, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const response = await axios.get(careerPageUrl, { timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS, headers: { 'User-Agent': 'Mozilla/5.0' } });
         const html = response.data;
         const $ = cheerio.load(html);
         const links = [];
@@ -573,7 +574,7 @@ function extractJobLinksGeneric(html, baseUrl) {
 
 async function fetchHtmlForFallback(url) {
     try {
-        const response = await axios.get(url, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' }, maxRedirects: 5 });
+        const response = await axios.get(url, { timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS, headers: { 'User-Agent': 'Mozilla/5.0' }, maxRedirects: 5 });
         return response.data;
     } catch (err) {
         // fallback to Playwright (reuse the browser)
@@ -582,12 +583,12 @@ async function fetchHtmlForFallback(url) {
             const browser = await getBrowser();
             context = await browser.newContext();
             page = await context.newPage();
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CRAWLER_TIMEOUTS.NAVIGATION_TIMEOUT_MS });
             try {
                 const acceptBtn = await page.locator('button:has-text("Accept"), button:has-text("Zustimmen"), button:has-text("Alle akzeptieren")').first();
-                if (await acceptBtn.isVisible({ timeout: 2000 })) await acceptBtn.click();
+                if (await acceptBtn.isVisible({ timeout: CRAWLER_TIMEOUTS.VISIBILITY_TIMEOUT_MS })) await acceptBtn.click();
             } catch (e) {}
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(CRAWLER_TIMEOUTS.WAIT_TIMEOUT_MS);
             return await page.content();
         } catch (playwrightErr) {
             return null;
@@ -649,7 +650,7 @@ async function fetchSoftgardenJobs(userId, projectId, pageId, feedMap = new Map(
         if (pageId) payload.pageId = pageId;
         const response = await axios.post('https://pcw-api.softgarden.de/widgets/job-list/job-ads', payload, {
             headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
-            timeout: 15000
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS
         });
         const data = response.data;
         const rawJobs = data?.jobs || data?.jobAds || data?.data || [];

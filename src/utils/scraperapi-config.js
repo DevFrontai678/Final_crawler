@@ -19,8 +19,7 @@
  * Optional environment variables (.env):
  *   SCRAPERAPI_COUNTRY_CODE=de        // geo-target requests (default: de)
  *   SCRAPERAPI_PREMIUM=false          // use premium residential proxies
- *   SCRAPERAPI_TIMEOUT_MS=30000       // per-request timeout (required)
- *   SCRAPERAPI_MAX_RETRIES=3          // retry attempts before giving up
+ *   SCRAPERAPI_TIMEOUT_MS=30000       // shared per-request timeout (required)
  *   SCRAPERAPI_INITIAL_BACKOFF_MS=2000
  * ============================================================================
  */
@@ -45,7 +44,7 @@ if (!SCRAPERAPI_API_KEY || SCRAPERAPI_API_KEY.trim() === '') {
 if (!SCRAPERAPI_TIMEOUT_MS || String(SCRAPERAPI_TIMEOUT_MS).trim() === '') {
     throw new Error(
         'Missing required environment variable: SCRAPERAPI_TIMEOUT_MS. ' +
-        'Set SCRAPERAPI_TIMEOUT_MS in your .env file so ScraperAPI uses an explicit timeout.'
+        'Set SCRAPERAPI_TIMEOUT_MS in your .env file so all ScraperAPI consumers share the same timeout.'
     );
 }
 
@@ -59,8 +58,8 @@ const SCRAPERAPI_CONFIG = Object.freeze({
     countryCode: process.env.SCRAPERAPI_COUNTRY_CODE || 'de',
     premium: process.env.SCRAPERAPI_PREMIUM === 'true',
     requestTimeoutMs: parseInt(SCRAPERAPI_TIMEOUT_MS, 10),
-    maxRetries: parseInt(process.env.SCRAPERAPI_MAX_RETRIES || '3', 10),
-    initialBackoffMs: parseInt(process.env.SCRAPERAPI_INITIAL_BACKOFF_MS || '2000', 10),
+    maxRetries: 1,
+    initialBackoffMs: 0,
     backoffMultiplier: 2
 });
 

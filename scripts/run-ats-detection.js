@@ -37,6 +37,8 @@ const ws = require('ws');
 const { detectATS } = require('../src/ats-adapters/ats-detector');
 const { fetchWithMetadata } = require('../src/utils/http-fetcher');
 const { proxyFetch } = require('../src/utils/proxy');
+const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
+const { SCRAPERAPI_CONFIG } = require('../src/utils/scraperapi-config');
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 
@@ -58,18 +60,10 @@ const CONFIG = {
   checkpointEvery:     100,
   cacheTTL:            3600000,
 
-  requestTimeout:      30000,
-  discoveryTimeout:    15000,
-  scraperApiTimeout:    (() => {
-    const value = process.env.SCRAPERAPI_TIMEOUT_MS;
-    if (!value || String(value).trim() === '') {
-      throw new Error(
-        'Missing required environment variable: SCRAPERAPI_TIMEOUT_MS'
-      );
-    }
-    return parseInt(value, 10);
-  })(),
-  companyTimeoutMs:    parseInt(process.env.ATS_COMPANY_TIMEOUT_MS || '45000', 10),
+  requestTimeout:      CRAWLER_TIMEOUTS.PAGE_CONTENT_TIMEOUT_MS,
+  discoveryTimeout:    CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
+  scraperApiTimeout:   SCRAPERAPI_CONFIG.requestTimeoutMs,
+  companyTimeoutMs:    CRAWLER_TIMEOUTS.COMPANY_TIMEOUT_MS,
   maxRedirects:        8,
 
   pageSize:            1000,

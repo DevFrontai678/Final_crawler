@@ -29,23 +29,94 @@ const cheerio = require('cheerio');
 const crypto = require('crypto');
 const axios = require('axios');
 const { fetchWithScraperAPI } = TEST_MODE ? { fetchWithScraperAPI: null } : require('../utils/scraperapi-config');
+const { CRAWLER_TIMEOUTS } = require('../utils/crawler-timeouts');
 require('dotenv').config();
+
+function ts() {
+    return new Date().toISOString();
+}
+
+const _console = {
+    log: console.log.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console),
+};
+
+const logState = {
+    companyName: null,
+    companyId: null,
+    pageUrl: null,
+    jobsSaved: 0,
+    jobsFound: 0,
+    step: null,
+};
+
+function truncateForLog(value, maxLen = 120) {
+    const text = String(value || '').trim();
+    return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
+}
+
+function setLogContext(patch = {}) {
+    Object.assign(logState, patch);
+}
+
+function resetLogContext() {
+    setLogContext({
+        companyName: null,
+        companyId: null,
+        pageUrl: null,
+        jobsSaved: 0,
+        jobsFound: 0,
+        step: null,
+    });
+}
+
+function formatLogPrefix() {
+    const parts = [`[${ts()}]`];
+    if (logState.companyName || logState.companyId) {
+        const companyPart = logState.companyName
+            ? `${logState.companyName}${logState.companyId ? `#${logState.companyId}` : ''}`
+            : `${logState.companyId}`;
+        parts.push(`[company=${truncateForLog(companyPart, 70)}]`);
+    }
+    if (logState.pageUrl) parts.push(`[page=${truncateForLog(logState.pageUrl, 90)}]`);
+    parts.push(`[saved=${logState.jobsSaved ?? 0}]`);
+    if (Number.isFinite(logState.jobsFound)) parts.push(`[found=${logState.jobsFound}]`);
+    if (logState.step) parts.push(`[${logState.step}]`);
+    return parts.join(' ');
+}
+
+function logInfo(scope, message) {
+    _console.log(`${formatLogPrefix()} [${scope}] ${message}`);
+}
+
+function logWarn(scope, message) {
+    _console.warn(`${formatLogPrefix()} [${scope}] ${message}`);
+}
+
+function logError(scope, message) {
+    _console.error(`${formatLogPrefix()} [${scope}] ${message}`);
+}
+
+console.log = (...args) => _console.log(formatLogPrefix(), ...args);
+console.warn = (...args) => _console.warn(formatLogPrefix(), ...args);
+console.error = (...args) => _console.error(formatLogPrefix(), ...args);
 
 // ─── PDF PARSE ────────────────────────────────────────────────────────────
 let pdfParse = null;
 try { pdfParse = require('pdf-parse'); } catch (e) {
-    if (!TEST_MODE) console.log('[PDF] pdf-parse not installed');
+    if (!TEST_MODE) logWarn('PDF', 'pdf-parse not installed');
 }
 
 // ─── ENV VALIDATION ───────────────────────────────────────────────────────
 const REQUIRED_KEYS = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'OPENAI_API_KEY', 'VOYAGE_API_KEY'];
 for (const key of REQUIRED_KEYS) {
     if (ENABLE_RUNTIME && !process.env[key]) {
-        console.error(`❌ Missing env var: ${key}`);
+        logError('ENV', `Missing env var: ${key}`);
         process.exit(1);
     }
 }
-if (ENABLE_RUNTIME) console.log(`✅ Environment OK`);
+if (ENABLE_RUNTIME) logInfo('ENV', 'Environment OK');
 
 // ─── MAJORI'S 3 DIVISIONS (relevance filter) ──────────────────────────────
 const DIVISIONS = {
@@ -91,9 +162,9 @@ const CONFIG = {
     MAX_JOB_LINKS_PER_COMPANY: parseInt(process.env.MAX_JOB_LINKS_PER_COMPANY || '5000', 10),
     MAX_DISCOVERY_PAGES_PER_COMPANY: parseInt(process.env.MAX_DISCOVERY_PAGES_PER_COMPANY || '1000', 10),
     RECRAWL_INTERVAL_HOURS: parseInt(process.env.RECRAWL_INTERVAL_HOURS || '48', 10),
-    COMPANY_TIMEOUT_MS: parseInt(process.env.COMPANY_TIMEOUT_MS || '900000', 10),
-    JOB_TIMEOUT_MS: parseInt(process.env.JOB_TIMEOUT_MS || '120000', 10),
-    PLAYWRIGHT_TIMEOUT_MS: parseInt(process.env.PLAYWRIGHT_TIMEOUT_MS || '60000', 10),
+    COMPANY_TIMEOUT_MS: CRAWLER_TIMEOUTS.COMPANY_TIMEOUT_MS,
+    JOB_TIMEOUT_MS: CRAWLER_TIMEOUTS.JOB_TIMEOUT_MS,
+    PLAYWRIGHT_TIMEOUT_MS: CRAWLER_TIMEOUTS.PAGE_CONTENT_TIMEOUT_MS,
     BROWSER_RESTART_THRESHOLD: parseInt(process.env.BROWSER_RESTART_THRESHOLD || '100', 10),
     QUEUE_POLL_INTERVAL_MS: 5000,
     RATE_LIMIT_MAX: parseInt(process.env.CRAWLER_RATE_LIMIT_MAX || '5', 10),
@@ -303,6 +374,44 @@ function normalizeUrl(rawUrl, baseUrl) {
     }
 }
 
+function normalizeJobIdentityUrl(rawUrl, baseUrl) {
+    const normalized = normalizeUrl(rawUrl, baseUrl);
+    if (!normalized) return null;
+    try {
+        const url = new URL(normalized);
+        url.hash = '';
+        for (const key of [...url.searchParams.keys()]) {
+            if (/^(language|lang)$/i.test(key)) {
+                url.searchParams.delete(key);
+            }
+        }
+        if ((url.protocol !== 'http:' && url.protocol !== 'https:') || isNonJobUrl(url.href)) return null;
+        url.pathname = url.pathname.replace(/\/{2,}/g, '/');
+        if (url.pathname.length > 1) url.pathname = url.pathname.replace(/\/+$/, '');
+        return url.href;
+    } catch {
+        return normalized;
+    }
+}
+
+function getQueryParam(url, key) {
+    try {
+        return new URL(url).searchParams.get(key);
+    } catch {
+        return null;
+    }
+}
+
+function isEnglishLanguageVariant(url) {
+    const lang = (getQueryParam(url, 'language') || getQueryParam(url, 'lang') || '').toLowerCase();
+    return lang === 'en' || lang === 'en-us' || lang === 'en-gb';
+}
+
+function isGermanLanguageVariant(url) {
+    const lang = (getQueryParam(url, 'language') || getQueryParam(url, 'lang') || '').toLowerCase();
+    return lang === 'de' || lang === 'de-de' || lang === 'de-at' || lang === 'de-ch';
+}
+
 function getDomainRoot(url) {
     try {
         const parts = new URL(url).hostname.replace(/^www\./i, '').split('.');
@@ -398,7 +507,7 @@ const redisConnection = ENABLE_RUNTIME ? new Redis({
 }) : null;
 
 const openai = ENABLE_RUNTIME ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
-if (ENABLE_RUNTIME) console.log(`✅ OpenAI client initialized (${CONFIG.GPT_MODEL})`);
+if (ENABLE_RUNTIME) logInfo('OPENAI', `Client initialized (${CONFIG.GPT_MODEL})`);
 
 const customCrawlQueue = ENABLE_RUNTIME ? new Queue(QUEUE_NAME, { connection: redisConnection }) : null;
 
@@ -410,7 +519,7 @@ let requestsSinceRestart = 0;
 async function getSharedBrowser() {
     if (!sharedBrowser) {
         sharedBrowser = await chromium.launch({ headless: true });
-        console.log('[BROWSER] Launched');
+        logInfo('BROWSER', 'Launched');
     }
     return sharedBrowser;
 }
@@ -438,7 +547,7 @@ async function recycleBrowserIfNeeded() {
         requestsSinceRestart = 0;
         if (prevC) await prevC.close().catch(() => {});
         if (prevB) await prevB.close().catch(() => {});
-        console.log('[BROWSER] Recycled');
+        logInfo('BROWSER', 'Recycled');
     }
 }
 
@@ -489,8 +598,8 @@ async function fetchWithPlaywright(url, options = {}) {
     try {
         const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
         await acceptCookies(page);
-        if (waitForSelector) await page.waitForSelector(waitForSelector, { timeout: 10000 }).catch(() => {});
-        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+        if (waitForSelector) await page.waitForSelector(waitForSelector, { timeout: CRAWLER_TIMEOUTS.SELECTOR_TIMEOUT_MS }).catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS }).catch(() => {});
         await page.waitForTimeout(2000);
         if (scroll) await autoScroll(page);
         const html = await page.content();
@@ -513,9 +622,9 @@ async function fetchPageWithFallback(url, options = {}) {
         if (!playwrightResult.status || !BLOCKED_OR_RETRYABLE_STATUSES.has(playwrightResult.status)) {
             return playwrightResult;
         }
-        console.log(`[FETCH] Playwright HTTP ${playwrightResult.status}: ${url} -> ScraperAPI`);
+        logInfo('FETCH', `Playwright HTTP ${playwrightResult.status}: ${url} -> ScraperAPI`);
     } catch (pwErr) {
-        console.log(`[FETCH] Playwright failed: ${pwErr.message} → ScraperAPI`);
+        logWarn('FETCH', `Playwright failed: ${pwErr.message} → ScraperAPI`);
     }
     try {
         const html = await fetchWithScraperAPI(url, {
@@ -523,7 +632,7 @@ async function fetchPageWithFallback(url, options = {}) {
         });
         return { html, url, status: null, usedScraperApi: true };
     } catch (e) {
-        console.warn(`[FETCH] ScraperAPI failed: ${e.message}`);
+        logWarn('FETCH', `ScraperAPI failed: ${e.message}`);
         if (playwrightResult) {
             return {
                 ...playwrightResult,
@@ -548,7 +657,7 @@ async function downloadAndParsePDF(url) {
     if (!pdfParse) return null;
     try {
         const r = await axios.get(url, {
-            responseType: 'arraybuffer', timeout: 30000,
+            responseType: 'arraybuffer', timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
         const d = await pdfParse(Buffer.from(r.data));
@@ -600,7 +709,7 @@ async function extractLinksFromPage(baseUrl, companyName) {
 
         await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.PLAYWRIGHT_TIMEOUT_MS });
         await acceptCookies(page);
-        await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS }).catch(() => {});
         await page.waitForTimeout(2500);
 
         // Scroll + load-more for lazy-loaded job lists
@@ -717,7 +826,7 @@ async function extractLinksFromPage(baseUrl, companyName) {
 
 // ─── DEEP CRAWL: category → jobs ──────────────────────────────────────────
 async function extractAllJobLinks(baseUrl, companyName) {
-    console.log(`[CRAWL] Deep-crawling: ${baseUrl}`);
+    logInfo('CRAWL', `Deep-crawling: ${baseUrl}`);
     const allJobs = new Set();
     const allCategories = new Set();
     const allSubdomains = new Set();
@@ -729,12 +838,12 @@ async function extractAllJobLinks(baseUrl, companyName) {
     p1.categories.forEach(u => allCategories.add(u));
     p1.subdomains.forEach(u => allSubdomains.add(u));
     p1.ats.forEach(u => allAts.add(u));
-    console.log(`[PASS 1] jobs=${p1.jobs.size} categories=${p1.categories.size} subdomains=${p1.subdomains.size} ats=${p1.ats.size}`);
+    logInfo('PASS 1', `jobs=${p1.jobs.size} categories=${p1.categories.size} subdomains=${p1.subdomains.size} ats=${p1.ats.size}`);
 
     // ── PASS 2: Crawl INTO each category (max N) ──────────────────────
     const cats = [...allCategories].slice(0, CONFIG.MAX_CATEGORIES_PER_COMPANY);
     for (const catUrl of cats) {
-        console.log(`[PASS 2] → category: ${catUrl}`);
+        logInfo('PASS 2', `→ category: ${catUrl}`);
         const p2 = await extractLinksFromPage(catUrl, companyName);
         p2.jobs.forEach(u => allJobs.add(u));
         p2.subdomains.forEach(u => allSubdomains.add(u));
@@ -750,7 +859,7 @@ async function extractAllJobLinks(baseUrl, companyName) {
     // ── PASS 2b: Any newly discovered categories ──────────────────────
     const newCats = [...allCategories].filter(u => !cats.includes(u)).slice(0, CONFIG.MAX_CATEGORIES_PER_COMPANY);
     for (const catUrl of newCats) {
-        console.log(`[PASS 2b] → category: ${catUrl}`);
+        logInfo('PASS 2b', `→ category: ${catUrl}`);
         const p2 = await extractLinksFromPage(catUrl, companyName);
         p2.jobs.forEach(u => allJobs.add(u));
         p2.ats.forEach(u => allAts.add(u));
@@ -759,7 +868,7 @@ async function extractAllJobLinks(baseUrl, companyName) {
     // ── PASS 3: Subdomain job portals ─────────────────────────────────
     const subs = [...allSubdomains].slice(0, CONFIG.MAX_SUBDOMAINS_PER_COMPANY);
     for (const subUrl of subs) {
-        console.log(`[PASS 3] → subdomain: ${subUrl}`);
+        logInfo('PASS 3', `→ subdomain: ${subUrl}`);
         const p3 = await extractLinksFromPage(subUrl, companyName);
         p3.jobs.forEach(u => allJobs.add(u));
         p3.categories.forEach(u => allCategories.add(u));
@@ -768,7 +877,7 @@ async function extractAllJobLinks(baseUrl, companyName) {
     // ── PASS 3b: Crawl into subdomain categories too ──────────────────
     const subCats = [...allCategories].filter(u => !cats.includes(u) && !newCats.includes(u)).slice(0, 5);
     for (const catUrl of subCats) {
-        console.log(`[PASS 3b] → ${catUrl}`);
+        logInfo('PASS 3b', `→ ${catUrl}`);
         const p = await extractLinksFromPage(catUrl, companyName);
         p.jobs.forEach(u => allJobs.add(u));
     }
@@ -776,7 +885,7 @@ async function extractAllJobLinks(baseUrl, companyName) {
     // ── PASS 4: ATS portals (take first N as-is; they have their own crawlers) ─
     const atsList = [...allAts].slice(0, 3);
     for (const atsUrl of atsList) {
-        console.log(`[PASS 4] ATS detected: ${atsUrl} (handled by dedicated crawlers)`);
+        logInfo('PASS 4', `ATS detected: ${atsUrl} (handled by dedicated crawlers)`);
         // Not crawled here — dedicated ATS crawlers handle these.
         // But we record the URL so the pipeline knows about it.
     }
@@ -784,7 +893,7 @@ async function extractAllJobLinks(baseUrl, companyName) {
     // Filter out garbage
     const finalJobs = [...allJobs].filter(u => !isNonJobUrl(u) && !isCategoryUrl(u));
 
-    console.log(`[LINKS] ✓ Final job links: ${finalJobs.length} (scanned ${1 + cats.length + newCats.length + subs.length + subCats.length} pages)`);
+    logInfo('LINKS', `Final job links: ${finalJobs.length} (scanned ${1 + cats.length + newCats.length + subs.length + subCats.length} pages)`);
     return finalJobs.slice(0, CONFIG.MAX_JOB_LINKS_PER_COMPANY);
 }
 
@@ -866,7 +975,7 @@ async function clickLoadMore(page) {
                 const btn = page.locator(sel).first();
                 if (await btn.isVisible({ timeout: 600 })) {
                     const before = await page.locator('a[href]').count().catch(() => 0);
-                    await btn.click({ timeout: 3000 });
+                    await btn.click({ timeout: CRAWLER_TIMEOUTS.CLICK_TIMEOUT_MS });
                     clicks++;
                     clicked = true;
                     await page.waitForTimeout(1500);
@@ -992,7 +1101,7 @@ async function discoverJobDetailUrlsByClicking(page, pageUrl, rootUrl) {
             const popup = await popupPromise;
 
             if (popup) {
-                await popup.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+                await popup.waitForLoadState('domcontentloaded', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS }).catch(() => {});
                 await popup.waitForTimeout(800).catch(() => {});
                 const popupUrl = normalizeUrl(popup.url());
                 const popupHtml = await popup.content().catch(() => '');
@@ -1004,7 +1113,7 @@ async function discoverJobDetailUrlsByClicking(page, pageUrl, rootUrl) {
                 continue;
             }
 
-            await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+            await page.waitForLoadState('domcontentloaded', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS / 2 }).catch(() => {});
             await page.waitForTimeout(800);
             const afterUrl = normalizeUrl(page.url()) || beforeUrl;
             const afterHtml = await page.content().catch(() => '');
@@ -1017,11 +1126,11 @@ async function discoverJobDetailUrlsByClicking(page, pageUrl, rootUrl) {
             if (await closeButton.isVisible({ timeout: 300 }).catch(() => false)) {
                 await closeButton.click({ timeout: 1000 }).catch(() => {});
             } else if (afterUrl !== beforeUrl) {
-                await page.goBack({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {});
+                await page.goBack({ waitUntil: 'domcontentloaded', timeout: CRAWLER_TIMEOUTS.NAVIGATION_TIMEOUT_MS / 12 }).catch(() => {});
                 await page.waitForTimeout(500).catch(() => {});
             }
         } catch {
-            await page.goto(beforeUrl, { waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {});
+            await page.goto(beforeUrl, { waitUntil: 'domcontentloaded', timeout: CRAWLER_TIMEOUTS.NAVIGATION_TIMEOUT_MS / 12 }).catch(() => {});
         }
     }
 
@@ -1035,7 +1144,7 @@ async function extractLinksFromPage(pageUrl, rootUrl) {
         const page = await context.newPage();
         const response = await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.PLAYWRIGHT_TIMEOUT_MS });
         await acceptCookies(page);
-        await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS }).catch(() => {});
         await page.waitForTimeout(1500);
         await autoScroll(page);
         await clickLoadMore(page);
@@ -1075,7 +1184,7 @@ async function extractLinksFromPage(pageUrl, rootUrl) {
         await page.close().catch(() => {});
         await recycleBrowserIfNeeded();
     } catch (err) {
-        console.log(`[DISCOVERY] Playwright failed on ${pageUrl}: ${err.message}`);
+        logWarn('DISCOVERY', `Playwright failed on ${pageUrl}: ${err.message}`);
         try {
             const r = await fetchPageWithFallback(pageUrl, { waitForSelector: 'body', scroll: true });
             if (r?.html) {
@@ -1097,7 +1206,7 @@ async function extractLinksFromPage(pageUrl, rootUrl) {
 }
 
 async function extractAllJobLinks(baseUrl, companyName) {
-    console.log(`[CRAWL] Discovering listings and job details from: ${baseUrl}`);
+    logInfo('CRAWL', `Discovering listings and job details from: ${baseUrl}`);
     const rootUrl = normalizeUrl(baseUrl) || baseUrl;
     const queue = [rootUrl];
     const visited = new Set();
@@ -1110,6 +1219,7 @@ async function extractAllJobLinks(baseUrl, companyName) {
         const current = normalizeUrl(queue.shift(), rootUrl);
         if (!current || visited.has(current) || isNonJobUrl(current) || !isSameCompanyUrl(current, rootUrl)) continue;
         visited.add(current);
+        setLogContext({ pageUrl: current, step: 'DISCOVERY' });
 
         const extracted = await extractLinksFromPage(current, rootUrl);
         listingPagesScanned++;
@@ -1125,22 +1235,22 @@ async function extractAllJobLinks(baseUrl, companyName) {
             if (normalized && !visited.has(normalized) && !jobLinks.has(normalized)) queue.push(normalized);
         });
 
-        console.log(`[DISCOVERY] pages=${visited.size} queue=${queue.length} job_links=${jobLinks.size} ats=${atsLinks.size}`);
+        logInfo('DISCOVERY', `pages=${visited.size} queue=${queue.length} job_links=${jobLinks.size} ats=${atsLinks.size}`);
         if (jobLinks.size >= CONFIG.MAX_JOB_LINKS_PER_COMPANY) {
-            console.warn(`[DISCOVERY] Hit MAX_JOB_LINKS_PER_COMPANY=${CONFIG.MAX_JOB_LINKS_PER_COMPANY}; increase env var for very large sites.`);
+            logWarn('DISCOVERY', `Hit MAX_JOB_LINKS_PER_COMPANY=${CONFIG.MAX_JOB_LINKS_PER_COMPANY}; increase env var for very large sites.`);
             break;
         }
     }
 
     if (queue.length > 0) {
-        console.warn(`[DISCOVERY] Stopped after ${visited.size} listing pages; ${queue.length} pages remain. Increase MAX_DISCOVERY_PAGES_PER_COMPANY for this site.`);
+        logWarn('DISCOVERY', `Stopped after ${visited.size} listing pages; ${queue.length} pages remain. Increase MAX_DISCOVERY_PAGES_PER_COMPANY for this site.`);
     }
     for (const atsUrl of atsLinks) {
-        console.log(`[DISCOVERY] ATS portal found but left for dedicated crawler: ${atsUrl}`);
+        logInfo('DISCOVERY', `ATS portal found but left for dedicated crawler: ${atsUrl}`);
     }
 
     const links = [...jobLinks].slice(0, CONFIG.MAX_JOB_LINKS_PER_COMPANY);
-    console.log(`[LINKS] job_links=${links.length} listing_pages_scanned=${listingPagesScanned} failed_listing_pages=${failedPages.length}`);
+    logInfo('LINKS', `job_links=${links.length} listing_pages_scanned=${listingPagesScanned} failed_listing_pages=${failedPages.length}`);
     return {
         links,
         stats: {
@@ -1222,6 +1332,8 @@ function chooseJobPageUrl({ pageUrl, canonicalUrl, jsonUrl, applyUrl }) {
     const candidates = [canonicalUrl, jsonUrl, pageUrl, applyUrl]
         .map(u => normalizeUrl(u, pageUrl))
         .filter(Boolean);
+    const german = candidates.find(isGermanLanguageVariant);
+    if (german) return german;
     const detail = candidates.find(isLikelyIndividualJobUrl);
     if (detail) return detail;
     return normalizeUrl(pageUrl);
@@ -1414,14 +1526,6 @@ function extractRawJobFromHtml(html, pageUrl, companyName) {
     if (!rawDescription || wordCount(rawDescription) < CONFIG.MIN_JOB_CONTENT_WORDS) reasons.push('insufficient_job_specific_content');
     if (discoveredDetailLinks >= 3 && score < CONFIG.MIN_JOB_PAGE_SCORE + 2) reasons.push('looks_like_listing_page_not_detail_page');
     if (score < CONFIG.MIN_JOB_PAGE_SCORE) reasons.push(`weak_job_evidence_score_${score}`);
-    if (hiringOrganization && companyName) {
-        const org = hiringOrganization.toLowerCase();
-        const company = companyName.toLowerCase();
-        if (!org.includes(company.slice(0, 8)) && !company.includes(org.slice(0, 8))) {
-            reasons.push('hiring_organization_mismatch');
-        }
-    }
-
     return {
         valid: reasons.length === 0,
         reasons,
@@ -1515,14 +1619,12 @@ Return ONLY valid JSON:
 
 RULES:
 1. is_job = FALSE if this is: navigation/category page, legal page (datenschutz/impressum/agb/cookie), marketing page, company culture page, product page, error page, or contains no actual job description.
-2. is_relevant = TRUE only if the job clearly belongs to ONE of these 3 divisions:
-${divisionKeywords}
-3. division = the closest matching division name, or null.
-4. cleaned_title: clean job role. Remove (m/w/d), (w/m/d), gender tags, location, company name.
-5. Do not use category labels, department names, marketing headings, product names, or career-page labels as a title.
-6. skills: only skills stated or strongly supported by this source text. Do not invent filler skills.
-7. If seniority, remote type, employment type, location, or skills are not present, return null or [].
-8. Return ONLY JSON.`;
+2. division = the closest matching division name, or null.
+3. cleaned_title: clean job role. Remove (m/w/d), (w/m/d), gender tags, location, company name.
+4. Do not use category labels, department names, marketing headings, product names, or career-page labels as a title.
+5. skills: only skills stated or strongly supported by this source text. Do not invent filler skills.
+6. If seniority, remote type, employment type, location, or skills are not present, return null or [].
+7. Return ONLY JSON.`;
 
     try {
         const res = await openai.chat.completions.create({
@@ -1582,7 +1684,7 @@ async function geocodeCity(city) {
         const r = await axios.get('https://nominatim.openstreetmap.org/search', {
             params: { q: city + ', Germany', format: 'json', limit: 1 },
             headers: { 'User-Agent': CONFIG.NOMINATIM_USER_AGENT },
-            timeout: 10000
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS
         });
         if (r.data && r.data.length > 0) {
             const result = { lat: parseFloat(r.data[0].lat), lng: parseFloat(r.data[0].lon) };
@@ -1611,7 +1713,7 @@ async function embedWithVoyage(text) {
                     'Authorization': `Bearer ${process.env.VOYAGE_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 30000
+                timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS
             }
         );
         return r.data?.data?.[0]?.embedding || null;
@@ -1623,7 +1725,8 @@ async function embedWithVoyage(text) {
 
 // ─── DEDUP ────────────────────────────────────────────────────────────────
 function generateExternalJobId(url) {
-    return crypto.createHash('sha256').update(url.trim().toLowerCase()).digest('hex').slice(0, 40);
+    const identity = normalizeJobIdentityUrl(url) || String(url || '').trim();
+    return crypto.createHash('sha256').update(identity.toLowerCase()).digest('hex').slice(0, 40);
 }
 
 // ─── DB ───────────────────────────────────────────────────────────────────
@@ -1724,14 +1827,9 @@ async function processJobLink(url, companyId, companyName) {
     const s = await structureJobWithGPT(title, description);
     if (!s) return { skip: true, reason: 'gpt_failed' };
     if (!s.is_job) {
-        console.log(`   ⏭️  Not a job: "${title}" (${s.reason || 'rejected'})`);
+        logInfo('JOB', `SKIP not a job: "${title}" (${s.reason || 'rejected'})`);
         return { skip: true, reason: 'not_a_job' };
     }
-    if (!s.is_relevant) {
-        console.log(`   ⏭️  Not relevant: "${title}" (${s.relevance_reason || 'off-division'})`);
-        return { skip: true, reason: 'not_relevant' };
-    }
-
     // 4. Geocode
     let lat = null, lng = null;
     if (location) {
@@ -1770,6 +1868,10 @@ async function processJobLink(url, companyId, companyName) {
 
 async function processJobLink(url, companyId, companyName) {
     const normalizedInputUrl = normalizeUrl(url) || url;
+    if (isEnglishLanguageVariant(normalizedInputUrl)) {
+        logWarn('JOB', `SKIP English variant: ${normalizedInputUrl}`);
+        return { skip: true, reason: 'english_language_variant_skipped', url: normalizedInputUrl };
+    }
     let html = null;
     let pdfText = '';
     let finalUrl = normalizedInputUrl;
@@ -1807,7 +1909,7 @@ async function processJobLink(url, companyId, companyName) {
     const structured = await structureJobWithGPT(rawJob);
     const structuredValidation = validateStructuredJob(structured, rawJob, companyName);
     if (!structuredValidation.ok) {
-        console.log(`   SKIP ${rawJob.title || finalUrl} (${structuredValidation.reasons.join('|')})`);
+        logInfo('JOB', `SKIP ${rawJob.title || finalUrl} (${structuredValidation.reasons.join('|')})`);
         return {
             skip: true,
             reason: structuredValidation.reasons.join('|') || 'structured_validation_failed',
@@ -1886,23 +1988,29 @@ async function withTimeout(promise, ms, label) {
 // ─── COMPANY PROCESSING ───────────────────────────────────────────────────
 async function processCompany(job) {
     const { companyId, companyName, careerUrl } = job.data;
-    console.log(`\n[CRAWL] ${companyName}`);
+    const startedAt = Date.now();
+    logInfo('CRAWL', `Start company="${companyName}" companyId=${companyId} careerUrl=${careerUrl || 'n/a'}`);
     await markCompanyStatus(companyId, 'in_progress', { touchTimestamp: false });
 
     let effectiveUrl = careerUrl;
     if (!effectiveUrl || effectiveUrl.trim() === '') {
-        console.log('[CAREER] Discovering...');
+        logInfo('CAREER', `Discovering missing career URL for companyId=${companyId}`);
         effectiveUrl = await discoverCareerPage(
             'https://' + companyName.replace(/[^a-z0-9]/gi, '').toLowerCase() + '.com'
         );
         if (!effectiveUrl) {
+            logWarn('CAREER', `Discovery failed for companyId=${companyId}`);
             await markCompanyStatus(companyId, 'failed');
             return { status: 'failed_fetch', companyId };
         }
     }
 
+    logInfo('CAREER', `Using careerUrl=${effectiveUrl}`);
+
     const links = await extractAllJobLinks(effectiveUrl, companyName);
+    logInfo('DISCOVERY', `Found ${links.length} candidate job links for companyId=${companyId}`);
     if (links.length === 0) {
+        logWarn('DISCOVERY', `No links discovered for companyId=${companyId}`);
         await markCompanyStatus(companyId, 'no_jobs');
         return { status: 'no_jobs', companyId };
     }
@@ -1911,8 +2019,11 @@ async function processCompany(job) {
     const seen = new Set();
     let skipped = 0;
 
+    let linkIndex = 0;
     for (const link of links) {
         try {
+            linkIndex++;
+            logInfo('JOB', `Processing ${linkIndex}/${links.length} for companyId=${companyId}`);
             const r = await withTimeout(
                 processJobLink(link, companyId, companyName),
                 CONFIG.JOB_TIMEOUT_MS,
@@ -1922,17 +2033,18 @@ async function processCompany(job) {
             if (seen.has(r.row.external_job_id)) continue;
             seen.add(r.row.external_job_id);
             rows.push(r.row);
-            console.log(`   ✅ ${r.row.title.slice(0, 55)} | 📍${r.row.location || '-'} | 🧠${r.row.structured_skills?.length || 0} skills`);
+            logInfo('JOB', `OK ${r.row.title.slice(0, 55)} | ${r.row.location || '-'} | ${r.row.structured_skills?.length || 0} skills`);
         } catch (e) {
-            console.error(`   ❌ ${e.message}`);
+            logError('JOB', e.message);
         }
     }
 
     let saved = 0;
     if (rows.length > 0) saved = await batchInsertJobs(rows);
-    console.log(`[DB] Saved ${saved} | Skipped ${skipped} (non-jobs/non-relevant)`);
+    logInfo('DB', `Saved ${saved} | Skipped ${skipped} (non-jobs/non-relevant)`);
 
     await markCompanyStatus(companyId, 'completed');
+    logInfo('CRAWL', `Done company="${companyName}" companyId=${companyId} jobsSaved=${saved} skipped=${skipped} elapsedMs=${Date.now() - startedAt}`);
     return { status: 'success', companyId, jobsSaved: saved };
 }
 
@@ -1954,7 +2066,15 @@ async function processCompany(job) {
         notFoundPages: 0
     };
 
-    console.log(`\n[CRAWL] ${companyName}`);
+    setLogContext({
+        companyName,
+        companyId,
+        pageUrl: careerUrl || null,
+        jobsSaved: 0,
+        jobsFound: 0,
+        step: 'START',
+    });
+    logInfo('CRAWL', `Start company="${companyName}" companyId=${companyId} careerUrl=${careerUrl || 'n/a'}`);
     await markCompanyStatus(companyId, 'in_progress', { touchTimestamp: false });
 
     metrics.activeJobsBefore = await getActiveJobCount(companyId);
@@ -1966,13 +2086,14 @@ async function processCompany(job) {
             effectiveUrl = validated.url;
         } else {
             metrics.notFoundReason = validated?.reason || 'invalid_saved_career_url';
-            console.warn(`[CAREER] Invalid saved URL for ${companyName}: ${metrics.notFoundReason}`);
+            logWarn('CAREER', `Invalid saved URL: ${metrics.notFoundReason}`);
             effectiveUrl = null;
         }
     }
 
     if (!effectiveUrl) {
-        console.log('[CAREER] Discovering...');
+        setLogContext({ step: 'DISCOVERY', pageUrl: careerUrl || null });
+        logInfo('CAREER', 'Discovering...');
         effectiveUrl = await discoverCareerPage(
             'https://' + companyName.replace(/[^a-z0-9]/gi, '').toLowerCase() + '.com',
             companyName
@@ -1991,6 +2112,7 @@ async function processCompany(job) {
 
     const discovery = await extractAllJobLinks(effectiveUrl, companyName);
     const links = discovery.links || [];
+    setLogContext({ step: 'JOBS', pageUrl: effectiveUrl, jobsFound: links.length, jobsSaved: 0 });
     Object.assign(metrics, {
         jobLinksFound: discovery.stats?.jobLinksFound || links.length,
         listingPagesScanned: discovery.stats?.listingPagesScanned || 0,
@@ -2033,7 +2155,7 @@ async function processCompany(job) {
                 if (rejectedSamples.length < 20) {
                     rejectedSamples.push({ url: result.url || link, title: result.title || null, reason });
                 }
-                console.warn(`   REJECT ${result.title || link} (${reason})`);
+                logWarn('JOB', `REJECT ${result.title || link} (${reason})`);
                 continue;
             }
 
@@ -2045,17 +2167,19 @@ async function processCompany(job) {
             }
             seen.add(result.row.external_job_id);
             rows.push(result.row);
-            console.log(`   OK ${result.row.title.slice(0, 55)} | ${result.row.location || '-'} | ${result.row.structured_skills?.length || 0} skills`);
+            setLogContext({ jobsSaved: rows.length });
+            logInfo('JOB', `OK ${result.row.title.slice(0, 55)} | ${result.row.location || '-'} | ${result.row.structured_skills?.length || 0} skills`);
         } catch (err) {
             metrics.failedPages++;
             if (failedSamples.length < 20) failedSamples.push({ url: link, reason: err.message });
-            console.error(`   FAIL ${link}: ${err.message}`);
+            logError('JOB', `FAIL ${link}: ${err.message}`);
         }
     }
 
-    console.log(`[DB] rows_ready=${rows.length}`);
+    logInfo('DB', `rows_ready=${rows.length}`);
     if (rows.length > 0) metrics.jobsSaved = await batchInsertJobs(rows);
     metrics.activeJobsAfter = await getActiveJobCount(companyId);
+    setLogContext({ step: 'SAVE', jobsSaved: metrics.jobsSaved });
 
     const fetchedRatio = links.length > 0 ? metrics.jobPagesFetched / links.length : 0;
     const saveRatio = links.length > 0 ? metrics.jobsSaved / links.length : 0;
@@ -2070,8 +2194,8 @@ async function processCompany(job) {
     const rejectionSummary = [...rejectionReasons.entries()]
         .map(([reason, count]) => `${reason}:${count}`)
         .join(', ') || '-';
-    console.log(`[SUMMARY] links=${links.length} fetched=${metrics.jobPagesFetched} structured=${metrics.jobsStructured} rejected=${metrics.invalidRejected} duplicates=${metrics.duplicateSkipped} saved=${metrics.jobsSaved} failed=${metrics.failedPages}`);
-    console.log(`[REJECTIONS] ${rejectionSummary}`);
+    logInfo('SUMMARY', `links=${links.length} fetched=${metrics.jobPagesFetched} structured=${metrics.jobsStructured} rejected=${metrics.invalidRejected} duplicates=${metrics.duplicateSkipped} saved=${metrics.jobsSaved} failed=${metrics.failedPages} active_jobs=${metrics.activeJobsAfter ?? '-'}`);
+    logInfo('REJECTIONS', rejectionSummary);
 
     if (allFoundLinksUnavailable) {
         await markCompanyStatus(companyId, 'not_found');
@@ -2109,6 +2233,7 @@ async function processCompany(job) {
         discovery: discovery.stats,
         ...metrics
     });
+    setLogContext({ step: 'DONE', jobsSaved: metrics.jobsSaved, pageUrl: effectiveUrl });
     return { status: metrics.jobsSaved > 0 ? 'success' : 'no_jobs', companyId, jobsSaved: metrics.jobsSaved, metrics };
 }
 
@@ -2243,6 +2368,8 @@ function printSummary() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────
 async function run() {
+    resetLogContext();
+    setLogContext({ step: 'BOOT' });
     console.log('[START] Custom Crawler v21 — Deep Category Crawling + Relevance Filter');
     console.log(`[CONFIG] Concurrency: ${CONFIG.CONCURRENCY} | GPT: ${CONFIG.GPT_MODEL} | Voyage: ${CONFIG.VOYAGE_MODEL}`);
     console.log(`[DIVISIONS] ${Object.keys(DIVISIONS).join(' | ')}`);
@@ -2258,6 +2385,8 @@ async function run() {
     console.log(`[QUEUE] Processing ${total} companies...`);
     await waitForQueue();
 
+    resetLogContext();
+    setLogContext({ step: 'SUMMARY' });
     console.log('[COMPLETE]');
     printProgress();
     printSummary();

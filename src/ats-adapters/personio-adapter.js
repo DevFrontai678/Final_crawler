@@ -1,6 +1,8 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 require('dotenv').config();
+const { SCRAPERAPI_CONFIG } = require('../utils/scraperapi-config');
+const { CRAWLER_TIMEOUTS } = require('../utils/crawler-timeouts');
 
 // ─── GLOBAL BROWSER (reused across all requests) ──────────────────────────
 let globalBrowser = null;
@@ -71,7 +73,7 @@ async function acceptCookies(page) {
   for (const selector of cookieSelectors) {
     try {
       const acceptBtn = await page.locator(selector).first();
-      if (await acceptBtn.isVisible({ timeout: 1500 })) {
+      if (await acceptBtn.isVisible({ timeout: CRAWLER_TIMEOUTS.VISIBILITY_TIMEOUT_MS })) {
         await acceptBtn.click();
         console.log('    🍪 Accepted cookies');
         return true;
@@ -109,7 +111,7 @@ async function fetchHtmlWithFallback(url, retryCount = 0) {
 
   try {
     const response = await axios.get(url, {
-      timeout: 15000,
+      timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
       headers: { 'User-Agent': 'Mozilla/5.0' },
       maxRedirects: 5
     });
@@ -144,9 +146,9 @@ async function fetchHtmlWithFallback(url, retryCount = 0) {
       locale: 'de-DE',
     });
     page = await context.newPage();
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CRAWLER_TIMEOUTS.NAVIGATION_TIMEOUT_MS });
     await acceptCookies(page);
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(CRAWLER_TIMEOUTS.WAIT_TIMEOUT_MS + 1000);
     const playwrightHtml = await page.content();
 
     if (hasPersonioJobContent(playwrightHtml)) {
@@ -174,7 +176,7 @@ async function fetchHtmlWithFallback(url, retryCount = 0) {
     const apiUrl = `https://api.scraperapi.com/?api_key=${apiKey}&url=${encodedUrl}&render=true&country_code=de&premium=true`;
 
     const response = await axios.get(apiUrl, {
-      timeout: 30000,
+      timeout: SCRAPERAPI_CONFIG.requestTimeoutMs,
       headers: { 'Accept': 'text/html' }
     });
 
@@ -329,7 +331,7 @@ async function fetchPersonioJobs(slug) {
     console.log(`    📡 Trying XML API: ${xmlUrl}`);
 
     const response = await axios.get(xmlUrl, {
-      timeout: 15000,
+      timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
       headers: { 'User-Agent': 'Mozilla/5.0' }
     });
 
@@ -372,7 +374,7 @@ async function fetchPersonioJobs(slug) {
       try {
         const xmlUrl = `https://${slug}.jobs.personio.de/xml`;
         const response = await axios.get(xmlUrl, {
-          timeout: 15000,
+          timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
           headers: { 'User-Agent': 'Mozilla/5.0' }
         });
         const xml = response.data;
@@ -415,7 +417,7 @@ async function fetchPersonioJobs(slug) {
     console.log(`    📡 Trying JSON API: ${jsonUrl}`);
 
     const response = await axios.get(jsonUrl, {
-      timeout: 15000,
+      timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
       headers: {
         'Accept': 'application/json',
         'User-Agent': 'Mozilla/5.0'

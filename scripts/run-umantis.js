@@ -5,6 +5,8 @@ const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
+const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
+const { enrichJobForStorage } = require('../src/utils/job-enrichment');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -23,9 +25,9 @@ function generateExternalHash(companyId, externalJobId) {
 
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
 const CONFIG = {
-    PLAYWRIGHT_TIMEOUT: 15000,
+    PLAYWRIGHT_TIMEOUT: CRAWLER_TIMEOUTS.NAVIGATION_TIMEOUT_MS,
     PLAYWRIGHT_RETRIES: 1,
-    AXIOS_TIMEOUT: 10000,
+    AXIOS_TIMEOUT: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
     JOB_SCRAPE_CONCURRENCY: 5,
     JOB_LINK_LIMIT: 60,
     MIN_DESCRIPTION_LENGTH: 50,
@@ -74,7 +76,7 @@ async function playwrightFetchPage(url) {
             browser = await chromium.launch({ headless: true });
             const page = await browser.newPage();
             await page.setExtraHTTPHeaders({ 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8' });
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.PLAYWRIGHT_TIMEOUT });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.PLAYWRIGHT_TIMEOUT });
             await page.waitForTimeout(2000);
             const html = await page.content();
             await browser.close();
@@ -548,21 +550,25 @@ async function run() {
             }
 
             for (const job of result.jobs) {
+                const storageJob = await enrichJobForStorage({
+                    company_id: company.Id,
+                    company_name: job.company_name || company.Name || null,
+                    external_job_id: job.external_job_id,
+                    external_hash: job.external_hash,
+                    title: job.title,
+                    location: job.location,
+                    employment_type: job.employment_type,
+                    remote_type: job.remote_type,
+                    raw_description: job.raw_description,
+                    apply_url: job.apply_url,
+                    ats_source: 'umantis',
+                    is_active: true
+                });
+
                 const { error: insertError } = await supabase
                     .from('jobs')
                     .upsert({
-                        company_id: company.Id,
-                        company_name: job.company_name,
-                        external_job_id: job.external_job_id,
-                        external_hash: job.external_hash,
-                        title: job.title,
-                        location: job.location,
-                        employment_type: job.employment_type,
-                        remote_type: job.remote_type,
-                        raw_description: job.raw_description,
-                        apply_url: job.apply_url,
-                        ats_source: 'umantis',   // ← FIXED
-                        is_active: true,
+                        ...storageJob,
                         first_seen_at: new Date(),
                         last_seen_at: new Date()
                     }, { onConflict: 'company_id,external_job_id' });

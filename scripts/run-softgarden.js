@@ -3,6 +3,8 @@ const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
+const { enrichJobForStorage } = require('../src/utils/job-enrichment');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -25,7 +27,7 @@ async function getBrowser() {
 async function fetchHtmlWithFallback(url) {
     try {
         const response = await axios.get(url, {
-            timeout: 15000,
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
             headers: { 'User-Agent': 'Mozilla/5.0' },
             maxRedirects: 5
         });
@@ -38,7 +40,7 @@ async function fetchHtmlWithFallback(url) {
             const browser = await getBrowser();
             context = await browser.newContext();
             page = await context.newPage();
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CRAWLER_TIMEOUTS.NAVIGATION_TIMEOUT_MS });
             const html = await page.content();
             return html;
         } catch (pwErr) {
@@ -208,7 +210,7 @@ async function fetchSoftgardenJobs(userId, projectId) {
             },
             {
                 headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-                timeout: 15000
+                timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS
             }
         );
 
@@ -295,20 +297,25 @@ async function run() {
         if (result.jobs.length === 0) continue;
 
         for (const job of result.jobs) {
+            const storageJob = await enrichJobForStorage({
+                company_id: company.Id,
+                company_name: job.company_name || company.Name || null,
+                external_job_id: job.external_job_id,
+                title: job.title,
+                location: job.location,
+                employment_type: job.employment_type,
+                raw_description: job.raw_description ? job.raw_description.slice(0, 5000) : null,
+                apply_url: job.apply_url,
+                ats_source: result.usedFallback ? 'softgarden_fallback' : 'softgarden',
+                is_active: true
+            });
+
             const { error: insertError } = await supabase
                 .from('jobs')
                 .upsert({
-                    company_id: company.Id,
-                    external_job_id: job.external_job_id,
-                    title: job.title,
-                    location: job.location,
-                    employment_type: job.employment_type,
-                    raw_description: job.raw_description ? job.raw_description.slice(0, 5000) : null,
-                    apply_url: job.apply_url,
-                    is_active: true,
+                    ...storageJob,
                     first_seen_at: new Date(),
                     last_seen_at: new Date(),
-                    ats_source: result.usedFallback ? 'softgarden_fallback' : 'softgarden'
                 }, { onConflict: 'company_id,external_job_id' });
 
             if (insertError) {

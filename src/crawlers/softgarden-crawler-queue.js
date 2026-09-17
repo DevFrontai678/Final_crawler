@@ -5,6 +5,8 @@ const ws = require('ws');
 const { processSoftgardenCompany, closeSoftgardenBrowser } = require('../ats-adapters/softgarden-adapter');
 const cheerio = require('cheerio');
 const axios = require('axios');
+const { CRAWLER_TIMEOUTS } = require('../utils/crawler-timeouts');
+const { enrichJobRows } = require('../utils/job-enrichment');
 require('dotenv').config();
 
 // ─── BACKFILL HELPERS ──────────────────────────────────────────────────────
@@ -47,7 +49,7 @@ function extractCompanyNameFromHTML(html, fallbackName) {
 
 async function fetchHtmlForBackfill(url) {
     try {
-        const response = await axios.get(url, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' }, maxRedirects: 5 });
+        const response = await axios.get(url, { timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS, headers: { 'User-Agent': 'Mozilla/5.0' }, maxRedirects: 5 });
         return response.data;
     } catch (err) {
         return null;
@@ -226,7 +228,7 @@ const worker = new Worker(QUEUE_NAME, async job => {
             return;
         }
 
-        const jobsToSave = result.jobs.map((j, index) => ({
+        const jobsToSave = await enrichJobRows(result.jobs.map((j, index) => ({
             company_id: companyId,
             external_job_id: j.external_job_id || `fallback_${Date.now()}_${index}`,
             title: j.title || 'Untitled',
@@ -238,7 +240,7 @@ const worker = new Worker(QUEUE_NAME, async job => {
             is_active: true,
             first_seen_at: new Date(),
             last_seen_at: new Date()
-        }));
+        })), { companyId, companyName: company.Name, atsSource: 'softgarden' });
 
         if (jobsToSave.length > 0) {
             const { error: saveError } = await supabase
