@@ -8,6 +8,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const fs = require('fs');
 require('dotenv').config();
+const { applyProxyToAxiosConfig, proxyFetch, logProxyFailure } = require('../utils/proxy');
 
 // ─── TOKEN LOGGING SETUP ──────────────────────────────────────────────────
 const TOKEN_LOG_FILE = './token-usage.log';
@@ -160,12 +161,14 @@ async function fetchWithTimeout(url, timeoutMs = 10000) {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       },
       maxRedirects: 6,
-      validateStatus: s => s < 500
+      validateStatus: s => s < 500,
+      ...applyProxyToAxiosConfig()
     });
     clearTimeout(timeout);
     return response;
   } catch (error) {
     clearTimeout(timeout);
+    logProxyFailure('ATS fetch', url, error);
     throw error;
   }
 }
@@ -256,7 +259,7 @@ function deepScanHtml(html, pageUrl) {
 async function claudeFallback(html, pageUrl) {
   try {
     const Anthropic = require('@anthropic-ai/sdk');
-    const client = new Anthropic();
+    const client = new Anthropic({ fetch: proxyFetch });
     const $ = cheerio.load(html);
     const scriptSrcs = [], iframeSrcs = [], careerLinks = [];
     $('script[src]').each((_, el) => { const s = $(el).attr('src') || ''; if (s) scriptSrcs.push(s); });

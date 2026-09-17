@@ -19,24 +19,33 @@
  * Optional environment variables (.env):
  *   SCRAPERAPI_COUNTRY_CODE=de        // geo-target requests (default: de)
  *   SCRAPERAPI_PREMIUM=false          // use premium residential proxies
- *   SCRAPERAPI_TIMEOUT_MS=30000       // per-request timeout
+ *   SCRAPERAPI_TIMEOUT_MS=30000       // per-request timeout (required)
  *   SCRAPERAPI_MAX_RETRIES=3          // retry attempts before giving up
  *   SCRAPERAPI_INITIAL_BACKOFF_MS=2000
  * ============================================================================
  */
 
 require('dotenv').config();
+const { proxyFetch } = require('./proxy');
 
 // ---------------------------------------------------------------------------
 // Environment validation — fail fast and loudly if misconfigured
 // ---------------------------------------------------------------------------
 const SCRAPERAPI_API_KEY = process.env.SCRAPERAPI_API_KEY;
+const SCRAPERAPI_TIMEOUT_MS = process.env.SCRAPERAPI_TIMEOUT_MS;
 
 if (!SCRAPERAPI_API_KEY || SCRAPERAPI_API_KEY.trim() === '') {
     throw new Error(
         'Missing required environment variable: SCRAPERAPI_API_KEY. ' +
         'ScraperAPI cannot be used without an API key. ' +
         'Add SCRAPERAPI_API_KEY=your_api_key_here to your .env file before starting the crawler.'
+    );
+}
+
+if (!SCRAPERAPI_TIMEOUT_MS || String(SCRAPERAPI_TIMEOUT_MS).trim() === '') {
+    throw new Error(
+        'Missing required environment variable: SCRAPERAPI_TIMEOUT_MS. ' +
+        'Set SCRAPERAPI_TIMEOUT_MS in your .env file so ScraperAPI uses an explicit timeout.'
     );
 }
 
@@ -49,7 +58,7 @@ const SCRAPERAPI_CONFIG = Object.freeze({
     renderJs: true,
     countryCode: process.env.SCRAPERAPI_COUNTRY_CODE || 'de',
     premium: process.env.SCRAPERAPI_PREMIUM === 'true',
-    requestTimeoutMs: parseInt(process.env.SCRAPERAPI_TIMEOUT_MS || '30000', 10),
+    requestTimeoutMs: parseInt(SCRAPERAPI_TIMEOUT_MS, 10),
     maxRetries: parseInt(process.env.SCRAPERAPI_MAX_RETRIES || '3', 10),
     initialBackoffMs: parseInt(process.env.SCRAPERAPI_INITIAL_BACKOFF_MS || '2000', 10),
     backoffMultiplier: 2
@@ -112,7 +121,7 @@ async function fetchWithScraperAPI(targetUrl, options = {}) {
         const timeoutId = setTimeout(() => controller.abort(), SCRAPERAPI_CONFIG.requestTimeoutMs);
 
         try {
-            const response = await fetch(requestUrl, { signal: controller.signal });
+            const response = await proxyFetch(requestUrl, { timeout: SCRAPERAPI_CONFIG.requestTimeoutMs });
             clearTimeout(timeoutId);
 
             if (!response.ok) {

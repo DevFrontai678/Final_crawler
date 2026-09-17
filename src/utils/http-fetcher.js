@@ -11,6 +11,7 @@
 
 const axios = require('axios');
 const { URL } = require('url');
+const { applyProxyToAxiosConfig, logProxyFailure } = require('./proxy');
 
 /**
  * Normalize URL: add https:// if missing, try both protocols if needed
@@ -80,6 +81,7 @@ async function fetchWithMetadata(url, options = {}) {
             status: responseDetails.statusCode,
           });
         },
+        ...applyProxyToAxiosConfig(),
       });
 
       const elapsed = Date.now() - startTime;
@@ -98,6 +100,7 @@ async function fetchWithMetadata(url, options = {}) {
       return result;
 
     } catch (error) {
+      logProxyFailure('HTTP fetch', targetUrl, error);
       // If this was the last protocol, store the error
       if (protocol === protocols[protocols.length - 1]) {
         const elapsed = Date.now() - startTime;

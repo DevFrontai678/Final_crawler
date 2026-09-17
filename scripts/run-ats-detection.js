@@ -10,6 +10,7 @@
  *   - Detects embedded / hosted ATS URLs in homepage HTML
  *   - Checks sitemap.xml and robots.txt sitemap declarations
  *   - Probes common career paths as a fallback
+ *   - Uses ScraperAPI once as a last-resort discovery fallback
  *   - Uses the final redirected URL as the canonical career URL
  *   - Stores discovery evidence inside detection_signals
  *   - Never stores a company homepage as career_page_url
@@ -35,6 +36,7 @@ const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
 const { detectATS } = require('../src/ats-adapters/ats-detector');
 const { fetchWithMetadata } = require('../src/utils/http-fetcher');
+const { proxyFetch } = require('../src/utils/proxy');
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 
@@ -49,7 +51,7 @@ const CONFIG = {
   dryRun:              args.includes('--dry-run'),
 
   delayMs:             1000,
-  maxRetries:          3,
+  maxRetries:          1,
   retryBaseDelay:      3000,
 
   batchSize:           50,
@@ -58,6 +60,16 @@ const CONFIG = {
 
   requestTimeout:      30000,
   discoveryTimeout:    15000,
+  scraperApiTimeout:    (() => {
+    const value = process.env.SCRAPERAPI_TIMEOUT_MS;
+    if (!value || String(value).trim() === '') {
+      throw new Error(
+        'Missing required environment variable: SCRAPERAPI_TIMEOUT_MS'
+      );
+    }
+    return parseInt(value, 10);
+  })(),
+  companyTimeoutMs:    parseInt(process.env.ATS_COMPANY_TIMEOUT_MS || '45000', 10),
   maxRedirects:        8,
 
   pageSize:            1000,
@@ -96,7 +108,7 @@ function getArg(name) {
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY,
-  { global: { fetch }, realtime: { transport: ws } }
+  { global: { fetch: proxyFetch }, realtime: { transport: ws } }
 );
 
 // ─── CACHE ─────────────────────────────────────────────────────────────────
@@ -1793,7 +1805,7 @@ async function serperSearch(query) {
   const timer = setTimeout(() => controller.abort(), CONFIG.searchTimeout);
 
   try {
-    const response = await fetch('https://google.serper.dev/search', {
+    const response = await proxyFetch('https://google.serper.dev/search', {
       method: 'POST',
       headers: {
         'X-API-KEY': process.env.SERPER_API_KEY,
@@ -1803,7 +1815,7 @@ async function serperSearch(query) {
         q: query,
         num: 10,
       }),
-      signal: controller.signal,
+      timeout: CONFIG.searchTimeout,
     });
 
     if (!response.ok) return [];
@@ -1928,7 +1940,7 @@ async function callClaudeForCareerLink(company, websiteUrl, homepageHtml) {
   const timer = setTimeout(() => controller.abort(), CONFIG.claudeTimeout);
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await proxyFetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'x-api-key': process.env.ANTHROPIC_API_KEY,
@@ -1946,7 +1958,7 @@ async function callClaudeForCareerLink(company, websiteUrl, homepageHtml) {
           },
         ],
       }),
-      signal: controller.signal,
+      timeout: CONFIG.claudeTimeout,
     });
 
     if (!response.ok) {
@@ -2021,6 +2033,123 @@ async function discoverFromClaudeLinks(company, websiteUrl, homepageHtml, worker
     claudeConfidence: candidate.claudeConfidence,
     claudeReason: candidate.claudeReason,
   };
+}
+
+function collectHomepageCandidates(html, homepageFinalUrl) {
+  if (!html) return [];
+
+  const anchorCandidates = extractAnchors(html, homepageFinalUrl)
+    .filter(item =>
+      hasCareerTerm(item.text) ||
+      hasCareerTerm(item.url) ||
+      isKnownAtsUrl(item.url)
+    )
+    .map(item => ({
+      ...item,
+      source: 'homepage_anchor',
+    }));
+
+  const embeddedAtsCandidates = extractKnownAtsUrlsFromHtml(
+    html,
+    homepageFinalUrl
+  );
+
+  const resourceCandidates = extractNonAnchorCareerUrlsFromHtml(
+    html,
+    homepageFinalUrl
+  );
+
+  return dedupeByUrl([
+    ...embeddedAtsCandidates,
+    ...resourceCandidates,
+    ...anchorCandidates,
+  ])
+    .map(item => ({
+      ...item,
+      score: scoreCareerCandidate(item, homepageFinalUrl),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, CONFIG.maxAnchorCandidates);
+}
+
+async function discoverFromScraperApi(company, websiteUrl, workerId) {
+  const apiKey = process.env.SCRAPERAPI_API_KEY;
+  const targetUrl = normalizeUrl(websiteUrl);
+
+  if (!apiKey || !targetUrl) return null;
+
+  const startedAt = Date.now();
+  const companyName = String(company?.Name || '').trim() || 'unknown-company';
+  console.log(`  ScraperAPI fallback... company="${companyName}" url="${targetUrl}"`);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CONFIG.scraperApiTimeout);
+
+  try {
+    const scraperUrl =
+      `https://api.scraperapi.com/?api_key=${encodeURIComponent(apiKey)}` +
+      `&url=${encodeURIComponent(targetUrl)}` +
+      '&render=true&premium=true';
+
+    const response = await proxyFetch(scraperUrl, {
+      method: 'GET',
+      timeout: CONFIG.scraperApiTimeout,
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      console.log(
+        `  ScraperAPI HTTP ${response.status} after ${Date.now() - startedAt}ms: ${body.slice(0, 300)}`
+      );
+      return null;
+    }
+
+    const html = await response.text();
+    if (!html) {
+      console.log(
+        `  ScraperAPI returned empty body after ${Date.now() - startedAt}ms`
+      );
+      return null;
+    }
+
+    const candidates = collectHomepageCandidates(html, targetUrl);
+    console.log(
+      `  ScraperAPI returned ${html.length} chars and ${candidates.length} candidates after ${Date.now() - startedAt}ms`
+    );
+
+    for (const candidate of candidates) {
+      const validated = await validateCareerCandidate(
+        candidate,
+        targetUrl,
+        workerId
+      );
+
+      if (validated) {
+        return {
+          ...validated,
+          fallback: false,
+          discoveryMethod: 'scraperapi',
+          homepageUrl: targetUrl,
+        };
+      }
+    }
+  } catch (err) {
+    const elapsed = Date.now() - startedAt;
+    const abortReason =
+      err?.name === 'AbortError' || /aborted/i.test(String(err?.message || ''))
+        ? `timeout after ${CONFIG.scraperApiTimeout}ms`
+        : null;
+
+    console.log(
+      `  ScraperAPI fallback failed after ${elapsed}ms: ${err?.name || 'Error'}: ${err?.message || String(err)}${
+        abortReason ? ` (${abortReason})` : ''
+      }`
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  return null;
 }
 
 // ─── MAIN CAREER PAGE DISCOVERY ────────────────────────────────────────────
@@ -2126,41 +2255,10 @@ async function discoverCareerPage(company, workerId) {
     websiteUrl;
 
   if (homepageResult?.html) {
-    const anchorCandidates = extractAnchors(
-      homepageResult.html,
-      homepageFinalUrl
-    )
-      .filter(item =>
-        hasCareerTerm(item.text) ||
-        hasCareerTerm(item.url) ||
-        isKnownAtsUrl(item.url)
-      )
-      .map(item => ({
-        ...item,
-        source: 'homepage_anchor',
-      }));
-
-    const embeddedAtsCandidates = extractKnownAtsUrlsFromHtml(
+    const candidates = collectHomepageCandidates(
       homepageResult.html,
       homepageFinalUrl
     );
-
-    const resourceCandidates = extractNonAnchorCareerUrlsFromHtml(
-      homepageResult.html,
-      homepageFinalUrl
-    );
-
-    const candidates = dedupeByUrl([
-      ...embeddedAtsCandidates,
-      ...resourceCandidates,
-      ...anchorCandidates,
-    ])
-      .map(item => ({
-        ...item,
-        score: scoreCareerCandidate(item, homepageFinalUrl),
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, CONFIG.maxAnchorCandidates);
 
     for (const candidate of candidates) {
       const validated = await validateCareerCandidate(
@@ -2261,7 +2359,29 @@ async function discoverCareerPage(company, workerId) {
     return result;
   }
 
-  // 7. Nothing genuine was verified.
+  // 7. ScraperAPI last-resort discovery fallback.
+  //
+  // This is intentionally a single attempt only. If it does not surface a
+  // genuine career page, we stop here instead of retrying.
+  const scraperApiResult = await discoverFromScraperApi(
+    company,
+    homepageFinalUrl,
+    workerId
+  );
+
+  if (scraperApiResult) {
+    const result = {
+      ...scraperApiResult,
+      fallback: false,
+      discoveryMethod: 'scraperapi',
+      homepageUrl: homepageFinalUrl,
+    };
+
+    cacheSet(cache.careerUrl, websiteUrl, result);
+    return result;
+  }
+
+  // 8. Nothing genuine was verified.
   //
   // Never store the homepage as a career page. A null career URL is safer
   // than an incorrect URL because invalid career URLs were the client's
@@ -2783,6 +2903,25 @@ async function runWorkerPool(companies, concurrency) {
     await batchUpsertCompanies(batch);
   }
 
+  function withTimeout(promise, timeoutMs, label) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      promise.then(
+        value => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        err => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      );
+    });
+  }
+
   async function worker(id) {
     while (queue.length > 0) {
       const company = queue.shift();
@@ -2794,7 +2933,39 @@ async function runWorkerPool(companies, concurrency) {
         continue;
       }
 
-      const outcome = await processCompany(company, id);
+      let outcome;
+      try {
+        outcome = await withTimeout(
+          processCompany(company, id),
+          CONFIG.companyTimeoutMs,
+          `Company ${company.Name || company.Id}`
+        );
+      } catch (err) {
+        console.log(
+          `  [W${id}] ⏱ ${company.Name || company.Id} timed out after ${CONFIG.companyTimeoutMs}ms; moving on`
+        );
+        outcome = {
+          status: 'error',
+          result: {
+            career_page_url: normalizeUrl(company.career_page_url) || normalizeUrl(company.detected_career_url) || normalizeUrl(company.Website),
+            detected_career_url: normalizeUrl(company.career_page_url) || normalizeUrl(company.detected_career_url) || normalizeUrl(company.Website),
+            ats_type: 'error',
+            ats_confidence: 0,
+            ats_api_url: null,
+            crawl_status: 'timeout',
+            career_page_status: 'timeout',
+            last_crawled_at: new Date().toISOString(),
+            retry_count: 0,
+            last_error: err.message,
+            last_error_type: 'CompanyTimeout',
+          },
+          metadata: {
+            retryCount: 0,
+            error: err.message,
+            elapsed: CONFIG.companyTimeoutMs,
+          },
+        };
+      }
 
       if (outcome.status === 'success') {
         results.success++;
