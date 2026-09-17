@@ -4,6 +4,7 @@ const ws = require('ws');
 const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
+
 const crypto = require('crypto');
 const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
 const { enrichJobForStorage } = require('../src/utils/job-enrichment');
@@ -14,7 +15,7 @@ const supabase = createClient(
     { realtime: { transport: ws } }
 );
 
-// ─── HELPER: generate external_hash ──────────────────────────────────────
+// ─── HELPER: gsenerate external_hash ──────────────────────────────────────
 function generateExternalHash(companyId, externalJobId) {
     if (!companyId || !externalJobId) return null;
     return crypto.createHash('sha256')
