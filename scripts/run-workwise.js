@@ -8,6 +8,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
 const { enrichJobForStorage } = require('../src/utils/job-enrichment');
+const { runCompaniesInBatches } = require('../src/utils/company-batch-runner');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -470,61 +471,64 @@ async function run() {
         return;
     }
 
-    console.log(`📋 Processing ${companies.length} Workwise companies...\n`);
+    console.log(`📋 Processing ${companies.length} Workwise companies in batches of 10...\n`);
 
-    let totalJobs = 0;
-    for (const company of companies) {
-        try {
-            const result = await processWorkwiseCompany(company);
-            if (result.jobs.length === 0) {
-                console.log(`   ⚠️ No jobs found for ${company.Name}`);
+    const { jobs: totalJobs } = await runCompaniesInBatches(companies, {
+        batchSize: parseInt(process.env.CRAWLER_COMPANY_BATCH_SIZE || '10', 10),
+        label: 'WORKWISE',
+        handler: async (company, meta) => {
+            try {
+                const result = await processWorkwiseCompany(company);
+                if (result.jobs.length === 0) {
+                    console.log(`   ⚠️ [${meta.companyIndex}/${meta.companyTotal}] ${company.Name} | no jobs found`);
+                    await supabase.from('companies')
+                        .update({ crawl_status: 'failed' })
+                        .eq('Id', company.Id);
+                    return { status: 'no_jobs', jobs: [] };
+                }
+
+                for (const job of result.jobs) {
+                    const storageJob = await enrichJobForStorage({
+                        company_id: company.Id,
+                        company_name: job.company_name || company.Name || null,
+                        external_job_id: job.external_job_id,
+                        external_hash: job.external_hash,
+                        title: job.title,
+                        location: job.location,
+                        employment_type: job.employment_type,
+                        remote_type: job.remote_type,
+                        raw_description: job.raw_description,
+                        apply_url: job.apply_url,
+                        ats_source: 'workwise',
+                        is_active: true
+                    });
+
+                    const { error: insertError } = await supabase
+                        .from('jobs')
+                        .upsert({
+                            ...storageJob,
+                            first_seen_at: new Date(),
+                            last_seen_at: new Date()
+                        }, { onConflict: 'company_id,external_job_id' });
+
+                    if (insertError) {
+                        console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
+                    }
+                }
+                console.log(`   💾 [${meta.companyIndex}/${meta.companyTotal}] ${company.Name} | saved=${result.jobs.length}`);
+                await supabase.from('companies')
+                    .update({ crawl_status: 'completed' })
+                    .eq('Id', company.Id);
+                return { status: 'completed', jobs: result.jobs };
+            } catch (err) {
+                console.error(`   ⚠️ [${meta.companyIndex}/${meta.companyTotal}] ${company.Name} failed: ${err.message}`);
                 await supabase.from('companies')
                     .update({ crawl_status: 'failed' })
                     .eq('Id', company.Id);
-                continue;
+                return { status: 'failed', jobs: [] };
             }
-
-            for (const job of result.jobs) {
-                const storageJob = await enrichJobForStorage({
-                    company_id: company.Id,
-                    company_name: job.company_name || company.Name || null,
-                    external_job_id: job.external_job_id,
-                    external_hash: job.external_hash,
-                    title: job.title,
-                    location: job.location,
-                    employment_type: job.employment_type,
-                    remote_type: job.remote_type,
-                    raw_description: job.raw_description,
-                    apply_url: job.apply_url,
-                    ats_source: 'workwise',
-                    is_active: true
-                });
-
-                const { error: insertError } = await supabase
-                    .from('jobs')
-                    .upsert({
-                        ...storageJob,
-                        first_seen_at: new Date(),
-                        last_seen_at: new Date()
-                    }, { onConflict: 'company_id,external_job_id' });
-
-                if (insertError) {
-                    console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
-                }
-            }
-            totalJobs += result.jobs.length;
-            console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
-            await supabase.from('companies')
-                .update({ crawl_status: 'completed' })
-                .eq('Id', company.Id);
-        } catch (err) {
-            console.error(`   ⚠️ Skipping ${company.Name}: ${err.message}`);
-            await supabase.from('companies')
-                .update({ crawl_status: 'failed' })
-                .eq('Id', company.Id);
         }
-        await new Promise(r => setTimeout(r, 300));
-    }
+    });
 
     if (browserInstance && browserInstance.isConnected()) {
         await browserInstance.close();

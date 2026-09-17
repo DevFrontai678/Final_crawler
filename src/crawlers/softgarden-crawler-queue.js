@@ -295,7 +295,7 @@ const worker = new Worker(QUEUE_NAME, async job => {
     }
 }, {
     connection: redisConnection,
-    concurrency: 3
+    concurrency: parseInt(process.env.CRAWLER_COMPANY_BATCH_SIZE || '10', 10)
 });
 
 worker.on('completed', job => {
@@ -316,7 +316,7 @@ worker.on('failed', (job, err) => {
         process.exit(0);
     }
     const count = await softgardenQueue.count();
-    console.log(`\n🚀 Queue ready with ${count} companies. Workers running (concurrency: 3)...\n`);
+    console.log(`\n🚀 Queue ready with ${count} companies. Workers running (concurrency: ${parseInt(process.env.CRAWLER_COMPANY_BATCH_SIZE || '10', 10)})...\n`);
 })();
 
 process.on('SIGINT', async () => {

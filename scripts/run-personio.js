@@ -3,6 +3,7 @@ const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
 const { processPersonioCompany, closePersonioBrowser } = require('../src/ats-adapters/personio-adapter');
 const { enrichJobForStorage } = require('../src/utils/job-enrichment');
+const { runCompaniesInBatches } = require('../src/utils/company-batch-runner');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -28,90 +29,91 @@ async function run() {
         return;
     }
 
-    console.log(`📋 Processing ${companies.length} Personio companies...\n`);
+    console.log(`📋 Processing ${companies.length} Personio companies in batches of 10...\n`);
 
-    let totalJobs = 0;
-    for (const company of companies) {
-        const result = await processPersonioCompany(company);
+    const { jobs: totalJobs } = await runCompaniesInBatches(companies, {
+        batchSize: parseInt(process.env.CRAWLER_COMPANY_BATCH_SIZE || '10', 10),
+        label: 'PERSONIO',
+        handler: async (company, meta) => {
+            const result = await processPersonioCompany(company);
 
-        if (result.error) {
-            console.log(`   ❌ ${result.error}`);
-            await supabase.from('crawl_logs').insert({
-                company_id: company.Id,
-                status: 'failed',
-                error_message: result.error,
-                created_at: new Date()
-            });
-            await supabase.from('companies')
-                .update({ crawl_status: 'failed' })
-                .eq('Id', company.Id);
-            continue;
-        }
-
-        if (result.jobs.length === 0) {
-            console.log(`   ⚠️ No jobs found`);
-            await supabase.from('crawl_logs').insert({
-                company_id: company.Id,
-                status: 'failed',
-                error_message: 'No jobs found',
-                created_at: new Date()
-            });
-            await supabase.from('companies')
-                .update({ crawl_status: 'failed' })
-                .eq('Id', company.Id);
-            continue;
-        }
-
-        let missingDescCount = 0;
-        let missingLocationCount = 0;
-
-        for (const job of result.jobs) {
-            if (!job.raw_description) missingDescCount++;
-            if (!job.location) missingLocationCount++;
-
-            const storageJob = await enrichJobForStorage({
-                company_id: company.Id,
-                company_name: job.company_name || company.Name || null,
-                external_job_id: job.external_job_id,
-                title: job.title || null,
-                location: job.location || null,
-                employment_type: job.employment_type || null,
-                raw_description: job.raw_description || null,
-                apply_url: job.apply_url,
-                ats_source: job.ats_source || 'personio',
-                is_active: true
-            });
-
-            const { error: insertError } = await supabase
-                .from('jobs')
-                .upsert({
-                    ...storageJob,
-                    first_seen_at: new Date(),
-                    last_seen_at: new Date()
-                }, { onConflict: 'company_id,external_job_id' });
-
-            if (insertError) {
-                console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
+            if (result.error) {
+                console.log(`   ❌ [${meta.companyIndex}/${meta.companyTotal}] ${company.Name} | ${result.error}`);
+                await supabase.from('crawl_logs').insert({
+                    company_id: company.Id,
+                    status: 'failed',
+                    error_message: result.error,
+                    created_at: new Date()
+                });
+                await supabase.from('companies')
+                    .update({ crawl_status: 'failed' })
+                    .eq('Id', company.Id);
+                return { status: 'failed', jobs: [] };
             }
+
+            if (result.jobs.length === 0) {
+                console.log(`   ⚠️ [${meta.companyIndex}/${meta.companyTotal}] ${company.Name} | no jobs found`);
+                await supabase.from('crawl_logs').insert({
+                    company_id: company.Id,
+                    status: 'failed',
+                    error_message: 'No jobs found',
+                    created_at: new Date()
+                });
+                await supabase.from('companies')
+                    .update({ crawl_status: 'failed' })
+                    .eq('Id', company.Id);
+                return { status: 'no_jobs', jobs: [] };
+            }
+
+            let missingDescCount = 0;
+            let missingLocationCount = 0;
+
+            for (const job of result.jobs) {
+                if (!job.raw_description) missingDescCount++;
+                if (!job.location) missingLocationCount++;
+
+                const storageJob = await enrichJobForStorage({
+                    company_id: company.Id,
+                    company_name: job.company_name || company.Name || null,
+                    external_job_id: job.external_job_id,
+                    title: job.title || null,
+                    location: job.location || null,
+                    employment_type: job.employment_type || null,
+                    raw_description: job.raw_description || null,
+                    apply_url: job.apply_url,
+                    ats_source: job.ats_source || 'personio',
+                    is_active: true
+                });
+
+                const { error: insertError } = await supabase
+                    .from('jobs')
+                    .upsert({
+                        ...storageJob,
+                        first_seen_at: new Date(),
+                        last_seen_at: new Date()
+                    }, { onConflict: 'company_id,external_job_id' });
+
+                if (insertError) {
+                    console.error(`   ❌ Save error for job ${job.title}: ${insertError.message}`);
+                }
+            }
+
+            console.log(`   💾 [${meta.companyIndex}/${meta.companyTotal}] ${company.Name} | saved=${result.jobs.length} | missing_desc=${missingDescCount} | missing_location=${missingLocationCount}`);
+
+            await supabase.from('crawl_logs').insert({
+                company_id: company.Id,
+                status: 'success',
+                jobs_found: result.jobs.length,
+                created_at: new Date()
+            });
+
+            await supabase.from('companies')
+                .update({ crawl_status: 'ats_detected' })
+                .eq('Id', company.Id);
+
+            return { status: 'success', jobs: result.jobs };
         }
-
-        totalJobs += result.jobs.length;
-        console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name} (missing desc: ${missingDescCount}, missing location: ${missingLocationCount})`);
-
-        // Save to crawl_logs
-        await supabase.from('crawl_logs').insert({
-            company_id: company.Id,
-            status: 'success',
-            jobs_found: result.jobs.length,
-            created_at: new Date()
-        });
-
-        await supabase.from('companies')
-            .update({ crawl_status: 'ats_detected' })
-            .eq('Id', company.Id);
-
-        await new Promise(r => setTimeout(r, 500));
-    }
+    });
 
     console.log(`\n✅ Done! Total Personio jobs saved: ${totalJobs}`);
 }

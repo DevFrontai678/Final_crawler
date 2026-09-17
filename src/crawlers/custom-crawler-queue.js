@@ -157,7 +157,7 @@ const DIVISIONS = {
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────
 const CONFIG = {
-    CONCURRENCY: parseInt(process.env.CRAWLER_CONCURRENCY || '2', 10),
+    CONCURRENCY: parseInt(process.env.CRAWLER_CONCURRENCY || '10', 10),
     PAGE_SIZE: 1000,
     MAX_JOB_LINKS_PER_COMPANY: parseInt(process.env.MAX_JOB_LINKS_PER_COMPANY || '5000', 10),
     MAX_DISCOVERY_PAGES_PER_COMPANY: parseInt(process.env.MAX_DISCOVERY_PAGES_PER_COMPANY || '1000', 10),
