@@ -1994,15 +1994,9 @@ async function processCompany(job) {
 
     let effectiveUrl = careerUrl;
     if (!effectiveUrl || effectiveUrl.trim() === '') {
-        logInfo('CAREER', `Discovering missing career URL for companyId=${companyId}`);
-        effectiveUrl = await discoverCareerPage(
-            'https://' + companyName.replace(/[^a-z0-9]/gi, '').toLowerCase() + '.com'
-        );
-        if (!effectiveUrl) {
-            logWarn('CAREER', `Discovery failed for companyId=${companyId}`);
-            await markCompanyStatus(companyId, 'failed');
-            return { status: 'failed_fetch', companyId };
-        }
+        logWarn('CAREER', `Missing career URL for companyId=${companyId}; skipping instead of guessing from company name`);
+        await markCompanyStatus(companyId, 'not_found');
+        return { status: 'not_found', companyId };
     }
 
     logInfo('CAREER', `Using careerUrl=${effectiveUrl}`);
@@ -2093,21 +2087,15 @@ async function processCompany(job) {
 
     if (!effectiveUrl) {
         setLogContext({ step: 'DISCOVERY', pageUrl: careerUrl || null });
-        logInfo('CAREER', 'Discovering...');
-        effectiveUrl = await discoverCareerPage(
-            'https://' + companyName.replace(/[^a-z0-9]/gi, '').toLowerCase() + '.com',
-            companyName
-        );
-        if (!effectiveUrl) {
-            const reason = isNotFoundReason(metrics.notFoundReason) ? metrics.notFoundReason : 'no_valid_career_url';
-            await markCompanyStatus(companyId, 'not_found');
-            await logCrawlEvent(companyId, 'not_found', {
-                reason,
-                error_message: 'No valid career URL found after redirect/content validation; existing jobs were preserved.',
-                ...metrics
-            });
-            return { status: 'not_found', companyId, metrics };
-        }
+        logWarn('CAREER', `Missing career URL for companyId=${companyId}; skipping instead of guessing from company name`);
+        const reason = isNotFoundReason(metrics.notFoundReason) ? metrics.notFoundReason : 'no_valid_career_url';
+        await markCompanyStatus(companyId, 'not_found');
+        await logCrawlEvent(companyId, 'not_found', {
+            reason,
+            error_message: 'No valid career URL was available; existing jobs were preserved.',
+            ...metrics
+        });
+        return { status: 'not_found', companyId, metrics };
     }
 
     const discovery = await extractAllJobLinks(effectiveUrl, companyName);
