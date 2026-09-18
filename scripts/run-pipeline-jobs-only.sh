@@ -217,28 +217,29 @@ start_new_cycle
 # ─── STEP 2: RESET ALL COMPANIES TO PENDING ──────────────────────────────
 reset_companies_to_pending
 
-# ─── STEP 3: SKIP ATS Detection ──────────────────────────────────────────
-log "⏩ Skipping ATS Detection (runs every 2 weeks only)"
+# ─── STEP 3: ATS Detection ──────────────────────────────────────────────
+run_script "scripts/run-ats-detection.js --all --concurrency 10"
 
-# ─── STEP 4: Adapters (SEQUENTIAL) ────────────────────────────────────────
+# ─── STEP 4: Custom Crawler ──────────────────────────────────────────────
+run_script "src/crawlers/custom-crawler-queue.js"
+
+# ─── STEP 5: Adapters (SEQUENTIAL) ────────────────────────────────────────
 run_all_adapter_scripts
 
-# ─── STEP 5: Softgarden Crawler ──────────────────────────────────────────
+# ─── STEP 6: Softgarden Crawler ──────────────────────────────────────────
 run_script "src/crawlers/softgarden-crawler-queue.js"
 
-# ─── STEP 6: Custom Crawler ──────────────────────────────────────────────
-run_script "src/crawlers/custom-crawler-queue.js"
-# ─── STEP 8: Backfill + Geocode ──────────────────────────────────────────
+# ─── STEP 7: Backfill + Geocode ──────────────────────────────────────────
 run_script "scripts/backfill-locations-google.js"
 run_script "scripts/geocode-jobs.js"
 
-# ─── STEP 9: Job Structuring (WORKER ONLY) ──────────────────────────────
+# ─── STEP 8: Job Structuring (WORKER ONLY) ──────────────────────────────
 run_script "scripts/run-job-structuring-worker.js"
 
-# ─── STEP 10: Job Embeddings ──────────────────────────────────────────────
+# ─── STEP 9: Job Embeddings ──────────────────────────────────────────────
 run_script "scripts/run-embeddings-queue.js --resume"
 
-# ─── STEP 12: Stale Cleanup ──────────────────────────────────────────────
+# ─── STEP 10: Stale Cleanup ──────────────────────────────────────────────
 cleanup_stale_records
 
 log "═══════════════════════════════════════════"

@@ -10,6 +10,7 @@ const COMPANY_BATCH_SIZE = process.env.CRAWLER_COMPANY_BATCH_SIZE || '10';
 
 const STEPS = [
     { name: 'ATS Detection', cmd: 'node', args: ['scripts/run-ats-detection.js', '--all', '--concurrency', '10'] },
+    { name: 'Custom Crawler', cmd: 'node', args: ['src/crawlers/custom-crawler-queue.js'] },
     { name: 'Personio Crawler', cmd: 'node', args: ['scripts/run-personio.js'] },
     { name: 'Softgarden Crawler', cmd: 'node', args: ['scripts/run-softgarden.js'] },
     { name: 'Workday Crawler', cmd: 'node', args: ['scripts/run-workday.js'] },
