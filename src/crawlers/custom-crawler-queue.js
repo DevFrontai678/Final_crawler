@@ -2044,7 +2044,7 @@ async function processCompany(job) {
 
 // ─── QUEUE ────────────────────────────────────────────────────────────────
 async function processCompany(job) {
-    const { companyId, companyName, careerUrl } = job.data;
+    const { companyId, companyName, careerUrl, companyIndex, companyTotal } = job.data;
     const metrics = {
         jobLinksFound: 0,
         listingPagesScanned: 0,
@@ -2068,10 +2068,11 @@ async function processCompany(job) {
         jobsFound: 0,
         step: 'START',
     });
-    logInfo('CRAWL', `Start company="${companyName}" companyId=${companyId} careerUrl=${careerUrl || 'n/a'}`);
+    logInfo('CRAWL', `Start ${companyLabel(companyName, companyIndex, companyTotal)} | companyId=${companyId} | careerUrl=${careerUrl || 'n/a'}`);
     await markCompanyStatus(companyId, 'in_progress', { touchTimestamp: false });
 
     metrics.activeJobsBefore = await getActiveJobCount(companyId);
+    const startedAt = Date.now();
 
     let effectiveUrl = careerUrl;
     if (effectiveUrl) {
@@ -2095,7 +2096,7 @@ async function processCompany(job) {
             error_message: 'No valid career URL was available; existing jobs were preserved.',
             ...metrics
         });
-        return { status: 'not_found', companyId, metrics };
+        return { status: 'not_found', companyId, companyName, companyIndex, companyTotal, jobsSaved: 0, elapsedMs: Date.now() - startedAt, metrics };
     }
 
     const discovery = await extractAllJobLinks(effectiveUrl, companyName);
@@ -2119,7 +2120,7 @@ async function processCompany(job) {
             careerUrl: effectiveUrl,
             ...metrics
         });
-        return { status, companyId, jobsSaved: 0, metrics };
+        return { status, companyId, companyName, companyIndex, companyTotal, jobsSaved: 0, elapsedMs: Date.now() - startedAt, metrics };
     }
 
     const rows = [];
@@ -2196,7 +2197,7 @@ async function processCompany(job) {
             discovery: discovery.stats,
             ...metrics
         });
-        return { status: 'not_found', companyId, jobsSaved: 0, metrics };
+        return { status: 'not_found', companyId, companyName, companyIndex, companyTotal, jobsSaved: 0, elapsedMs: Date.now() - startedAt, metrics };
     }
 
     if (partial) {
@@ -2210,7 +2211,7 @@ async function processCompany(job) {
             discovery: discovery.stats,
             ...metrics
         });
-        return { status: 'partial', companyId, jobsSaved: metrics.jobsSaved, metrics };
+        return { status: 'partial', companyId, companyName, companyIndex, companyTotal, jobsSaved: metrics.jobsSaved, elapsedMs: Date.now() - startedAt, metrics };
     }
 
     await markCompanyStatus(companyId, metrics.jobsSaved > 0 ? 'completed' : 'no_jobs');
@@ -2222,7 +2223,16 @@ async function processCompany(job) {
         ...metrics
     });
     setLogContext({ step: 'DONE', jobsSaved: metrics.jobsSaved, pageUrl: effectiveUrl });
-    return { status: metrics.jobsSaved > 0 ? 'success' : 'no_jobs', companyId, jobsSaved: metrics.jobsSaved, metrics };
+    return {
+        status: metrics.jobsSaved > 0 ? 'success' : 'no_jobs',
+        companyId,
+        companyName,
+        companyIndex,
+        companyTotal,
+        jobsSaved: metrics.jobsSaved,
+        elapsedMs: Date.now() - startedAt,
+        metrics
+    };
 }
 
 async function resetStuck() {
@@ -2237,8 +2247,25 @@ async function resetStuck() {
 async function enqueueCompanies() {
     const cutoff = new Date(Date.now() - CONFIG.RECRAWL_INTERVAL_HOURS * 3600 * 1000).toISOString();
     let page = 0, total = 0, hasMore = true;
+    let totalEligible = null;
 
     console.log('[QUEUE] Fetching companies...');
+    const { count: countResult, error: countError } = await supabase.from('companies')
+        .select('"Id"', { count: 'exact', head: true })
+        .eq('ats_type', 'custom')
+        .not('detected_career_url', 'is', null)
+        .neq('crawl_status', 'in_progress')
+        .or(`last_crawled_at.is.null,last_crawled_at.lt.${cutoff}`);
+
+    if (countError) {
+        console.warn(`[QUEUE] Count query failed: ${countError.message}`);
+    } else {
+        totalEligible = countResult ?? null;
+        if (Number.isFinite(totalEligible)) {
+            console.log(`[QUEUE] Eligible companies: ${totalEligible}`);
+        }
+    }
+
     while (hasMore) {
         const start = page * CONFIG.PAGE_SIZE;
         const end = start + CONFIG.PAGE_SIZE - 1;
@@ -2256,10 +2283,13 @@ async function enqueueCompanies() {
 
         console.log(`[QUEUE] Page ${page + 1}: ${data.length} companies`);
         for (const c of data) {
+            const companyIndex = total + 1;
             await customCrawlQueue.add('crawl-company', {
                 companyId: c.Id,
                 companyName: c.Name,
-                careerUrl: c.detected_career_url
+                careerUrl: c.detected_career_url,
+                companyIndex,
+                companyTotal: totalEligible
             }, {
                 jobId: `company-${c.Id}`,
                 attempts: 2,
@@ -2272,7 +2302,7 @@ async function enqueueCompanies() {
         if (data.length < CONFIG.PAGE_SIZE) hasMore = false;
         page++;
     }
-    console.log(`[QUEUE] Queued ${total}`);
+    console.log(`[QUEUE] Queued ${total}${Number.isFinite(totalEligible) ? ` of ${totalEligible}` : ''}`);
     totalQueued = total;
     return total;
 }
@@ -2283,9 +2313,37 @@ let processedCount = 0, totalQueued = 0;
 
 function printProgress() {
     const pct = totalQueued > 0 ? ((processedCount / totalQueued) * 100).toFixed(1) : 0;
-    console.log(`\n[PROGRESS] ${processedCount}/${totalQueued} (${pct}%)`);
-    console.log(`  ✅ With jobs: ${stats.with_jobs} | ❌ No jobs: ${stats.no_jobs} | 🚫 Failed: ${stats.failed}`);
-    console.log(`  💾 Jobs saved: ${stats.jobs_saved}`);
+    console.log(
+        `\n[PROGRESS] done=${processedCount}/${totalQueued} (${pct}%) | ` +
+        `success=${stats.with_jobs} | no_jobs=${stats.no_jobs} | ` +
+        `partial=${stats.partial} | failed=${stats.failed} | ` +
+        `errors=${stats.errors} | jobs_saved=${stats.jobs_saved}`
+    );
+}
+
+function companyLabel(companyName, companyIndex, companyTotal) {
+    if (Number.isFinite(companyIndex) && Number.isFinite(companyTotal) && companyTotal > 0) {
+        return `${companyIndex}/${companyTotal} ${companyName}`;
+    }
+    return companyName;
+}
+
+function logCompanyResult(jobData, result) {
+    const label = companyLabel(jobData.companyName, jobData.companyIndex, jobData.companyTotal);
+    const elapsedMs = result.elapsedMs ?? '-';
+    const jobsSaved = result.jobsSaved ?? 0;
+    const status = result.status || 'unknown';
+    const detailBits = [];
+
+    if (result.metrics?.jobLinksFound != null) detailBits.push(`links=${result.metrics.jobLinksFound}`);
+    if (result.metrics?.listingPagesScanned != null) detailBits.push(`pages=${result.metrics.listingPagesScanned}`);
+    if (result.metrics?.jobPagesFetched != null) detailBits.push(`fetched=${result.metrics.jobPagesFetched}`);
+    if (result.metrics?.jobsStructured != null) detailBits.push(`structured=${result.metrics.jobsStructured}`);
+
+    console.log(
+        `[DONE] ${label} | status=${status} | jobs_saved=${jobsSaved} | elapsed=${elapsedMs}ms` +
+        (detailBits.length > 0 ? ` | ${detailBits.join(' | ')}` : '')
+    );
 }
 
 // ─── WORKER ───────────────────────────────────────────────────────────────
@@ -2310,11 +2368,13 @@ if (worker) worker.on('completed', (job, r) => {
     else if (r.status === 'success') { stats.with_jobs++; stats.jobs_saved += r.jobsSaved || 0; }
     else stats.errors++;
     processedCount++;
+    logCompanyResult(job.data, r);
     if (processedCount % 10 === 0 || processedCount === totalQueued) printProgress();
 });
 
 if (worker) worker.on('failed', async (job, err) => {
-    console.error(`[FAILED] ${job?.data?.companyName}: ${err.message}`);
+    const label = companyLabel(job?.data?.companyName, job?.data?.companyIndex, job?.data?.companyTotal);
+    console.error(`[FAILED] ${label}: ${err.message}`);
     stats.processed++; stats.errors++; processedCount++;
     if (job?.data?.companyId) await markCompanyStatus(job.data.companyId, 'failed');
     if (processedCount % 10 === 0 || processedCount === totalQueued) printProgress();
