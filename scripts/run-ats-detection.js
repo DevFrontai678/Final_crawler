@@ -2422,7 +2422,6 @@ async function processCompany(company, workerId) {
         ats_api_url: null,
         crawl_status: 'no_url',
         career_page_status: 'no_url',
-        last_crawled_at: new Date().toISOString(),
         retry_count: 0,
         last_error: 'No Website, career_page_url, or detected_career_url available',
         last_error_type: 'NoUrl',
@@ -2450,7 +2449,6 @@ async function processCompany(company, workerId) {
         ats_api_url: null,
         crawl_status: 'career_not_found',
         career_page_status: 'not_found',
-        last_crawled_at: new Date().toISOString(),
         retry_count: 0,
         last_error: 'No genuine public career page could be verified',
         last_error_type: 'CareerPageNotFound',
@@ -2681,7 +2679,6 @@ async function processCompany(company, workerId) {
             ? 'custom_detected'
             : 'ats_detected',
 
-        last_crawled_at: new Date().toISOString(),
         crawl_time_ms: elapsed,
         retry_count: retryCount,
 
@@ -2778,7 +2775,6 @@ async function processCompany(company, workerId) {
           ats_api_url: null,
 
           crawl_status: 'custom_detected',
-          last_crawled_at: new Date().toISOString(),
           crawl_time_ms: elapsed,
           retry_count: retryCount + 1,
 
@@ -2830,7 +2826,6 @@ async function processCompany(company, workerId) {
       ats_type: 'custom',
       ats_confidence: 0.70,
       crawl_status: 'custom_detected',
-      last_crawled_at: new Date().toISOString(),
       last_error: lastError ? lastError.message : 'Unknown error',
       last_error_type: lastError
         ? (lastError.code || lastError.name || 'UnknownError')
@@ -2948,7 +2943,6 @@ async function runWorkerPool(companies, concurrency) {
             ats_api_url: null,
             crawl_status: 'timeout',
             career_page_status: 'timeout',
-            last_crawled_at: new Date().toISOString(),
             retry_count: 0,
             last_error: err.message,
             last_error_type: 'CompanyTimeout',
