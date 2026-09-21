@@ -422,6 +422,41 @@ function getDomainRoot(url) {
     }
 }
 
+function getDomainHost(url) {
+    try {
+        const value = String(url || '').trim();
+        if (!value) return '';
+        return new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`)
+            .hostname
+            .replace(/^www\./i, '')
+            .toLowerCase();
+    } catch {
+        return '';
+    }
+}
+
+function areRelatedCompanyDomains(firstUrl, secondUrl) {
+    const firstHost = getDomainHost(firstUrl);
+    const secondHost = getDomainHost(secondUrl);
+    if (!firstHost || !secondHost) return false;
+    return firstHost === secondHost ||
+        firstHost.endsWith(`.${secondHost}`) ||
+        secondHost.endsWith(`.${firstHost}`);
+}
+
+function isAllowedCareerDomain(url, companyWebsiteUrl) {
+    if (!companyWebsiteUrl) return true;
+    return isAtsUrl(url) || areRelatedCompanyDomains(url, companyWebsiteUrl);
+}
+
+function logExternalDomainBlocked({ companyName, companyWebsiteUrl, careerUrl, blockedUrl, reason }) {
+    logWarn(
+        'EXTERNAL_DOMAIN_BLOCKED',
+        `company=${truncateForLog(companyName, 70)} companyDomain=${getDomainHost(companyWebsiteUrl) || '-'} ` +
+        `careerUrl=${truncateForLog(careerUrl, 140)} blockedDomain=${getDomainHost(blockedUrl) || '-'} reason=${reason}`
+    );
+}
+
 function isSameCompanyUrl(candidateUrl, baseUrl) {
     const root = getDomainRoot(baseUrl);
     if (!root) return true;
@@ -466,7 +501,7 @@ function pageHasCareerIntent(url, html) {
 }
 
 function isNotFoundReason(reason) {
-    return /http_(404|410)|http_(403|429).*scraperapi|scraperapi_failed|blocked_after_scraperapi|no_valid_career_url|resolved_page_not_career_related|career_url_resolved_to_unrelated_page|zero_job_links/i.test(String(reason || ''));
+    return /http_(404|410)|http_(403|429).*scraperapi|scraperapi_failed|blocked_after_scraperapi|no_valid_career_url|resolved_page_not_career_related|career_url_resolved_to_unrelated_page|career_url_(redirected_to_)?external_domain|career_url_external_ats|zero_job_links/i.test(String(reason || ''));
 }
 
 function classifyLink(fullUrl, anchorText, contextText, baseUrl) {
@@ -1023,9 +1058,23 @@ async function extractAllJobLinks(baseUrl, companyName) {
 }
 
 // ─── CONTAINER FIND ───────────────────────────────────────────────────────
-async function validateCareerPage(candidateUrl, companyName) {
+async function validateCareerPage(candidateUrl, companyName, companyWebsiteUrl) {
     const url = normalizeUrl(candidateUrl);
     if (!url || isNonJobUrl(url)) return null;
+    if (isAtsUrl(url)) {
+        logInfo('ATS', `External ATS career source delegated to dedicated handling: ${url}`);
+        return { ok: false, url, reason: 'career_url_external_ats', sourceType: 'external_ats' };
+    }
+    if (!isAllowedCareerDomain(url, companyWebsiteUrl)) {
+        logExternalDomainBlocked({
+            companyName,
+            companyWebsiteUrl,
+            careerUrl: url,
+            blockedUrl: url,
+            reason: 'career_url_external_domain'
+        });
+        return { ok: false, url, reason: 'career_url_external_domain' };
+    }
 
     const fetched = await fetchPageWithFallback(url, { waitForSelector: 'body', scroll: true });
     if (!fetched?.html || fetched.html.length < 400) {
@@ -1037,6 +1086,20 @@ async function validateCareerPage(candidateUrl, companyName) {
     }
 
     const finalUrl = normalizeUrl(fetched.url || url) || url;
+    if (isAtsUrl(finalUrl)) {
+        logInfo('ATS', `Career URL redirected to external ATS source; delegated to dedicated handling: ${finalUrl}`);
+        return { ok: false, url: finalUrl, reason: 'career_url_external_ats', sourceType: 'external_ats' };
+    }
+    if (!isAllowedCareerDomain(finalUrl, companyWebsiteUrl)) {
+        logExternalDomainBlocked({
+            companyName,
+            companyWebsiteUrl,
+            careerUrl: url,
+            blockedUrl: finalUrl,
+            reason: 'career_url_redirected_to_external_domain'
+        });
+        return { ok: false, url: finalUrl, reason: 'career_url_redirected_to_external_domain' };
+    }
     if (fetched.status && fetched.status >= 400) {
         return {
             ok: false,
@@ -1266,7 +1329,7 @@ async function discoverJobDetailUrlsByClicking(page, pageUrl, rootUrl) {
     return found;
 }
 
-async function extractLinksFromPage(pageUrl, rootUrl) {
+async function extractLinksFromPage(pageUrl, rootUrl, companyName = '') {
     const result = { jobs: new Set(), listings: new Set(), ats: new Set(), finalUrl: pageUrl, failed: false, error: null };
     let page = null;
     try {
@@ -1281,6 +1344,18 @@ async function extractLinksFromPage(pageUrl, rootUrl) {
 
         const html = await page.content();
         result.finalUrl = normalizeUrl(page.url()) || pageUrl;
+        if (!areRelatedCompanyDomains(result.finalUrl, rootUrl) && !isAtsUrl(result.finalUrl)) {
+            logExternalDomainBlocked({
+                companyName,
+                companyWebsiteUrl: rootUrl,
+                careerUrl: pageUrl,
+                blockedUrl: result.finalUrl,
+                reason: 'discovery_page_redirected_to_external_domain'
+            });
+            result.failed = true;
+            result.error = 'discovery_page_redirected_to_external_domain';
+            return result;
+        }
         const status = response ? response.status() : null;
         if (status && status >= 400) {
             if (BLOCKED_OR_RETRYABLE_STATUSES.has(status)) {
@@ -1342,26 +1417,55 @@ async function extractAllJobLinks(baseUrl, companyName) {
     const jobLinks = new Set();
     const atsLinks = new Set();
     const failedPages = [];
+    const blockedExternalDomains = new Set();
     let listingPagesScanned = 0;
+
+    function blockExternalUrl(url, reason) {
+        const domain = getDomainHost(url) || url;
+        if (blockedExternalDomains.has(domain)) return;
+        blockedExternalDomains.add(domain);
+        logExternalDomainBlocked({
+            companyName,
+            companyWebsiteUrl: rootUrl,
+            careerUrl: baseUrl,
+            blockedUrl: url,
+            reason
+        });
+    }
 
     while (queue.length > 0 && visited.size < CONFIG.MAX_DISCOVERY_PAGES_PER_COMPANY) {
         const current = normalizeUrl(queue.shift(), rootUrl);
-        if (!current || visited.has(current) || isNonJobUrl(current) || !isSameCompanyUrl(current, rootUrl)) continue;
+        if (!current || visited.has(current) || isNonJobUrl(current)) continue;
+        if (!areRelatedCompanyDomains(current, rootUrl)) {
+            blockExternalUrl(current, 'discovery_queue_external_domain');
+            continue;
+        }
         visited.add(current);
         setLogContext({ pageUrl: current, step: 'DISCOVERY' });
 
-        const extracted = await extractLinksFromPage(current, rootUrl);
+        const extracted = await extractLinksFromPage(current, rootUrl, companyName);
         listingPagesScanned++;
         if (extracted.failed) failedPages.push({ url: current, reason: extracted.error || 'unknown' });
 
         extracted.jobs.forEach(u => {
             const normalized = normalizeUrl(u, current);
-            if (normalized && !isCategoryUrl(normalized) && !isNonJobUrl(normalized)) jobLinks.add(normalized);
+            if (!normalized || isCategoryUrl(normalized) || isNonJobUrl(normalized)) return;
+            if (!areRelatedCompanyDomains(normalized, rootUrl)) {
+                if (isAtsUrl(normalized)) atsLinks.add(normalized);
+                else blockExternalUrl(normalized, 'discovered_job_link_external_domain');
+                return;
+            }
+            jobLinks.add(normalized);
         });
         extracted.ats.forEach(u => atsLinks.add(u));
         extracted.listings.forEach(u => {
             const normalized = normalizeUrl(u, current);
-            if (normalized && !visited.has(normalized) && !jobLinks.has(normalized)) queue.push(normalized);
+            if (!normalized || visited.has(normalized) || jobLinks.has(normalized)) return;
+            if (!areRelatedCompanyDomains(normalized, rootUrl)) {
+                if (!isAtsUrl(normalized)) blockExternalUrl(normalized, 'discovered_listing_link_external_domain');
+                return;
+            }
+            queue.push(normalized);
         });
 
         logInfo('DISCOVERY', `pages=${visited.size} queue=${queue.length} job_links=${jobLinks.size} ats=${atsLinks.size}`);
@@ -2180,7 +2284,7 @@ async function processCompany(job) {
 
 // ─── QUEUE ────────────────────────────────────────────────────────────────
 async function processCompany(job) {
-    const { companyId, companyName, careerUrl, companyIndex, companyTotal } = job.data;
+    const { companyId, companyName, careerUrl, companyWebsiteUrl, companyIndex, companyTotal } = job.data;
     const metrics = {
         jobLinksFound: 0,
         listingPagesScanned: 0,
@@ -2212,8 +2316,12 @@ async function processCompany(job) {
 
     let effectiveUrl = careerUrl;
     if (effectiveUrl) {
-        const validated = await validateCareerPage(effectiveUrl, companyName);
-        if (validated?.ok) {
+        const validated = await validateCareerPage(effectiveUrl, companyName, companyWebsiteUrl);
+        if (validated?.sourceType === 'external_ats') {
+            metrics.notFoundReason = validated.reason;
+            logInfo('ATS', `Skipping custom discovery for external ATS source: ${validated.url || effectiveUrl}`);
+            effectiveUrl = null;
+        } else if (validated?.ok) {
             effectiveUrl = validated.url;
         } else {
             metrics.notFoundReason = validated?.reason || 'invalid_saved_career_url';
@@ -2226,10 +2334,16 @@ async function processCompany(job) {
         setLogContext({ step: 'DISCOVERY', pageUrl: careerUrl || null });
         logWarn('CAREER', `Missing career URL for companyId=${companyId}; skipping instead of guessing from company name`);
         const reason = isNotFoundReason(metrics.notFoundReason) ? metrics.notFoundReason : 'no_valid_career_url';
+        const externalDomainBlocked = /career_url_(redirected_to_)?external_domain/.test(reason);
+        const externalAtsSource = reason === 'career_url_external_ats';
         await markCompanyStatus(companyId, 'not_found');
         await logCrawlEvent(companyId, 'not_found', {
             reason,
-            error_message: 'No valid career URL was available; existing jobs were preserved.',
+            error_message: externalAtsSource
+                ? 'Career URL is hosted on an external ATS source and was left for dedicated ATS handling; existing jobs were preserved.'
+                : externalDomainBlocked
+                    ? 'Career URL redirected to or is hosted on an unrelated external domain; existing jobs were preserved.'
+                    : 'No valid career URL was available; existing jobs were preserved.',
             duration_ms: Date.now() - startedAt,
             ...metrics
         });
@@ -2422,7 +2536,7 @@ async function enqueueCompanies() {
         const start = page * CONFIG.PAGE_SIZE;
         const end = start + CONFIG.PAGE_SIZE - 1;
         const { data, error } = await supabase.from('companies')
-            .select('"Id", detected_career_url, "Name"')
+            .select('"Id", detected_career_url, "Name", "Website"')
             .eq('ats_type', 'custom')
             .not('detected_career_url', 'is', null)
             .neq('crawl_status', 'in_progress')
@@ -2440,6 +2554,7 @@ async function enqueueCompanies() {
                 companyId: c.Id,
                 companyName: c.Name,
                 careerUrl: c.detected_career_url,
+                companyWebsiteUrl: c.Website,
                 companyIndex,
                 companyTotal: totalEligible
             }, {
