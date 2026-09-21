@@ -28,6 +28,7 @@ const ws = ENABLE_RUNTIME ? require('ws') : null;
 const cheerio = require('cheerio');
 const crypto = require('crypto');
 const axios = require('axios');
+const { AsyncLocalStorage } = require('async_hooks');
 const { fetchWithScraperAPI } = TEST_MODE ? { fetchWithScraperAPI: null } : require('../utils/scraperapi-config');
 const { CRAWLER_TIMEOUTS } = require('../utils/crawler-timeouts');
 require('dotenv').config();
@@ -510,13 +511,103 @@ const openai = ENABLE_RUNTIME ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY 
 if (ENABLE_RUNTIME) logInfo('OPENAI', `Client initialized (${CONFIG.GPT_MODEL})`);
 
 const customCrawlQueue = ENABLE_RUNTIME ? new Queue(QUEUE_NAME, { connection: redisConnection }) : null;
+const CRAWLER_INSTANCE_LOCK_KEY = `bull:${QUEUE_NAME}:crawler-instance-lock`;
+const CRAWLER_INSTANCE_LOCK_TTL_MS = 60000;
+const CRAWLER_INSTANCE_LOCK_RENEW_MS = 20000;
+let crawlerInstanceLockToken = null;
+let crawlerInstanceLockRenewal = null;
+let crawlerInstanceLockLost = false;
+
+async function acquireCrawlerInstanceLock() {
+    const token = crypto.randomUUID();
+    const acquired = await redisConnection.set(
+        CRAWLER_INSTANCE_LOCK_KEY,
+        token,
+        'PX',
+        CRAWLER_INSTANCE_LOCK_TTL_MS,
+        'NX'
+    );
+    if (acquired !== 'OK') {
+        throw new Error('Another custom crawler instance is already running');
+    }
+
+    crawlerInstanceLockToken = token;
+    crawlerInstanceLockLost = false;
+    crawlerInstanceLockRenewal = setInterval(() => {
+        renewCrawlerInstanceLock().catch(error => {
+            logError('QUEUE', `Crawler instance lock renewal failed: ${error.message}`);
+            if (!crawlerInstanceLockLost) {
+                crawlerInstanceLockLost = true;
+                shutdown(1);
+            }
+        });
+    }, CRAWLER_INSTANCE_LOCK_RENEW_MS);
+}
+
+async function renewCrawlerInstanceLock() {
+    if (!crawlerInstanceLockToken) return;
+    const renewed = await redisConnection.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end",
+        1,
+        CRAWLER_INSTANCE_LOCK_KEY,
+        crawlerInstanceLockToken,
+        String(CRAWLER_INSTANCE_LOCK_TTL_MS)
+    );
+    if (renewed !== 1) {
+        throw new Error('Crawler instance lock was lost');
+    }
+}
+
+async function releaseCrawlerInstanceLock() {
+    if (crawlerInstanceLockRenewal) clearInterval(crawlerInstanceLockRenewal);
+    crawlerInstanceLockRenewal = null;
+    if (!crawlerInstanceLockToken) return;
+
+    const token = crawlerInstanceLockToken;
+    crawlerInstanceLockToken = null;
+    crawlerInstanceLockLost = false;
+    await redisConnection.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+        1,
+        CRAWLER_INSTANCE_LOCK_KEY,
+        token
+    );
+}
 
 // ─── BROWSER ──────────────────────────────────────────────────────────────
 let sharedBrowser = null;
 let browserContext = null;
 let requestsSinceRestart = 0;
+let browserRecyclePending = false;
+let browserRecyclePromise = null;
+const activeCompanyRuns = new Set();
+const companyRunContext = new AsyncLocalStorage();
+
+function trackCompanyPage(page) {
+    const run = companyRunContext.getStore();
+    if (run) run.pages.add(page);
+    return page;
+}
+
+async function closeTrackedPage(page) {
+    const run = companyRunContext.getStore();
+    if (run) run.pages.delete(page);
+    await page?.close().catch(() => {});
+}
+
+async function closeCompanyPages(run) {
+    while (run.pages.size > 0) {
+        const pages = [...run.pages];
+        run.pages.clear();
+        await Promise.all(pages.map(page => page.close().catch(() => {})));
+    }
+}
 
 async function getSharedBrowser() {
+    if (sharedBrowser && !sharedBrowser.isConnected()) {
+        sharedBrowser = null;
+        browserContext = null;
+    }
     if (!sharedBrowser) {
         sharedBrowser = await chromium.launch({ headless: true });
         logInfo('BROWSER', 'Launched');
@@ -525,6 +616,17 @@ async function getSharedBrowser() {
 }
 
 async function getBrowserContext() {
+    if (companyRunContext.getStore()?.timedOut) {
+        const error = new Error('Company processing timed out');
+        error.name = 'TimeoutError';
+        throw error;
+    }
+    if (browserRecyclePromise) await browserRecyclePromise;
+    if (companyRunContext.getStore()?.timedOut) {
+        const error = new Error('Company processing timed out');
+        error.name = 'TimeoutError';
+        throw error;
+    }
     if (!browserContext) {
         const browser = await getSharedBrowser();
         browserContext = await browser.newContext({
@@ -538,17 +640,43 @@ async function getBrowserContext() {
 async function recycleBrowserIfNeeded() {
     requestsSinceRestart++;
     if (requestsSinceRestart >= CONFIG.BROWSER_RESTART_THRESHOLD) {
+        browserRecyclePending = true;
+    }
+    await recycleBrowserWhenIdle();
+}
+
+function recycleBrowserWhenIdle() {
+    if (!browserRecyclePending || activeCompanyRuns.size > 0 || browserRecyclePromise) {
+        return browserRecyclePromise || Promise.resolve();
+    }
+
+    browserRecyclePromise = (async () => {
         const prevB = sharedBrowser, prevC = browserContext;
-        sharedBrowser = await chromium.launch({ headless: true });
-        browserContext = await sharedBrowser.newContext({
-            extraHTTPHeaders: { 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8' },
-            viewport: { width: 1280, height: 800 }
-        });
+        let nextBrowser = null;
+        let nextContext = null;
+        try {
+            nextBrowser = await chromium.launch({ headless: true });
+            nextContext = await nextBrowser.newContext({
+                extraHTTPHeaders: { 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8' },
+                viewport: { width: 1280, height: 800 }
+            });
+        } catch (error) {
+            if (nextContext) await nextContext.close().catch(() => {});
+            if (nextBrowser) await nextBrowser.close().catch(() => {});
+            throw error;
+        }
+        sharedBrowser = nextBrowser;
+        browserContext = nextContext;
         requestsSinceRestart = 0;
+        browserRecyclePending = false;
         if (prevC) await prevC.close().catch(() => {});
         if (prevB) await prevB.close().catch(() => {});
         logInfo('BROWSER', 'Recycled');
-    }
+    })().finally(() => {
+        browserRecyclePromise = null;
+    });
+
+    return browserRecyclePromise;
 }
 
 // ─── COOKIES ──────────────────────────────────────────────────────────────
@@ -594,7 +722,7 @@ async function autoScroll(page, maxSteps = CONFIG.AUTO_SCROLL_MAX_STEPS) {
 async function fetchWithPlaywright(url, options = {}) {
     const { waitForSelector, timeout = CONFIG.PLAYWRIGHT_TIMEOUT_MS, scroll = false } = options;
     const context = await getBrowserContext();
-    const page = await context.newPage();
+    const page = trackCompanyPage(await context.newPage());
     try {
         const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
         await acceptCookies(page);
@@ -605,13 +733,10 @@ async function fetchWithPlaywright(url, options = {}) {
         const html = await page.content();
         const finalUrl = page.url();
         const status = response ? response.status() : null;
-        await page.close().catch(() => {});
-        await recycleBrowserIfNeeded();
         return { html, url: finalUrl, status };
-    } catch (err) {
-        await page.close().catch(() => {});
+    } finally {
+        await closeTrackedPage(page);
         await recycleBrowserIfNeeded();
-        throw err;
     }
 }
 
@@ -1101,15 +1226,19 @@ async function discoverJobDetailUrlsByClicking(page, pageUrl, rootUrl) {
             const popup = await popupPromise;
 
             if (popup) {
-                await popup.waitForLoadState('domcontentloaded', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS }).catch(() => {});
-                await popup.waitForTimeout(800).catch(() => {});
-                const popupUrl = normalizeUrl(popup.url());
-                const popupHtml = await popup.content().catch(() => '');
-                if (popupUrl && isSameCompanyUrl(popupUrl, rootUrl) &&
-                    (isLikelyIndividualJobUrl(popupUrl) || extractRawJobFromHtml(popupHtml, popupUrl, '').valid)) {
-                    found.add(popupUrl);
+                trackCompanyPage(popup);
+                try {
+                    await popup.waitForLoadState('domcontentloaded', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS }).catch(() => {});
+                    await popup.waitForTimeout(800).catch(() => {});
+                    const popupUrl = normalizeUrl(popup.url());
+                    const popupHtml = await popup.content().catch(() => '');
+                    if (popupUrl && isSameCompanyUrl(popupUrl, rootUrl) &&
+                        (isLikelyIndividualJobUrl(popupUrl) || extractRawJobFromHtml(popupHtml, popupUrl, '').valid)) {
+                        found.add(popupUrl);
+                    }
+                } finally {
+                    await closeTrackedPage(popup);
                 }
-                await popup.close().catch(() => {});
                 continue;
             }
 
@@ -1139,9 +1268,10 @@ async function discoverJobDetailUrlsByClicking(page, pageUrl, rootUrl) {
 
 async function extractLinksFromPage(pageUrl, rootUrl) {
     const result = { jobs: new Set(), listings: new Set(), ats: new Set(), finalUrl: pageUrl, failed: false, error: null };
+    let page = null;
     try {
         const context = await getBrowserContext();
-        const page = await context.newPage();
+        page = trackCompanyPage(await context.newPage());
         const response = await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.PLAYWRIGHT_TIMEOUT_MS });
         await acceptCookies(page);
         await page.waitForLoadState('networkidle', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS }).catch(() => {});
@@ -1153,8 +1283,6 @@ async function extractLinksFromPage(pageUrl, rootUrl) {
         result.finalUrl = normalizeUrl(page.url()) || pageUrl;
         const status = response ? response.status() : null;
         if (status && status >= 400) {
-            await page.close().catch(() => {});
-            await recycleBrowserIfNeeded();
             if (BLOCKED_OR_RETRYABLE_STATUSES.has(status)) {
                 const fallback = await fetchPageWithFallback(pageUrl, { waitForSelector: 'body', scroll: true });
                 if (fallback?.usedScraperApi && fallback.html) {
@@ -1181,8 +1309,6 @@ async function extractLinksFromPage(pageUrl, rootUrl) {
             clickedJobs.forEach(u => result.jobs.add(u));
         }
 
-        await page.close().catch(() => {});
-        await recycleBrowserIfNeeded();
     } catch (err) {
         logWarn('DISCOVERY', `Playwright failed on ${pageUrl}: ${err.message}`);
         try {
@@ -1201,6 +1327,9 @@ async function extractLinksFromPage(pageUrl, rootUrl) {
             result.failed = true;
             result.error = fallbackErr.message;
         }
+    } finally {
+        if (page) await closeTrackedPage(page);
+        await recycleBrowserIfNeeded();
     }
     return result;
 }
@@ -1730,9 +1859,14 @@ function generateExternalJobId(url) {
 }
 
 // ─── DB ───────────────────────────────────────────────────────────────────
-async function markCompanyStatus(companyId, status, { touchTimestamp = true } = {}) {
+async function markCompanyStatus(companyId, status, { touchTimestamp = true, error: companyError } = {}) {
+    if (companyRunContext.getStore()?.timedOut && status !== 'failed') return;
     const u = { crawl_status: status };
     if (touchTimestamp) u.last_crawled_at = new Date().toISOString();
+    if (companyError) {
+        u.last_error = companyError.message;
+        u.last_error_type = companyError.name || companyError.code || 'UnknownError';
+    }
     const { error } = await supabase.from('companies').update(u).eq('Id', companyId);
     if (error) console.error(`[DB] ${error.message}`);
 }
@@ -1757,23 +1891,17 @@ async function batchInsertJobs(rows) {
 }
 
 async function logCrawlEvent(companyId, status, payload = {}) {
-    const details = {
-        ...payload,
-        created_at: new Date()
-    };
+    if (companyRunContext.getStore()?.timedOut) return;
     const row = {
         company_id: companyId,
+        crawl_type: 'custom',
         status,
         jobs_found: payload.jobs_found ?? payload.jobsSaved ?? null,
         error_message: payload.error_message || payload.reason || null,
+        duration_ms: payload.duration_ms ?? payload.elapsedMs ?? null,
         created_at: new Date()
     };
-    if (payload.details !== false) row.details = details;
-    let { error } = await supabase.from('crawl_logs').insert(row);
-    if (error && row.details) {
-        delete row.details;
-        ({ error } = await supabase.from('crawl_logs').insert(row));
-    }
+    const { error } = await supabase.from('crawl_logs').insert(row);
     if (error) console.error(`[DB] crawl_logs: ${error.message}`);
 }
 
@@ -1978,9 +2106,17 @@ async function processJobLink(url, companyId, companyName) {
     };
 }
 
-async function withTimeout(promise, ms, label) {
+async function withTimeout(promise, ms, label, onTimeout) {
     let h;
-    const t = new Promise((_, rej) => { h = setTimeout(() => rej(new Error(`Timeout: ${label}`)), ms); });
+    const t = new Promise((_, rej) => {
+        h = setTimeout(() => {
+            const error = new Error(`Timeout: ${label}`);
+            error.name = 'TimeoutError';
+            Promise.resolve(onTimeout?.(error))
+                .catch(cleanupError => logError('TIMEOUT', `Cleanup failed: ${cleanupError.message}`))
+                .finally(() => rej(error));
+        }, ms);
+    });
     try { return await Promise.race([promise, t]); }
     finally { clearTimeout(h); }
 }
@@ -2094,6 +2230,7 @@ async function processCompany(job) {
         await logCrawlEvent(companyId, 'not_found', {
             reason,
             error_message: 'No valid career URL was available; existing jobs were preserved.',
+            duration_ms: Date.now() - startedAt,
             ...metrics
         });
         return { status: 'not_found', companyId, companyName, companyIndex, companyTotal, jobsSaved: 0, elapsedMs: Date.now() - startedAt, metrics };
@@ -2118,6 +2255,7 @@ async function processCompany(job) {
                 ? 'Discovery returned zero job links; existing jobs were preserved.'
                 : 'Discovery returned zero job links.',
             careerUrl: effectiveUrl,
+            duration_ms: Date.now() - startedAt,
             ...metrics
         });
         return { status, companyId, companyName, companyIndex, companyTotal, jobsSaved: 0, elapsedMs: Date.now() - startedAt, metrics };
@@ -2176,6 +2314,11 @@ async function processCompany(job) {
         metrics.failedPages > 0 ||
         fetchedRatio < CONFIG.PARTIAL_CRAWL_MIN_FETCH_RATIO ||
         saveRatio < CONFIG.PARTIAL_CRAWL_MIN_SAVE_RATIO;
+    const partialReasons = [];
+    if (discovery.stats?.stoppedByPageLimit) partialReasons.push('discovery stopped at the existing page limit');
+    if (metrics.failedPages > 0) partialReasons.push(`${metrics.failedPages} job page(s) failed`);
+    if (fetchedRatio < CONFIG.PARTIAL_CRAWL_MIN_FETCH_RATIO) partialReasons.push(`fetch ratio ${fetchedRatio.toFixed(2)}`);
+    if (saveRatio < CONFIG.PARTIAL_CRAWL_MIN_SAVE_RATIO) partialReasons.push(`save ratio ${saveRatio.toFixed(2)}`);
     const allFoundLinksUnavailable = metrics.jobsSaved === 0 &&
         metrics.notFoundPages > 0 &&
         (metrics.notFoundPages + metrics.failedPages + metrics.invalidRejected) >= links.length;
@@ -2192,6 +2335,7 @@ async function processCompany(job) {
             reason: 'all_job_pages_unavailable_after_scraperapi',
             error_message: 'Job links were discovered, but every job page failed or was unavailable after ScraperAPI fallback; existing jobs were preserved.',
             careerUrl: effectiveUrl,
+            duration_ms: Date.now() - startedAt,
             rejectedSamples,
             failedSamples,
             discovery: discovery.stats,
@@ -2201,11 +2345,12 @@ async function processCompany(job) {
     }
 
     if (partial) {
-        await markCompanyStatus(companyId, 'failed');
+        await markCompanyStatus(companyId, 'partial');
         await logCrawlEvent(companyId, 'partial', {
             reason: 'partial_custom_crawl_preserved_existing_jobs',
-            error_message: 'Custom crawl was incomplete or low-yield; existing jobs were preserved and no deletion was performed.',
+            error_message: `Partial crawl: ${partialReasons.join('; ')}. Existing jobs were preserved and no deletion was performed.`,
             careerUrl: effectiveUrl,
+            duration_ms: Date.now() - startedAt,
             rejectedSamples,
             failedSamples,
             discovery: discovery.stats,
@@ -2215,8 +2360,9 @@ async function processCompany(job) {
     }
 
     await markCompanyStatus(companyId, metrics.jobsSaved > 0 ? 'completed' : 'no_jobs');
-    await logCrawlEvent(companyId, metrics.jobsSaved > 0 ? 'success' : 'no_jobs', {
+    await logCrawlEvent(companyId, metrics.jobsSaved > 0 ? 'completed' : 'no_jobs', {
         careerUrl: effectiveUrl,
+        duration_ms: Date.now() - startedAt,
         rejectedSamples,
         failedSamples,
         discovery: discovery.stats,
@@ -2224,7 +2370,7 @@ async function processCompany(job) {
     });
     setLogContext({ step: 'DONE', jobsSaved: metrics.jobsSaved, pageUrl: effectiveUrl });
     return {
-        status: metrics.jobsSaved > 0 ? 'success' : 'no_jobs',
+        status: metrics.jobsSaved > 0 ? 'completed' : 'no_jobs',
         companyId,
         companyName,
         companyIndex,
@@ -2244,6 +2390,12 @@ async function resetStuck() {
     if (data?.length) console.log(`[RESET] ${data.length} stuck companies`);
 }
 
+async function rebuildQueue() {
+    if (!crawlerInstanceLockToken) throw new Error('Crawler instance lock is required before rebuilding the queue');
+    await customCrawlQueue.obliterate({ force: true });
+    console.log('[QUEUE] Cleared stale Redis jobs; rebuilding from company database state');
+}
+
 async function enqueueCompanies() {
     const cutoff = new Date(Date.now() - CONFIG.RECRAWL_INTERVAL_HOURS * 3600 * 1000).toISOString();
     let page = 0, total = 0, hasMore = true;
@@ -2255,7 +2407,7 @@ async function enqueueCompanies() {
         .eq('ats_type', 'custom')
         .not('detected_career_url', 'is', null)
         .neq('crawl_status', 'in_progress')
-        .or(`last_crawled_at.is.null,last_crawled_at.lt.${cutoff}`);
+        .or(`crawl_status.eq.pending,last_crawled_at.is.null,last_crawled_at.lt.${cutoff}`);
 
     if (countError) {
         console.warn(`[QUEUE] Count query failed: ${countError.message}`);
@@ -2274,7 +2426,7 @@ async function enqueueCompanies() {
             .eq('ats_type', 'custom')
             .not('detected_career_url', 'is', null)
             .neq('crawl_status', 'in_progress')
-            .or(`last_crawled_at.is.null,last_crawled_at.lt.${cutoff}`)
+            .or(`crawl_status.eq.pending,last_crawled_at.is.null,last_crawled_at.lt.${cutoff}`)
             .order('Id', { ascending: true })
             .range(start, end);
 
@@ -2348,15 +2500,30 @@ function logCompanyResult(jobData, result) {
 
 // ─── WORKER ───────────────────────────────────────────────────────────────
 const worker = ENABLE_RUNTIME ? new Worker(QUEUE_NAME, async job => {
-    return await withTimeout(
-        processCompany(job),
-        CONFIG.COMPANY_TIMEOUT_MS,
-        `company ${job.data.companyName}`
-    );
+    const run = { pages: new Set(), timedOut: false };
+    activeCompanyRuns.add(run);
+    return companyRunContext.run(run, async () => {
+        try {
+            return await withTimeout(
+                processCompany(job),
+                CONFIG.COMPANY_TIMEOUT_MS,
+                `company ${job.data.companyName}`,
+                async () => {
+                    run.timedOut = true;
+                    await closeCompanyPages(run);
+                }
+            );
+        } finally {
+            await closeCompanyPages(run);
+            activeCompanyRuns.delete(run);
+            await recycleBrowserWhenIdle();
+        }
+    });
 }, {
     connection: redisConnection,
     concurrency: CONFIG.CONCURRENCY,
-    limiter: { max: CONFIG.RATE_LIMIT_MAX, duration: CONFIG.RATE_LIMIT_DURATION_MS }
+    limiter: { max: CONFIG.RATE_LIMIT_MAX, duration: CONFIG.RATE_LIMIT_DURATION_MS },
+    autorun: false
 }) : null;
 
 if (worker) worker.on('completed', (job, r) => {
@@ -2365,7 +2532,7 @@ if (worker) worker.on('completed', (job, r) => {
     else if (r.status === 'not_found') stats.not_found++;
     else if (r.status === 'no_jobs') stats.no_jobs++;
     else if (r.status === 'partial') { stats.partial++; stats.jobs_saved += r.jobsSaved || 0; }
-    else if (r.status === 'success') { stats.with_jobs++; stats.jobs_saved += r.jobsSaved || 0; }
+    else if (r.status === 'completed') { stats.with_jobs++; stats.jobs_saved += r.jobsSaved || 0; }
     else stats.errors++;
     processedCount++;
     logCompanyResult(job.data, r);
@@ -2375,8 +2542,14 @@ if (worker) worker.on('completed', (job, r) => {
 if (worker) worker.on('failed', async (job, err) => {
     const label = companyLabel(job?.data?.companyName, job?.data?.companyIndex, job?.data?.companyTotal);
     console.error(`[FAILED] ${label}: ${err.message}`);
-    stats.processed++; stats.errors++; processedCount++;
-    if (job?.data?.companyId) await markCompanyStatus(job.data.companyId, 'failed');
+    stats.processed++; stats.failed++; stats.errors++; processedCount++;
+    if (job?.data?.companyId) {
+        await markCompanyStatus(job.data.companyId, 'failed', { error: err });
+        await logCrawlEvent(job.data.companyId, 'failed', {
+            error_message: err.message,
+            duration_ms: job.processedOn ? Date.now() - job.processedOn : null
+        });
+    }
     if (processedCount % 10 === 0 || processedCount === totalQueued) printProgress();
 });
 
@@ -2395,6 +2568,7 @@ async function shutdown(code = 0) {
     try { await worker.close(); } catch {}
     try { await customCrawlQueue.close(); } catch {}
     try { if (sharedBrowser) await sharedBrowser.close(); } catch {}
+    try { await releaseCrawlerInstanceLock(); } catch {}
     try { await redisConnection.quit(); } catch {}
     process.exit(code);
 }
@@ -2422,7 +2596,9 @@ async function run() {
     console.log(`[CONFIG] Concurrency: ${CONFIG.CONCURRENCY} | GPT: ${CONFIG.GPT_MODEL} | Voyage: ${CONFIG.VOYAGE_MODEL}`);
     console.log(`[DIVISIONS] ${Object.keys(DIVISIONS).join(' | ')}`);
 
+    await acquireCrawlerInstanceLock();
     await resetStuck();
+    await rebuildQueue();
     const total = await enqueueCompanies();
 
     if (total === 0) {
@@ -2431,6 +2607,7 @@ async function run() {
         return;
     }
     console.log(`[QUEUE] Processing ${total} companies...`);
+    worker.run().catch(err => console.error(`[WORKER] ${err.message}`));
     await waitForQueue();
 
     resetLogContext();
