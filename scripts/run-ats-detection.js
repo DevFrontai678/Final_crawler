@@ -63,7 +63,7 @@ const CONFIG = {
   requestTimeout:      CRAWLER_TIMEOUTS.PAGE_CONTENT_TIMEOUT_MS,
   discoveryTimeout:    CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
   scraperApiTimeout:   SCRAPERAPI_CONFIG.requestTimeoutMs,
-  companyTimeoutMs:    CRAWLER_TIMEOUTS.COMPANY_TIMEOUT_MS,
+  companyTimeoutMs:    CRAWLER_TIMEOUTS.ATS_DETECTION_COMPANY_TIMEOUT_MS,
   maxRedirects:        8,
 
   pageSize:            1000,
