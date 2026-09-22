@@ -109,6 +109,9 @@ function buildRequestUrl(targetUrl, options) {
  * @throws {Error} If every retry attempt fails.
  */
 async function fetchWithScraperAPI(targetUrl, options = {}) {
+    if (options.signal?.aborted) {
+        throw options.signal.reason || new Error('ScraperAPI request aborted');
+    }
     const renderJs = options.renderJs !== undefined ? options.renderJs : SCRAPERAPI_CONFIG.renderJs;
     const requestUrl = buildRequestUrl(targetUrl, { ...options, renderJs });
 
@@ -118,12 +121,19 @@ async function fetchWithScraperAPI(targetUrl, options = {}) {
     for (let attempt = 1; attempt <= SCRAPERAPI_CONFIG.maxRetries; attempt++) {
         const startedAt = Date.now();
         const controller = new AbortController();
+        const abortFromParent = () => controller.abort(options.signal?.reason);
+        if (options.signal) {
+            if (options.signal.aborted) abortFromParent();
+            else options.signal.addEventListener('abort', abortFromParent, { once: true });
+        }
         const timeoutId = setTimeout(() => controller.abort(), SCRAPERAPI_CONFIG.requestTimeoutMs);
 
         try {
             console.log(`   [ScraperAPI] Request ${attempt}/${SCRAPERAPI_CONFIG.maxRetries} started for ${targetUrl}`);
-            const response = await proxyFetch(requestUrl, { timeout: SCRAPERAPI_CONFIG.requestTimeoutMs });
-            clearTimeout(timeoutId);
+            const response = await proxyFetch(requestUrl, {
+                timeout: SCRAPERAPI_CONFIG.requestTimeoutMs,
+                signal: controller.signal
+            });
 
             if (!response.ok) {
                 throw new Error(`ScraperAPI responded with HTTP ${response.status} for ${targetUrl}`);
@@ -133,7 +143,9 @@ async function fetchWithScraperAPI(targetUrl, options = {}) {
             console.log(`   [ScraperAPI] Request ${attempt}/${SCRAPERAPI_CONFIG.maxRetries} succeeded for ${targetUrl} in ${Date.now() - startedAt}ms`);
             return html;
         } catch (error) {
-            clearTimeout(timeoutId);
+            if (options.signal?.aborted) {
+                throw options.signal.reason || error;
+            }
             lastError = error.name === 'AbortError'
                 ? new Error(`ScraperAPI request timed out after ${SCRAPERAPI_CONFIG.requestTimeoutMs}ms`)
                 : error;
@@ -145,6 +157,9 @@ async function fetchWithScraperAPI(targetUrl, options = {}) {
                 await sleep(backoff);
                 backoff *= SCRAPERAPI_CONFIG.backoffMultiplier;
             }
+        } finally {
+            clearTimeout(timeoutId);
+            if (options.signal) options.signal.removeEventListener('abort', abortFromParent);
         }
     }
 

@@ -165,6 +165,7 @@ const CONFIG = {
     RECRAWL_INTERVAL_HOURS: parseInt(process.env.RECRAWL_INTERVAL_HOURS || '48', 10),
     COMPANY_TIMEOUT_MS: CRAWLER_TIMEOUTS.CUSTOM_CRAWLER_COMPANY_TIMEOUT_MS,
     JOB_TIMEOUT_MS: CRAWLER_TIMEOUTS.JOB_TIMEOUT_MS,
+    JOB_DETAIL_CONCURRENCY: Math.max(1, parseInt(process.env.CRAWLER_JOB_DETAIL_CONCURRENCY || '3', 10) || 3),
     PLAYWRIGHT_TIMEOUT_MS: CRAWLER_TIMEOUTS.PAGE_CONTENT_TIMEOUT_MS,
     BROWSER_RESTART_THRESHOLD: parseInt(process.env.BROWSER_RESTART_THRESHOLD || '100', 10),
     QUEUE_POLL_INTERVAL_MS: 5000,
@@ -618,6 +619,20 @@ let browserRecyclePromise = null;
 const activeCompanyRuns = new Set();
 const companyRunContext = new AsyncLocalStorage();
 
+function getAbortError(signal) {
+    if (signal?.reason instanceof Error) return signal.reason;
+
+    const error = new Error('Operation aborted');
+    error.name = 'AbortError';
+    return error;
+}
+
+function throwIfAborted(signal) {
+    if (signal?.aborted || companyRunContext.getStore()?.timedOut) {
+        throw getAbortError(signal);
+    }
+}
+
 function trackCompanyPage(page) {
     const run = companyRunContext.getStore();
     if (run) run.pages.add(page);
@@ -755,9 +770,13 @@ async function autoScroll(page, maxSteps = CONFIG.AUTO_SCROLL_MAX_STEPS) {
 
 // ─── FETCH HELPERS ────────────────────────────────────────────────────────
 async function fetchWithPlaywright(url, options = {}) {
-    const { waitForSelector, timeout = CONFIG.PLAYWRIGHT_TIMEOUT_MS, scroll = false } = options;
+    const { waitForSelector, timeout = CONFIG.PLAYWRIGHT_TIMEOUT_MS, scroll = false, signal } = options;
+    throwIfAborted(signal);
     const context = await getBrowserContext();
+    throwIfAborted(signal);
     const page = trackCompanyPage(await context.newPage());
+    const closeOnAbort = () => page.close().catch(() => {});
+    if (signal) signal.addEventListener('abort', closeOnAbort, { once: true });
     try {
         const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
         await acceptCookies(page);
@@ -770,12 +789,15 @@ async function fetchWithPlaywright(url, options = {}) {
         const status = response ? response.status() : null;
         return { html, url: finalUrl, status };
     } finally {
+        if (signal) signal.removeEventListener('abort', closeOnAbort);
         await closeTrackedPage(page);
         await recycleBrowserIfNeeded();
     }
 }
 
 async function fetchPageWithFallback(url, options = {}) {
+    const { signal } = options;
+    throwIfAborted(signal);
     const normalizedUrl = normalizeUrl(url);
     const scraperApiCacheKey = normalizedUrl || null;
     const scraperApiCache = companyRunContext.getStore()?.scraperApiFallbacks;
@@ -793,9 +815,11 @@ async function fetchPageWithFallback(url, options = {}) {
         }
         logInfo('FETCH', `Playwright HTTP ${playwrightResult.status}: ${url} -> ScraperAPI`);
     } catch (pwErr) {
+        throwIfAborted(signal);
         logWarn('FETCH', `Playwright failed: ${pwErr.message} → ScraperAPI`);
     }
 
+    throwIfAborted(signal);
     if (scraperApiCacheKey && scraperApiCache?.has(scraperApiCacheKey)) {
         logInfo('FETCH', `ScraperAPI cache hit: ${scraperApiCacheKey}`);
         return scraperApiCache.get(scraperApiCacheKey);
@@ -804,7 +828,7 @@ async function fetchPageWithFallback(url, options = {}) {
     const scraperApiResult = (async () => {
         try {
             const html = await fetchWithScraperAPI(url, {
-                renderJs: true, waitFor: 5000, premium: true, waitForSelector: 'body'
+                renderJs: true, waitFor: 5000, premium: true, waitForSelector: 'body', signal
             });
             return { html, url, status: null, usedScraperApi: true };
         } catch (e) {
@@ -836,16 +860,20 @@ async function fetchPageWithFallback(url, options = {}) {
 }
 
 // ─── PDF ──────────────────────────────────────────────────────────────────
-async function downloadAndParsePDF(url) {
+async function downloadAndParsePDF(url, signal) {
     if (!pdfParse) return null;
+    throwIfAborted(signal);
     try {
         const r = await axios.get(url, {
             responseType: 'arraybuffer', timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
-            headers: { 'User-Agent': 'Mozilla/5.0' }
+            headers: { 'User-Agent': 'Mozilla/5.0' }, signal
         });
         const d = await pdfParse(Buffer.from(r.data));
         return d.text || '';
-    } catch { return null; }
+    } catch (err) {
+        throwIfAborted(signal);
+        return null;
+    }
 }
 
 function isPdfUrl(url) {
@@ -1839,7 +1867,8 @@ function validateStructuredJob(structured, rawJob, companyName) {
 }
 
 // ─── GPT: STRUCTURE + VALIDATE + RELEVANCE ────────────────────────────────
-async function structureJobWithGPT(rawJobOrTitle, maybeDescription) {
+async function structureJobWithGPT(rawJobOrTitle, maybeDescription, signal) {
+    throwIfAborted(signal);
     const rawJob = typeof rawJobOrTitle === 'object'
         ? rawJobOrTitle
         : { title: rawJobOrTitle, rawDescription: maybeDescription };
@@ -1892,7 +1921,7 @@ RULES:
             temperature: 0,
             max_tokens: 700,
             response_format: { type: 'json_object' }
-        });
+        }, { signal });
         const content = res.choices[0]?.message?.content?.trim() || '';
         const p = JSON.parse(content);
 
@@ -1918,6 +1947,7 @@ RULES:
             location_city: p.location_city || null
         };
     } catch (err) {
+        throwIfAborted(signal);
         console.warn(`⚠️ GPT error: ${err.message}`);
         return null;
     }
@@ -1927,34 +1957,40 @@ RULES:
 const geocodeCache = new Map();
 let lastGeo = 0;
 
-async function geocodeCity(city) {
+async function geocodeCity(city, signal) {
     if (!city || typeof city !== 'string') return { lat: null, lng: null };
+    throwIfAborted(signal);
     const key = city.toLowerCase().trim();
     if (geocodeCache.has(key)) return geocodeCache.get(key);
 
     const elapsed = Date.now() - lastGeo;
     if (elapsed < 1100) await new Promise(r => setTimeout(r, 1100 - elapsed));
+    throwIfAborted(signal);
     lastGeo = Date.now();
 
     try {
         const r = await axios.get('https://nominatim.openstreetmap.org/search', {
             params: { q: city + ', Germany', format: 'json', limit: 1 },
             headers: { 'User-Agent': CONFIG.NOMINATIM_USER_AGENT },
-            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
+            signal
         });
         if (r.data && r.data.length > 0) {
             const result = { lat: parseFloat(r.data[0].lat), lng: parseFloat(r.data[0].lon) };
             geocodeCache.set(key, result);
             return result;
         }
-    } catch (e) {}
+    } catch (e) {
+        throwIfAborted(signal);
+    }
     const nullR = { lat: null, lng: null };
     geocodeCache.set(key, nullR);
     return nullR;
 }
 
 // ─── VOYAGE EMBEDDING ─────────────────────────────────────────────────────
-async function embedWithVoyage(text) {
+async function embedWithVoyage(text, signal) {
+    throwIfAborted(signal);
     if (!text || text.length < 10) return null;
     try {
         const r = await axios.post(
@@ -1969,11 +2005,13 @@ async function embedWithVoyage(text) {
                     'Authorization': `Bearer ${process.env.VOYAGE_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS
+                timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
+                signal
             }
         );
         return r.data?.data?.[0]?.embedding || null;
     } catch (err) {
+        throwIfAborted(signal);
         console.warn(`[VOYAGE] ${err.message}`);
         return null;
     }
@@ -2121,7 +2159,8 @@ async function processJobLink(url, companyId, companyName) {
     };
 }
 
-async function processJobLink(url, companyId, companyName) {
+async function processJobLink(url, companyId, companyName, signal) {
+    throwIfAborted(signal);
     const normalizedInputUrl = normalizeUrl(url) || url;
     if (isEnglishLanguageVariant(normalizedInputUrl)) {
         logWarn('JOB', `SKIP English variant: ${normalizedInputUrl}`);
@@ -2132,9 +2171,9 @@ async function processJobLink(url, companyId, companyName) {
     let finalUrl = normalizedInputUrl;
 
     if (isPdfUrl(normalizedInputUrl)) {
-        pdfText = await downloadAndParsePDF(normalizedInputUrl) || '';
+        pdfText = await downloadAndParsePDF(normalizedInputUrl, signal) || '';
     } else {
-        const r = await fetchPageWithFallback(normalizedInputUrl, { waitForSelector: 'body', scroll: true });
+        const r = await fetchPageWithFallback(normalizedInputUrl, { waitForSelector: 'body', scroll: true, signal });
         if (r) {
             html = r.html;
             finalUrl = normalizeUrl(r.url || normalizedInputUrl) || normalizedInputUrl;
@@ -2149,6 +2188,7 @@ async function processJobLink(url, companyId, companyName) {
     const rawJob = pdfText
         ? extractRawJobFromPdf(pdfText, finalUrl)
         : extractRawJobFromHtml(html, finalUrl, companyName);
+    throwIfAborted(signal);
     rawJob.url = finalUrl;
     rawJob.companyName = companyName;
 
@@ -2161,7 +2201,7 @@ async function processJobLink(url, companyId, companyName) {
         };
     }
 
-    const structured = await structureJobWithGPT(rawJob);
+    const structured = await structureJobWithGPT(rawJob, undefined, signal);
     const structuredValidation = validateStructuredJob(structured, rawJob, companyName);
     if (!structuredValidation.ok) {
         logInfo('JOB', `SKIP ${rawJob.title || finalUrl} (${structuredValidation.reasons.join('|')})`);
@@ -2177,14 +2217,14 @@ async function processJobLink(url, companyId, companyName) {
     let lat = null;
     let lng = null;
     if (location) {
-        const geo = await geocodeCity(location);
+        const geo = await geocodeCity(location, signal);
         lat = geo.lat;
         lng = geo.lng;
     }
 
     const finalTitle = structuredValidation.title;
     const rawDescription = `${finalTitle}\n\n${rawJob.rawDescription}`.trim().slice(0, 6000);
-    const embedding = await embedWithVoyage(rawDescription);
+    const embedding = await embedWithVoyage(rawDescription, signal);
     const jobPageUrl = chooseJobPageUrl({
         pageUrl: finalUrl,
         canonicalUrl: rawJob.jobPageUrl || rawJob.canonicalUrl,
@@ -2200,6 +2240,7 @@ async function processJobLink(url, companyId, companyName) {
         };
     }
     const externalSourceId = jobPageUrl || rawJob.canonicalUrl || finalUrl;
+    throwIfAborted(signal);
 
     return {
         skip: false,
@@ -2233,19 +2274,42 @@ async function processJobLink(url, companyId, companyName) {
     };
 }
 
-async function withTimeout(promise, ms, label, onTimeout) {
-    let h;
-    const t = new Promise((_, rej) => {
-        h = setTimeout(() => {
-            const error = new Error(`Timeout: ${label}`);
-            error.name = 'TimeoutError';
-            Promise.resolve(onTimeout?.(error))
-                .catch(cleanupError => logError('TIMEOUT', `Cleanup failed: ${cleanupError.message}`))
-                .finally(() => rej(error));
-        }, ms);
-    });
-    try { return await Promise.race([promise, t]); }
-    finally { clearTimeout(h); }
+async function withTimeout(task, ms, label, onTimeout, parentSignal) {
+    const controller = new AbortController();
+    let timedOut = false;
+    let timeoutCleanup = Promise.resolve();
+    const timeoutError = new Error(`Timeout: ${label}`);
+    timeoutError.name = 'TimeoutError';
+
+    const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort(timeoutError);
+        timeoutCleanup = Promise.resolve(onTimeout?.(timeoutError))
+            .catch(cleanupError => logError('TIMEOUT', `Cleanup failed: ${cleanupError.message}`));
+    }, ms);
+    const abortFromParent = () => controller.abort(getAbortError(parentSignal));
+    if (parentSignal) {
+        if (parentSignal.aborted) abortFromParent();
+        else parentSignal.addEventListener('abort', abortFromParent, { once: true });
+    }
+
+    try {
+        const result = await task(controller.signal);
+        if (timedOut) {
+            await timeoutCleanup;
+            throw timeoutError;
+        }
+        return result;
+    } catch (err) {
+        if (timedOut) {
+            await timeoutCleanup;
+            throw timeoutError;
+        }
+        throw err;
+    } finally {
+        clearTimeout(timer);
+        if (parentSignal) parentSignal.removeEventListener('abort', abortFromParent);
+    }
 }
 
 // ─── COMPANY PROCESSING ───────────────────────────────────────────────────
@@ -2282,7 +2346,7 @@ async function processCompany(job) {
             linkIndex++;
             logInfo('JOB', `Processing ${linkIndex}/${links.length} for companyId=${companyId}`);
             const r = await withTimeout(
-                processJobLink(link, companyId, companyName),
+                jobSignal => processJobLink(link, companyId, companyName, jobSignal),
                 CONFIG.JOB_TIMEOUT_MS,
                 `job`
             );
@@ -2306,7 +2370,8 @@ async function processCompany(job) {
 }
 
 // ─── QUEUE ────────────────────────────────────────────────────────────────
-async function processCompany(job) {
+async function processCompany(job, signal) {
+    throwIfAborted(signal);
     const { companyId, companyName, careerUrl, companyWebsiteUrl, companyIndex, companyTotal } = job.data;
     const metrics = {
         jobLinksFound: 0,
@@ -2374,6 +2439,7 @@ async function processCompany(job) {
     }
 
     const discovery = await extractAllJobLinks(effectiveUrl, companyName);
+    throwIfAborted(signal);
     const links = discovery.links || [];
     setLogContext({ step: 'JOBS', pageUrl: effectiveUrl, jobsFound: links.length, jobsSaved: 0 });
     Object.assign(metrics, {
@@ -2398,19 +2464,38 @@ async function processCompany(job) {
         return { status, companyId, companyName, companyIndex, companyTotal, jobsSaved: 0, elapsedMs: Date.now() - startedAt, metrics };
     }
 
-    const rows = [];
+    const pendingRows = [];
     const seen = new Set();
     const rejectedSamples = [];
     const failedSamples = [];
     const rejectionReasons = new Map();
 
-    for (const link of links) {
-        try {
-            const result = await withTimeout(
-                processJobLink(link, companyId, companyName),
-                CONFIG.JOB_TIMEOUT_MS,
-                `job ${link}`
-            );
+    for (let index = 0; index < links.length; index += CONFIG.JOB_DETAIL_CONCURRENCY) {
+        throwIfAborted(signal);
+        const jobBatch = links.slice(index, index + CONFIG.JOB_DETAIL_CONCURRENCY);
+        const outcomes = await Promise.all(jobBatch.map(async link => {
+            try {
+                const result = await withTimeout(
+                    jobSignal => processJobLink(link, companyId, companyName, jobSignal),
+                    CONFIG.JOB_TIMEOUT_MS,
+                    `job ${link}`,
+                    undefined,
+                    signal
+                );
+                return { link, result };
+            } catch (err) {
+                return { link, error: err };
+            }
+        }));
+
+        for (const { link, result, error } of outcomes) {
+            if (error) {
+                metrics.failedPages++;
+                if (failedSamples.length < 20) failedSamples.push({ url: link, reason: error.message });
+                logError('JOB', `FAIL ${link}: ${error.message}`);
+                continue;
+            }
+
             if (result.skip) {
                 metrics.invalidRejected++;
                 if (isNotFoundReason(result.reason)) metrics.notFoundPages++;
@@ -2430,18 +2515,22 @@ async function processCompany(job) {
                 continue;
             }
             seen.add(result.row.external_job_id);
-            rows.push(result.row);
-            setLogContext({ jobsSaved: rows.length });
+            pendingRows.push(result.row);
             logInfo('JOB', `OK ${result.row.title.slice(0, 55)} | ${result.row.location || '-'} | ${result.row.structured_skills?.length || 0} skills`);
-        } catch (err) {
-            metrics.failedPages++;
-            if (failedSamples.length < 20) failedSamples.push({ url: link, reason: err.message });
-            logError('JOB', `FAIL ${link}: ${err.message}`);
         }
+
+        if (pendingRows.length > 0) {
+            const rowsToSave = pendingRows.splice(0, pendingRows.length);
+            const saved = await batchInsertJobs(rowsToSave);
+            metrics.jobsSaved += saved;
+            setLogContext({ jobsSaved: metrics.jobsSaved });
+            logInfo('DB', `Saved incremental batch=${saved} total=${metrics.jobsSaved}`);
+        }
+
+        throwIfAborted(signal);
     }
 
-    logInfo('DB', `rows_ready=${rows.length}`);
-    if (rows.length > 0) metrics.jobsSaved = await batchInsertJobs(rows);
+    logInfo('DB', `incremental_saved=${metrics.jobsSaved}`);
     metrics.activeJobsAfter = await getActiveJobCount(companyId);
     setLogContext({ step: 'SAVE', jobsSaved: metrics.jobsSaved });
 
@@ -2643,7 +2732,7 @@ const worker = ENABLE_RUNTIME ? new Worker(QUEUE_NAME, async job => {
     return companyRunContext.run(run, async () => {
         try {
             return await withTimeout(
-                processCompany(job),
+                signal => processCompany(job, signal),
                 CONFIG.COMPANY_TIMEOUT_MS,
                 `company ${job.data.companyName}`,
                 async () => {
@@ -2731,7 +2820,7 @@ async function run() {
     resetLogContext();
     setLogContext({ step: 'BOOT' });
     console.log('[START] Custom Crawler v21 — Deep Category Crawling + Relevance Filter');
-    console.log(`[CONFIG] Concurrency: ${CONFIG.CONCURRENCY} | GPT: ${CONFIG.GPT_MODEL} | Voyage: ${CONFIG.VOYAGE_MODEL}`);
+    console.log(`[CONFIG] Concurrency: ${CONFIG.CONCURRENCY} | Job detail concurrency: ${CONFIG.JOB_DETAIL_CONCURRENCY} | GPT: ${CONFIG.GPT_MODEL} | Voyage: ${CONFIG.VOYAGE_MODEL}`);
     console.log(`[DIVISIONS] ${Object.keys(DIVISIONS).join(' | ')}`);
 
     await acquireCrawlerInstanceLock();
