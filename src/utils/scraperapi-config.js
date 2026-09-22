@@ -116,10 +116,12 @@ async function fetchWithScraperAPI(targetUrl, options = {}) {
     let backoff = SCRAPERAPI_CONFIG.initialBackoffMs;
 
     for (let attempt = 1; attempt <= SCRAPERAPI_CONFIG.maxRetries; attempt++) {
+        const startedAt = Date.now();
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), SCRAPERAPI_CONFIG.requestTimeoutMs);
 
         try {
+            console.log(`   [ScraperAPI] Request ${attempt}/${SCRAPERAPI_CONFIG.maxRetries} started for ${targetUrl}`);
             const response = await proxyFetch(requestUrl, { timeout: SCRAPERAPI_CONFIG.requestTimeoutMs });
             clearTimeout(timeoutId);
 
@@ -127,7 +129,9 @@ async function fetchWithScraperAPI(targetUrl, options = {}) {
                 throw new Error(`ScraperAPI responded with HTTP ${response.status} for ${targetUrl}`);
             }
 
-            return await response.text();
+            const html = await response.text();
+            console.log(`   [ScraperAPI] Request ${attempt}/${SCRAPERAPI_CONFIG.maxRetries} succeeded for ${targetUrl} in ${Date.now() - startedAt}ms`);
+            return html;
         } catch (error) {
             clearTimeout(timeoutId);
             lastError = error.name === 'AbortError'
@@ -135,7 +139,7 @@ async function fetchWithScraperAPI(targetUrl, options = {}) {
                 : error;
 
             const isLastAttempt = attempt === SCRAPERAPI_CONFIG.maxRetries;
-            console.log(`   [ScraperAPI] Attempt ${attempt}/${SCRAPERAPI_CONFIG.maxRetries} failed for ${targetUrl}: ${lastError.message}`);
+            console.log(`   [ScraperAPI] Request ${attempt}/${SCRAPERAPI_CONFIG.maxRetries} failed for ${targetUrl} after ${Date.now() - startedAt}ms: ${lastError.message}`);
 
             if (!isLastAttempt) {
                 await sleep(backoff);

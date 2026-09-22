@@ -776,6 +776,15 @@ async function fetchWithPlaywright(url, options = {}) {
 }
 
 async function fetchPageWithFallback(url, options = {}) {
+    const normalizedUrl = normalizeUrl(url);
+    const scraperApiCacheKey = normalizedUrl || null;
+    const scraperApiCache = companyRunContext.getStore()?.scraperApiFallbacks;
+
+    if (scraperApiCacheKey && scraperApiCache?.has(scraperApiCacheKey)) {
+        logInfo('FETCH', `ScraperAPI cache hit: ${scraperApiCacheKey}`);
+        return scraperApiCache.get(scraperApiCacheKey);
+    }
+
     let playwrightResult = null;
     try {
         playwrightResult = await fetchWithPlaywright(url, options);
@@ -786,30 +795,44 @@ async function fetchPageWithFallback(url, options = {}) {
     } catch (pwErr) {
         logWarn('FETCH', `Playwright failed: ${pwErr.message} → ScraperAPI`);
     }
-    try {
-        const html = await fetchWithScraperAPI(url, {
-            renderJs: true, waitFor: 5000, premium: true, waitForSelector: 'body'
-        });
-        return { html, url, status: null, usedScraperApi: true };
-    } catch (e) {
-        logWarn('FETCH', `ScraperAPI failed: ${e.message}`);
-        if (playwrightResult) {
+
+    if (scraperApiCacheKey && scraperApiCache?.has(scraperApiCacheKey)) {
+        logInfo('FETCH', `ScraperAPI cache hit: ${scraperApiCacheKey}`);
+        return scraperApiCache.get(scraperApiCacheKey);
+    }
+
+    const scraperApiResult = (async () => {
+        try {
+            const html = await fetchWithScraperAPI(url, {
+                renderJs: true, waitFor: 5000, premium: true, waitForSelector: 'body'
+            });
+            return { html, url, status: null, usedScraperApi: true };
+        } catch (e) {
+            logWarn('FETCH', `ScraperAPI failed: ${e.message}`);
+            if (playwrightResult) {
+                return {
+                    ...playwrightResult,
+                    usedScraperApi: false,
+                    scraperApiFailed: true,
+                    scraperApiError: e.message
+                };
+            }
             return {
-                ...playwrightResult,
+                html: null,
+                url,
+                status: null,
                 usedScraperApi: false,
                 scraperApiFailed: true,
                 scraperApiError: e.message
             };
         }
-        return {
-            html: null,
-            url,
-            status: null,
-            usedScraperApi: false,
-            scraperApiFailed: true,
-            scraperApiError: e.message
-        };
+    })();
+
+    if (scraperApiCacheKey && scraperApiCache) {
+        scraperApiCache.set(scraperApiCacheKey, scraperApiResult);
     }
+
+    return scraperApiResult;
 }
 
 // ─── PDF ──────────────────────────────────────────────────────────────────
@@ -2615,7 +2638,7 @@ function logCompanyResult(jobData, result) {
 
 // ─── WORKER ───────────────────────────────────────────────────────────────
 const worker = ENABLE_RUNTIME ? new Worker(QUEUE_NAME, async job => {
-    const run = { pages: new Set(), timedOut: false };
+    const run = { pages: new Set(), scraperApiFallbacks: new Map(), timedOut: false };
     activeCompanyRuns.add(run);
     return companyRunContext.run(run, async () => {
         try {
