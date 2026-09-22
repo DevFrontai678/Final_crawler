@@ -81,7 +81,7 @@ const CONFIG = {
   // Any URL suggested by Claude is independently validated before storage.
   claudeCareerFallback: Boolean(process.env.ANTHROPIC_API_KEY) && !args.includes('--no-claude-career'),
   claudeTimeout:        20000,
-  claudeModel:          process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-latest',
+  claudeModel:          process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001',
   maxClaudeLinks:       120,
 
   // Useful in development when the Anthropic key is invalid.
