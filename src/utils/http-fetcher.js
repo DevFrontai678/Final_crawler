@@ -53,6 +53,10 @@ async function fetchWithMetadata(url, options = {}) {
   // List of protocols to try: HTTPS first, then HTTP
   const protocols = options.protocols || ['https', 'http'];
 
+  if (options.signal?.aborted) {
+    throw options.signal.reason || new Error('HTTP fetch aborted');
+  }
+
   for (const protocol of protocols) {
     let targetUrl = normalizeUrl(url, protocol === 'https');
     if (!targetUrl) continue;
@@ -67,6 +71,7 @@ async function fetchWithMetadata(url, options = {}) {
     try {
       const response = await axios.get(targetUrl, {
         timeout,
+        signal: options.signal,
         maxRedirects,
         headers: {
           'User-Agent': userAgent,
@@ -100,6 +105,9 @@ async function fetchWithMetadata(url, options = {}) {
       return result;
 
     } catch (error) {
+      if (options.signal?.aborted || error?.code === 'ERR_CANCELED') {
+        throw error;
+      }
       logProxyFailure('HTTP fetch', targetUrl, error);
       // If this was the last protocol, store the error
       if (protocol === protocols[protocols.length - 1]) {

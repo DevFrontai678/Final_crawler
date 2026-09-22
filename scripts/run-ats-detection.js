@@ -637,6 +637,31 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function getAbortError(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+
+  const error = new Error('Operation aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw getAbortError(signal);
+}
+
+function forwardAbortSignal(signal, controller) {
+  if (!signal) return () => {};
+
+  const abort = () => controller.abort(signal.reason);
+  if (signal.aborted) {
+    abort();
+  } else {
+    signal.addEventListener('abort', abort, { once: true });
+  }
+
+  return () => signal.removeEventListener('abort', abort);
+}
+
 function formatDuration(ms) {
   const s = Math.round(ms / 1000);
   if (s < 60) return `${s}s`;
@@ -1537,7 +1562,8 @@ function careerEvidenceScore(url, html, title, source, websiteUrl) {
   return score;
 }
 
-async function validateCareerCandidate(candidate, websiteUrl, workerId) {
+async function validateCareerCandidate(candidate, websiteUrl, workerId, signal) {
+  throwIfAborted(signal);
   const candidateUrl = safeUrl(candidate.url);
   if (!candidateUrl) return null;
 
@@ -1546,6 +1572,7 @@ async function validateCareerCandidate(candidate, websiteUrl, workerId) {
       timeout: CONFIG.discoveryTimeout,
       maxRedirects: CONFIG.maxRedirects,
       protocols: ['https', 'http'],
+      signal,
     });
 
     const finalUrl = safeUrl(fetched.finalUrl || candidateUrl) || candidateUrl;
@@ -1616,7 +1643,8 @@ async function validateCareerCandidate(candidate, websiteUrl, workerId) {
         : 0.88,
       validationSignals: evidence,
     };
-  } catch {
+  } catch (err) {
+    throwIfAborted(signal);
     return null;
   }
 }
@@ -1642,19 +1670,23 @@ function extractSitemapLocs(xml, baseUrl) {
   return [...new Set(urls)];
 }
 
-async function fetchTextLike(url) {
+async function fetchTextLike(url, signal) {
+  throwIfAborted(signal);
   try {
     return await fetchWithMetadata(url, {
       timeout: CONFIG.discoveryTimeout,
       maxRedirects: CONFIG.maxRedirects,
       protocols: ['https', 'http'],
+      signal,
     });
-  } catch {
+  } catch (err) {
+    throwIfAborted(signal);
     return null;
   }
 }
 
-async function discoverFromSitemaps(websiteUrl, workerId) {
+async function discoverFromSitemaps(websiteUrl, workerId, signal) {
+  throwIfAborted(signal);
   const origin = new URL(websiteUrl).origin;
   const sitemapUrls = new Set([
     `${origin}/sitemap.xml`,
@@ -1662,7 +1694,7 @@ async function discoverFromSitemaps(websiteUrl, workerId) {
   ]);
 
   // robots.txt may declare a nonstandard sitemap location.
-  const robots = await fetchTextLike(`${origin}/robots.txt`);
+  const robots = await fetchTextLike(`${origin}/robots.txt`, signal);
   if (robots?.html) {
     const sitemapRegex = /^\s*Sitemap:\s*(.+)\s*$/gim;
     let match;
@@ -1676,7 +1708,8 @@ async function discoverFromSitemaps(websiteUrl, workerId) {
   const candidateUrls = [];
 
   for (const sitemapUrl of [...sitemapUrls].slice(0, 4)) {
-    const sitemap = await fetchTextLike(sitemapUrl);
+    throwIfAborted(signal);
+    const sitemap = await fetchTextLike(sitemapUrl, signal);
     if (!sitemap?.html) continue;
 
     const locs = extractSitemapLocs(sitemap.html, sitemapUrl);
@@ -1707,7 +1740,8 @@ async function discoverFromSitemaps(websiteUrl, workerId) {
       .slice(0, 3);
 
     for (const child of childSitemaps) {
-      const childResult = await fetchTextLike(child);
+      throwIfAborted(signal);
+      const childResult = await fetchTextLike(child, signal);
       if (!childResult?.html) continue;
 
       for (const loc of extractSitemapLocs(childResult.html, child)) {
@@ -1731,7 +1765,8 @@ async function discoverFromSitemaps(websiteUrl, workerId) {
     .slice(0, CONFIG.maxSitemapCandidates);
 
   for (const candidate of candidates) {
-    const validated = await validateCareerCandidate(candidate, websiteUrl, workerId);
+    throwIfAborted(signal);
+    const validated = await validateCareerCandidate(candidate, websiteUrl, workerId, signal);
     if (validated) return validated;
   }
 
@@ -1740,7 +1775,8 @@ async function discoverFromSitemaps(websiteUrl, workerId) {
 
 // ─── COMMON PATH DISCOVERY ─────────────────────────────────────────────────
 
-async function discoverFromCommonPaths(websiteUrl, workerId) {
+async function discoverFromCommonPaths(websiteUrl, workerId, signal) {
+  throwIfAborted(signal);
   const origin = new URL(websiteUrl).origin;
 
   const candidates = COMMON_CAREER_PATHS
@@ -1757,7 +1793,8 @@ async function discoverFromCommonPaths(websiteUrl, workerId) {
     .sort((a, b) => b.score - a.score);
 
   for (const candidate of candidates) {
-    const validated = await validateCareerCandidate(candidate, websiteUrl, workerId);
+    throwIfAborted(signal);
+    const validated = await validateCareerCandidate(candidate, websiteUrl, workerId, signal);
     if (validated) return validated;
   }
 
@@ -1792,10 +1829,12 @@ function searchCandidateMatchesCompany(candidate, company, websiteUrl) {
   return false;
 }
 
-async function serperSearch(query) {
+async function serperSearch(query, signal) {
   if (!CONFIG.searchFallback || !process.env.SERPER_API_KEY) return [];
 
+  throwIfAborted(signal);
   const controller = new AbortController();
+  const removeAbortForwarder = forwardAbortSignal(signal, controller);
   const timer = setTimeout(() => controller.abort(), CONFIG.searchTimeout);
 
   try {
@@ -1810,21 +1849,25 @@ async function serperSearch(query) {
         num: 10,
       }),
       timeout: CONFIG.searchTimeout,
+      signal: controller.signal,
     });
 
     if (!response.ok) return [];
 
     const payload = await response.json();
     return Array.isArray(payload.organic) ? payload.organic : [];
-  } catch {
+  } catch (err) {
+    throwIfAborted(signal);
     return [];
   } finally {
     clearTimeout(timer);
+    removeAbortForwarder();
   }
 }
 
-async function discoverFromSearch(company, websiteUrl, workerId) {
+async function discoverFromSearch(company, websiteUrl, workerId, signal) {
   if (!CONFIG.searchFallback) return null;
+  throwIfAborted(signal);
 
   const domain = getHostname(websiteUrl);
   if (!domain) return null;
@@ -1843,7 +1886,8 @@ async function discoverFromSearch(company, websiteUrl, workerId) {
   const rawCandidates = [];
 
   for (const query of queries) {
-    const results = await serperSearch(query);
+    throwIfAborted(signal);
+    const results = await serperSearch(query, signal);
 
     for (const item of results) {
       const url = safeUrl(item.link);
@@ -1884,10 +1928,12 @@ async function discoverFromSearch(company, websiteUrl, workerId) {
     .slice(0, CONFIG.maxSearchCandidates);
 
   for (const candidate of candidates) {
+    throwIfAborted(signal);
     const validated = await validateCareerCandidate(
       candidate,
       websiteUrl,
-      workerId
+      workerId,
+      signal
     );
 
     if (validated) return validated;
@@ -1898,8 +1944,9 @@ async function discoverFromSearch(company, websiteUrl, workerId) {
 
 
 
-async function callClaudeForCareerLink(company, websiteUrl, homepageHtml) {
+async function callClaudeForCareerLink(company, websiteUrl, homepageHtml, signal) {
   if (!CONFIG.claudeCareerFallback || !homepageHtml) return null;
+  throwIfAborted(signal);
 
   const allLinks = extractAnchors(homepageHtml, websiteUrl)
     .filter(item => item.url)
@@ -1931,6 +1978,7 @@ async function callClaudeForCareerLink(company, websiteUrl, homepageHtml) {
   ].join('\n');
 
   const controller = new AbortController();
+  const removeAbortForwarder = forwardAbortSignal(signal, controller);
   const timer = setTimeout(() => controller.abort(), CONFIG.claudeTimeout);
 
   try {
@@ -1953,6 +2001,7 @@ async function callClaudeForCareerLink(company, websiteUrl, homepageHtml) {
         ],
       }),
       timeout: CONFIG.claudeTimeout,
+      signal: controller.signal,
     });
 
     if (!response.ok) {
@@ -1996,18 +2045,22 @@ async function callClaudeForCareerLink(company, websiteUrl, homepageHtml) {
           : null,
       claudeReason: parsed.reason || null,
     };
-  } catch {
+  } catch (err) {
+    throwIfAborted(signal);
     return null;
   } finally {
     clearTimeout(timer);
+    removeAbortForwarder();
   }
 }
 
-async function discoverFromClaudeLinks(company, websiteUrl, homepageHtml, workerId) {
+async function discoverFromClaudeLinks(company, websiteUrl, homepageHtml, workerId, signal) {
+  throwIfAborted(signal);
   const candidate = await callClaudeForCareerLink(
     company,
     websiteUrl,
-    homepageHtml
+    homepageHtml,
+    signal
   );
 
   if (!candidate) return null;
@@ -2017,7 +2070,8 @@ async function discoverFromClaudeLinks(company, websiteUrl, homepageHtml, worker
   const validated = await validateCareerCandidate(
     candidate,
     websiteUrl,
-    workerId
+    workerId,
+    signal
   );
 
   if (!validated) return null;
@@ -2066,17 +2120,19 @@ function collectHomepageCandidates(html, homepageFinalUrl) {
     .slice(0, CONFIG.maxAnchorCandidates);
 }
 
-async function discoverFromScraperApi(company, websiteUrl, workerId) {
+async function discoverFromScraperApi(company, websiteUrl, workerId, signal) {
   const apiKey = process.env.SCRAPERAPI_API_KEY;
   const targetUrl = normalizeUrl(websiteUrl);
 
   if (!apiKey || !targetUrl) return null;
+  throwIfAborted(signal);
 
   const startedAt = Date.now();
   const companyName = String(company?.Name || '').trim() || 'unknown-company';
   console.log(`  ScraperAPI fallback... company="${companyName}" url="${targetUrl}"`);
 
   const controller = new AbortController();
+  const removeAbortForwarder = forwardAbortSignal(signal, controller);
   const timer = setTimeout(() => controller.abort(), CONFIG.scraperApiTimeout);
 
   try {
@@ -2088,6 +2144,7 @@ async function discoverFromScraperApi(company, websiteUrl, workerId) {
     const response = await proxyFetch(scraperUrl, {
       method: 'GET',
       timeout: CONFIG.scraperApiTimeout,
+      signal: controller.signal,
     });
 
     if (!response.ok) {
@@ -2112,10 +2169,12 @@ async function discoverFromScraperApi(company, websiteUrl, workerId) {
     );
 
     for (const candidate of candidates) {
+      throwIfAborted(signal);
       const validated = await validateCareerCandidate(
         candidate,
         targetUrl,
-        workerId
+        workerId,
+        signal
       );
 
       if (validated) {
@@ -2128,6 +2187,7 @@ async function discoverFromScraperApi(company, websiteUrl, workerId) {
       }
     }
   } catch (err) {
+    throwIfAborted(signal);
     const elapsed = Date.now() - startedAt;
     const abortReason =
       err?.name === 'AbortError' || /aborted/i.test(String(err?.message || ''))
@@ -2141,6 +2201,7 @@ async function discoverFromScraperApi(company, websiteUrl, workerId) {
     );
   } finally {
     clearTimeout(timer);
+    removeAbortForwarder();
   }
 
   return null;
@@ -2148,7 +2209,8 @@ async function discoverFromScraperApi(company, websiteUrl, workerId) {
 
 // ─── MAIN CAREER PAGE DISCOVERY ────────────────────────────────────────────
 
-async function discoverCareerPage(company, workerId) {
+async function discoverCareerPage(company, workerId, signal) {
+  throwIfAborted(signal);
   const websiteUrl = normalizeUrl(company.Website);
 
   const storedCareer = normalizeUrl(company.career_page_url);
@@ -2201,10 +2263,12 @@ async function discoverCareerPage(company, workerId) {
     .sort((a, b) => b.score - a.score);
 
   for (const candidate of existingCandidates) {
+    throwIfAborted(signal);
     const validated = await validateCareerCandidate(
       candidate,
       websiteUrl || candidate.url,
-      workerId
+      workerId,
+      signal
     );
 
     if (validated) {
@@ -2239,8 +2303,10 @@ async function discoverCareerPage(company, workerId) {
       timeout: CONFIG.requestTimeout,
       maxRedirects: CONFIG.maxRedirects,
       protocols: ['https', 'http'],
+      signal,
     });
-  } catch {
+  } catch (err) {
+    throwIfAborted(signal);
     homepageResult = null;
   }
 
@@ -2255,10 +2321,12 @@ async function discoverCareerPage(company, workerId) {
     );
 
     for (const candidate of candidates) {
+      throwIfAborted(signal);
       const validated = await validateCareerCandidate(
         candidate,
         homepageFinalUrl,
-        workerId
+        workerId,
+        signal
       );
 
       if (validated) {
@@ -2286,7 +2354,7 @@ async function discoverCareerPage(company, workerId) {
     );
   } else {
     // 3. Search sitemap URLs.
-    const sitemapResult = await discoverFromSitemaps(homepageFinalUrl, workerId);
+    const sitemapResult = await discoverFromSitemaps(homepageFinalUrl, workerId, signal);
 
     if (sitemapResult) {
       const result = {
@@ -2303,7 +2371,8 @@ async function discoverCareerPage(company, workerId) {
     // 4. Probe standard career paths.
     const commonPathResult = await discoverFromCommonPaths(
       homepageFinalUrl,
-      workerId
+      workerId,
+      signal
     );
 
     if (commonPathResult) {
@@ -2326,7 +2395,8 @@ async function discoverCareerPage(company, workerId) {
   const searchResult = await discoverFromSearch(
     company,
     homepageFinalUrl,
-    workerId
+    workerId,
+    signal
   );
 
   if (searchResult) {
@@ -2349,7 +2419,8 @@ async function discoverCareerPage(company, workerId) {
     company,
     homepageFinalUrl,
     homepageResult?.html || '',
-    workerId
+    workerId,
+    signal
   );
 
   if (claudeResult) {
@@ -2371,7 +2442,8 @@ async function discoverCareerPage(company, workerId) {
   const scraperApiResult = await discoverFromScraperApi(
     company,
     homepageFinalUrl,
-    workerId
+    workerId,
+    signal
   );
 
   if (scraperApiResult) {
@@ -2412,7 +2484,8 @@ async function discoverCareerPage(company, workerId) {
 
 // ─── PROCESS A SINGLE COMPANY ──────────────────────────────────────────────
 
-async function processCompany(company, workerId) {
+async function processCompany(company, workerId, signal) {
+  throwIfAborted(signal);
   const startTime = Date.now();
   let retryCount = 0;
   let lastError = null;
@@ -2445,7 +2518,7 @@ async function processCompany(company, workerId) {
   }
 
   // ─── STEP 1: Discover the best career page first ─────────────────────
-  const careerDiscovery = await discoverCareerPage(company, workerId);
+  const careerDiscovery = await discoverCareerPage(company, workerId, signal);
 
   const discoveredUrl = normalizeUrl(careerDiscovery?.url);
 
@@ -2485,6 +2558,7 @@ async function processCompany(company, workerId) {
       if (attempt > 0) {
         const delay = exponentialBackoffWithJitter(attempt);
         await sleep(delay);
+        throwIfAborted(signal);
         retryCount++;
       }
 
@@ -2493,6 +2567,7 @@ async function processCompany(company, workerId) {
         timeout: CONFIG.requestTimeout,
         maxRedirects: CONFIG.maxRedirects,
         protocols: ['https', 'http'],
+        signal,
       });
 
       const fetchedFinalUrl =
@@ -2538,7 +2613,7 @@ async function processCompany(company, workerId) {
           },
         };
       } else if (fetchResult.html) {
-        detectionResult = await detectATS(company.Id, fetchedFinalUrl);
+        detectionResult = await detectATS(company.Id, fetchedFinalUrl, { signal });
 
         // If the shared detector still returns unknown/custom, check the
         // fetched HTML one more time before accepting a generic result.
@@ -2592,7 +2667,8 @@ async function processCompany(company, workerId) {
             source: 'ats_detector',
           },
           normalizeUrl(company.Website) || careerDiscovery?.homepageUrl || fetchedFinalUrl,
-          workerId
+          workerId,
+          signal
         );
 
         if (validatedDetectorUrl?.genuineCareer) {
@@ -2903,23 +2979,28 @@ async function runWorkerPool(companies, concurrency) {
     await batchUpsertCompanies(batch);
   }
 
-  function withTimeout(promise, timeoutMs, label) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
+  async function withTimeout(task, timeoutMs, label) {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeoutError = new Error(`${label} timed out after ${timeoutMs}ms`);
+    timeoutError.name = 'AbortError';
+    timeoutError.code = 'ATS_DETECTION_COMPANY_TIMEOUT';
 
-      promise.then(
-        value => {
-          clearTimeout(timer);
-          resolve(value);
-        },
-        err => {
-          clearTimeout(timer);
-          reject(err);
-        }
-      );
-    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(timeoutError);
+    }, timeoutMs);
+
+    try {
+      const result = await task(controller.signal);
+      if (timedOut) throw timeoutError;
+      return result;
+    } catch (err) {
+      if (timedOut) throw timeoutError;
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function worker(id) {
@@ -2936,7 +3017,7 @@ async function runWorkerPool(companies, concurrency) {
       let outcome;
       try {
         outcome = await withTimeout(
-          processCompany(company, id),
+          signal => processCompany(company, id, signal),
           CONFIG.companyTimeoutMs,
           `Company ${company.Name || company.Id}`
         );

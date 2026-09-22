@@ -135,6 +135,7 @@ async function proxyFetch(input, init = {}) {
     headers,
     data: body,
     timeout,
+    signal: init.signal,
     maxRedirects: init.redirect === 'manual' ? 0 : (init.maxRedirects || 8),
     validateStatus: () => true,
     responseType: 'arraybuffer',

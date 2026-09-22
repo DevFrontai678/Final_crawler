@@ -148,8 +148,29 @@ function jobContentScore(html) {
 }
 
 // ─── FETCH WITH TIMEOUT ──────────────────────────────────────────────────────
-async function fetchWithTimeout(url, timeoutMs = 10000) {
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw signal.reason || new Error('ATS detection aborted');
+  }
+}
+
+function forwardAbortSignal(signal, controller) {
+  if (!signal) return () => {};
+
+  const abort = () => controller.abort(signal.reason);
+  if (signal.aborted) {
+    abort();
+  } else {
+    signal.addEventListener('abort', abort, { once: true });
+  }
+
+  return () => signal.removeEventListener('abort', abort);
+}
+
+async function fetchWithTimeout(url, timeoutMs = 10000, signal) {
+  throwIfAborted(signal);
   const controller = new AbortController();
+  const removeAbortForwarder = forwardAbortSignal(signal, controller);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await axios.get(url, {
@@ -164,17 +185,19 @@ async function fetchWithTimeout(url, timeoutMs = 10000) {
       validateStatus: s => s < 500,
       ...applyProxyToAxiosConfig()
     });
-    clearTimeout(timeout);
     return response;
   } catch (error) {
-    clearTimeout(timeout);
     logProxyFailure('ATS fetch', url, error);
     throw error;
+  } finally {
+    clearTimeout(timeout);
+    removeAbortForwarder();
   }
 }
 
 // ─── CAREER PAGE DISCOVERY ──────────────────────────────────────────────────
-async function fetchCareerPage(rawUrl) {
+async function fetchCareerPage(rawUrl, signal) {
+  throwIfAborted(signal);
   if (!rawUrl) return null;
   const base = getBaseUrl(normalizeUrl(rawUrl));
   const rawNorm = normalizeUrl(rawUrl);
@@ -182,33 +205,40 @@ async function fetchCareerPage(rawUrl) {
   // try exact URL
   if (rawNorm !== base) {
     try {
-      const res = await fetchWithTimeout(rawNorm, 8000);
+      const res = await fetchWithTimeout(rawNorm, 8000, signal);
       if (res.status === 200 && res.data && typeof res.data === 'string') {
         return { url: rawNorm, html: res.data };
       }
-    } catch {}
+    } catch (err) {
+      throwIfAborted(signal);
+    }
   }
 
   // try career paths
   for (const path of CAREER_PATHS) {
+    throwIfAborted(signal);
     try {
       const testUrl = base + path;
-      const res = await fetchWithTimeout(testUrl, 8000);
+      const res = await fetchWithTimeout(testUrl, 8000, signal);
       if (res.status === 200 && res.data && typeof res.data === 'string') {
         if (jobContentScore(res.data) >= 1) {
           return { url: testUrl, html: res.data };
         }
       }
-    } catch {}
+    } catch (err) {
+      throwIfAborted(signal);
+    }
   }
 
   // fallback to base
   try {
-    const res = await fetchWithTimeout(base, 8000);
+    const res = await fetchWithTimeout(base, 8000, signal);
     if (res.status === 200 && res.data && typeof res.data === 'string') {
       return { url: base, html: res.data };
     }
-  } catch {}
+  } catch (err) {
+    throwIfAborted(signal);
+  }
   return null;
 }
 
@@ -256,7 +286,8 @@ function deepScanHtml(html, pageUrl) {
 }
 
 // ─── CLAUDE FALLBACK (with token logging) ──────────────────────────────────
-async function claudeFallback(html, pageUrl) {
+async function claudeFallback(html, pageUrl, signal) {
+  throwIfAborted(signal);
   try {
     const Anthropic = require('@anthropic-ai/sdk');
     const client = new Anthropic({ fetch: proxyFetch });
@@ -289,7 +320,7 @@ async function claudeFallback(html, pageUrl) {
         role: 'user',
         content: `You are an expert at detecting Applicant Tracking Systems (ATS).\nAnalyze this career page data and identify which ATS is used.\n\n${context}\n\nReply with ONLY ONE WORD from this exact list:\n${VALID.join(', ')}\n\nUse "custom" if the company built their own job listing system.\nUse "unknown" if there are no jobs or no ATS detectable.`
       }]
-    });
+    }, { signal });
 
     // ─── Token logging ──────────────────────────────────────────────────
     const usage = response.usage;
@@ -308,13 +339,15 @@ async function claudeFallback(html, pageUrl) {
     console.log(`      ↳ Claude says: "${answer}"`);
     return VALID.includes(answer) ? answer : 'unknown';
   } catch (err) {
+    throwIfAborted(signal);
     console.log(`      ↳ Claude error: ${err.message}`);
     return 'unknown';
   }
 }
 
 // ─── MAIN EXPORT ──────────────────────────────────────────────────────────────
-async function detectATS(companyId, websiteUrl) {
+async function detectATS(companyId, websiteUrl, { signal } = {}) {
+  throwIfAborted(signal);
   const result = {
     company_id: companyId,
     career_page_url: websiteUrl || '',
@@ -347,7 +380,7 @@ async function detectATS(companyId, websiteUrl) {
   // fetch career page
   let page = null;
   try {
-    page = await fetchCareerPage(normUrl);
+    page = await fetchCareerPage(normUrl, signal);
   } catch (err) {
     result.ats_type = 'error';
     result.error = err.message || 'Fetch failed';
@@ -404,7 +437,7 @@ async function detectATS(companyId, websiteUrl) {
 
   // LAYER 3: Claude fallback
   console.log(`    [L3] Claude fallback...`);
-  const claudeAts = await claudeFallback(String(page.html), page.url);
+  const claudeAts = await claudeFallback(String(page.html), page.url, signal);
   result.ats_type = claudeAts;
   result.ats_confidence = 0.60;
   result.detection_method = 'claude_fallback';
