@@ -2275,37 +2275,48 @@ async function discoverCareerPage(company, workerId) {
     }
   }
 
-  // 3. Search sitemap URLs.
-  const sitemapResult = await discoverFromSitemaps(homepageFinalUrl, workerId);
-
-  if (sitemapResult) {
-    const result = {
-      ...sitemapResult,
-      fallback: false,
-      discoveryMethod: 'sitemap',
-      homepageUrl: homepageFinalUrl,
-    };
-
-    cacheSet(cache.careerUrl, websiteUrl, result);
-    return result;
-  }
-
-  // 4. Probe standard career paths.
-  const commonPathResult = await discoverFromCommonPaths(
-    homepageFinalUrl,
-    workerId
+  const homepageDnsErrorCode = homepageResult?.error?.code;
+  const hasHomepageDnsFailure = ['EAI_AGAIN', 'ENOTFOUND'].includes(
+    homepageDnsErrorCode
   );
 
-  if (commonPathResult) {
-    const result = {
-      ...commonPathResult,
-      fallback: false,
-      discoveryMethod: 'common_path',
-      homepageUrl: homepageFinalUrl,
-    };
+  if (hasHomepageDnsFailure) {
+    console.log(
+      `  [DISCOVERY] Skipping same-origin sitemap/common-path discovery due to DNS error: ${homepageDnsErrorCode}`
+    );
+  } else {
+    // 3. Search sitemap URLs.
+    const sitemapResult = await discoverFromSitemaps(homepageFinalUrl, workerId);
 
-    cacheSet(cache.careerUrl, websiteUrl, result);
-    return result;
+    if (sitemapResult) {
+      const result = {
+        ...sitemapResult,
+        fallback: false,
+        discoveryMethod: 'sitemap',
+        homepageUrl: homepageFinalUrl,
+      };
+
+      cacheSet(cache.careerUrl, websiteUrl, result);
+      return result;
+    }
+
+    // 4. Probe standard career paths.
+    const commonPathResult = await discoverFromCommonPaths(
+      homepageFinalUrl,
+      workerId
+    );
+
+    if (commonPathResult) {
+      const result = {
+        ...commonPathResult,
+        fallback: false,
+        discoveryMethod: 'common_path',
+        homepageUrl: homepageFinalUrl,
+      };
+
+      cacheSet(cache.careerUrl, websiteUrl, result);
+      return result;
+    }
   }
 
   // 5. Optional search fallback.
