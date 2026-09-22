@@ -252,11 +252,10 @@ function getDiscoveryUrlPriority(url) {
 
 // ─── CATEGORY PAGE DETECTION (crawl INTO, don't treat as job) ─────────────
 const CATEGORY_PATTERNS = [
-    /\/karriere\/[a-zäöü-]+\/?$/i,           // /karriere/professionals/
     /\/career\/[a-z-]+\/?$/i,                // /career/it-professionals/
     /\/jobs\/[a-z-]+\/?$/i,                  // /jobs/engineering/
     /\/stellenangebote\/[a-z-]+\/?$/i,       // /stellenangebote/it/
-    /\/karriere\/(professionals|studium|studierende|ausbildung|praktikum|absolventen|berufserfahrene|schüler|schueler|bewerber|einstieg|führungskräfte|fuehrungskraefte|mitarbeiter)/i,
+    /\/karriere\/(professionals|studium|studierende|ausbildung|praktikum|absolventen|berufserfahrene|schüler|schueler|bewerber|einstieg|führungskräfte|fuehrungskraefte|mitarbeiter)(?:\/|$)/i,
     /\/karriere\/[a-z-]+\/[a-z-]+\/?$/i,     // /karriere/it/professionals/
     /\/(dein|deine|unsere|ihre)-(studium|praktikum|ausbildung|einstieg|karriere)/i,
     /\/team\/[a-z-]+\/?$/i,                  // /team/engineering/
@@ -547,6 +546,23 @@ function isNotFoundReason(reason) {
     return /http_(404|410)|http_(403|429).*scraperapi|scraperapi_failed|blocked_after_scraperapi|no_valid_career_url|resolved_page_not_career_related|career_url_resolved_to_unrelated_page|career_url_(redirected_to_)?external_domain|career_url_external_ats|zero_job_links/i.test(String(reason || ''));
 }
 
+function hasSpecificJobTitleEvidence(title) {
+    const clean = compactText(title, 180);
+    if (isGenericJobTitle(clean) || wordCount(clean) > 18) return false;
+    return /\b(mitarbeiter|fachplaner|objektüberwacher|architekt|architect|ingenieur|engineer|entwickler|developer|controller|manager|berater|consultant|analyst|designer|administrator|techniker|projektleiter|sachverständig|supervisor|koordinator|specialist|leiter)\b/i.test(clean) ||
+        /\b\(?[mfw]\s*\/\s*[mfw]\s*\/\s*d\)?\b/i.test(clean) ||
+        /\b(?:senior|junior)\b/i.test(clean);
+}
+
+function hasJobDetailIndicator(fullUrl, anchorText) {
+    const lastSegment = (() => {
+        try { return decodeURIComponent(new URL(fullUrl).pathname.split('/').filter(Boolean).pop() || ''); }
+        catch { return ''; }
+    })();
+    return /\d{3,}|[a-z]+-[a-z]+(?:-[a-z]+)*/i.test(lastSegment) ||
+        /\b\(?[mfw]\s*\/\s*[mfw]\s*\/\s*d\)?\b/i.test(String(anchorText || ''));
+}
+
 function classifyLink(fullUrl, anchorText, contextText, baseUrl) {
     if (!fullUrl || !isSameCompanyUrl(fullUrl, baseUrl)) return 'ignore';
     if (isAtsUrl(fullUrl)) return 'ats';
@@ -559,15 +575,22 @@ function classifyLink(fullUrl, anchorText, contextText, baseUrl) {
     })();
 
     if (isJobDetailUrl(fullUrl) || isPdfUrl(fullUrl)) return 'job';
-    if (isCategoryUrl(fullUrl)) return 'listing';
 
     const hasCareerUrl = CAREER_WORDS.some(w => lowerUrl.includes(w.replace(/\s+/g, '-')) || lowerUrl.includes(w.replace(/\s+/g, '')));
     const hasListingText = LISTING_WORDS.some(w => text.includes(w));
     const hasJobText = JOB_EVIDENCE_WORDS.some(w => text.includes(w)) || /\b(job|stelle|position|vacancy|bewerb)\b/i.test(text);
     const looksLikeSpecificSlug = /(\d{3,}|[a-z]+-[a-z]+-[a-z]+|[a-z]+_[a-z]+_[a-z]+)/i.test(lastSegment);
+    const hasSpecificTitle = hasSpecificJobTitleEvidence(anchorText);
+    const hasDetailIndicator = hasJobDetailIndicator(fullUrl, anchorText);
 
-    if (hasCareerUrl && (hasListingText || /page=\d+|seite=\d+|offset=\d+|start=\d+/i.test(lowerUrl))) return 'listing';
+    // Career sites often use /karriere/<job-title> URLs. Keep a specific
+    // vacancy candidate eligible when its title and URL/context indicate a
+    // detail page; processJobLink() still validates the fetched page before
+    // it can be structured or upserted.
+    if (hasCareerUrl && hasSpecificTitle && (hasDetailIndicator || hasJobText)) return 'job';
     if (hasJobText && looksLikeSpecificSlug && !isGenericJobTitle(anchorText)) return 'job';
+    if (isCategoryUrl(fullUrl)) return 'listing';
+    if (hasCareerUrl && (hasListingText || /page=\d+|seite=\d+|offset=\d+|start=\d+/i.test(lowerUrl))) return 'listing';
     if (hasCareerUrl || hasListingText) return 'listing';
     return 'ignore';
 }
