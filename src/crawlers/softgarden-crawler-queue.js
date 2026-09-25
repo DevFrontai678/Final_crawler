@@ -150,7 +150,7 @@ async function addSoftgardenCompaniesToQueue() {
 
         const { data: companies, error } = await supabase
             .from('companies')
-            .select('"Id", detected_career_url, "Name", crawl_status, last_crawled_at')
+            .select('"Id", detected_career_url, "Name", "Website", crawl_status, last_crawled_at')
             .eq('ats_type', 'softgarden')
             .neq('crawl_status', 'in_progress')
             .or(`crawl_status.eq.pending,last_crawled_at.lt.${cutoffIso}`)
@@ -174,7 +174,8 @@ async function addSoftgardenCompaniesToQueue() {
             await softgardenQueue.add('crawl-softgarden-company', {
                 companyId: company.Id,
                 companyName: company.Name,
-                careerUrl: company.detected_career_url
+                careerUrl: company.detected_career_url,
+                companyWebsiteUrl: company.Website
             }, {
                 attempts: 3,
                 backoff: { type: 'exponential', delay: 5000 },
@@ -205,12 +206,12 @@ function printProgress() {
 }
 
 const worker = new Worker(QUEUE_NAME, async job => {
-    const { companyId, companyName, careerUrl } = job.data;
+    const { companyId, companyName, careerUrl, companyWebsiteUrl } = job.data;
     const attempt = job.attemptsMade + 1;
     console.log(`\n🕸️ Processing: ${companyName} (Attempt ${attempt}/3)`);
 
     try {
-        const company = { Id: companyId, Name: companyName, detected_career_url: careerUrl };
+        const company = { Id: companyId, Name: companyName, Website: companyWebsiteUrl, detected_career_url: careerUrl };
         const result = await processSoftgardenCompany(company);
 
         if (result.error) {
@@ -240,7 +241,7 @@ const worker = new Worker(QUEUE_NAME, async job => {
             is_active: true,
             first_seen_at: new Date(),
             last_seen_at: new Date()
-        })), { companyId, companyName: company.Name, atsSource: 'softgarden' });
+        })), { companyId, companyName: company.Name, companyWebsite: company.Website, atsSource: 'softgarden' });
 
         if (jobsToSave.length > 0) {
             const { error: saveError } = await supabase

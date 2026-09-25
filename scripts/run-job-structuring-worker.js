@@ -13,6 +13,7 @@ const { Worker } = require('bullmq');
 const Redis = require('ioredis');
 const { createClient } = require('@supabase/supabase-js');
 const { structureJob } = require('../src/ai/gpt-structurer');
+const { resolveRemoteType } = require('../src/utils/job-enrichment');
 const ws = require('ws');
 
 // ─── CONFIG ─────────────────────────────────────────────────────────────
@@ -66,11 +67,31 @@ const worker = new Worker(
                 return { jobId, status: 'skipped' };
             }
 
+            // Preserve an existing centralized value. GPT's remote_type is intentionally ignored.
+            const { data: existingJob, error: existingJobError } = await supabase
+                .from('jobs')
+                .select('remote_type')
+                .eq('id', jobId)
+                .maybeSingle();
+
+            if (existingJobError) {
+                throw new Error(`Supabase remote_type fetch failed: ${existingJobError.message}`);
+            }
+
+            const existingRemoteType = existingJob?.remote_type;
+            const normalizedRemoteType = existingRemoteType == null
+                ? ''
+                : String(existingRemoteType).trim().toLowerCase();
+            const validRemoteTypes = new Set(['remote', 'hybrid', 'onsite']);
+            const resolvedRemoteType = validRemoteTypes.has(normalizedRemoteType)
+                ? existingRemoteType
+                : resolveRemoteType(raw_description);
+
             // 2. Build update object
             const updates = {
                 structured_skills: result.skills && result.skills.length > 0 ? result.skills : null,
                 seniority_level: result.seniority_level,
-                remote_type: result.remote_type,
+                remote_type: resolvedRemoteType,
                 employment_type: result.employment_type
             };
 

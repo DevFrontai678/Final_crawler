@@ -31,6 +31,7 @@ const axios = require('axios');
 const { AsyncLocalStorage } = require('async_hooks');
 const { fetchWithScraperAPI } = TEST_MODE ? { fetchWithScraperAPI: null } : require('../utils/scraperapi-config');
 const { CRAWLER_TIMEOUTS } = require('../utils/crawler-timeouts');
+const { resolveJobLocation, resolveRemoteType } = require('../utils/job-enrichment');
 require('dotenv').config();
 
 function ts() {
@@ -2272,7 +2273,7 @@ async function processJobLink(url, companyId, companyName) {
     };
 }
 
-async function processJobLink(url, companyId, companyName, signal) {
+async function processJobLink(url, companyId, companyName, signal, companyWebsiteUrl) {
     throwIfAborted(signal);
     const normalizedInputUrl = normalizeUrl(url) || url;
     if (isEnglishLanguageVariant(normalizedInputUrl)) {
@@ -2326,14 +2327,15 @@ async function processJobLink(url, companyId, companyName, signal) {
         };
     }
 
-    const location = structured.location_city || rawJob.location;
-    let lat = null;
-    let lng = null;
-    if (location) {
-        const geo = await geocodeCity(location, signal);
-        lat = geo.lat;
-        lng = geo.lng;
-    }
+    const resolvedLocation = await resolveJobLocation({
+        location: rawJob.location || structured.location_city,
+        company_website: companyWebsiteUrl,
+        location_lat: null,
+        location_lng: null
+    }, { signal });
+    const location = resolvedLocation.location;
+    const lat = resolvedLocation.location_lat;
+    const lng = resolvedLocation.location_lng;
 
     const finalTitle = structuredValidation.title;
     const rawDescription = `${finalTitle}\n\n${rawJob.rawDescription}`.trim().slice(0, 6000);
@@ -2367,7 +2369,7 @@ async function processJobLink(url, companyId, companyName, signal) {
             location: location ? String(location).slice(0, 100) : null,
             location_lat: lat,
             location_lng: lng,
-            remote_type: structured.remote_type,
+            remote_type: resolveRemoteType(rawJob.rawDescription),
             employment_type: structured.employment_type,
             skill_embedding: embedding,
             apply_url: jobPageUrl,
@@ -2428,6 +2430,7 @@ async function withTimeout(task, ms, label, onTimeout, parentSignal) {
 function createStreamingJobProcessor({
     companyId,
     companyName,
+    companyWebsiteUrl,
     signal,
     metrics,
     seen,
@@ -2446,7 +2449,7 @@ function createStreamingJobProcessor({
         let result;
         try {
             result = await withTimeout(
-                jobSignal => processJobLink(link, companyId, companyName, jobSignal),
+                jobSignal => processJobLink(link, companyId, companyName, jobSignal, companyWebsiteUrl),
                 CONFIG.JOB_TIMEOUT_MS,
                 `job ${link}`,
                 undefined,
@@ -2542,7 +2545,7 @@ function createStreamingJobProcessor({
 
 // ─── COMPANY PROCESSING ───────────────────────────────────────────────────
 async function processCompany(job) {
-    const { companyId, companyName, careerUrl } = job.data;
+    const { companyId, companyName, careerUrl, companyWebsiteUrl } = job.data;
     const startedAt = Date.now();
     logInfo('CRAWL', `Start company="${companyName}" companyId=${companyId} careerUrl=${careerUrl || 'n/a'}`);
     await markCompanyStatus(companyId, 'in_progress', { touchTimestamp: false });
@@ -2574,7 +2577,7 @@ async function processCompany(job) {
             linkIndex++;
             logInfo('JOB', `Processing ${linkIndex}/${links.length} for companyId=${companyId}`);
             const r = await withTimeout(
-                jobSignal => processJobLink(link, companyId, companyName, jobSignal),
+                jobSignal => processJobLink(link, companyId, companyName, jobSignal, companyWebsiteUrl),
                 CONFIG.JOB_TIMEOUT_MS,
                 `job`
             );
@@ -2673,6 +2676,7 @@ async function processCompany(job, signal) {
     const jobProcessor = createStreamingJobProcessor({
         companyId,
         companyName,
+        companyWebsiteUrl,
         signal,
         metrics,
         seen,

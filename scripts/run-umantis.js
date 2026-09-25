@@ -522,7 +522,7 @@ async function processUmantisCompany(company) {
 async function run() {
     const { data: companies, error } = await supabase
         .from('companies')
-        .select('"Id", "Name", detected_career_url')
+        .select('"Id", "Name", "Website", detected_career_url')
         .eq('ats_type', 'umantis')
         .eq('crawl_status', 'pending');
 
@@ -556,6 +556,7 @@ async function run() {
                     const storageJob = await enrichJobForStorage({
                         company_id: company.Id,
                         company_name: job.company_name || company.Name || null,
+                        company_website: company.Website || null,
                         external_job_id: job.external_job_id,
                         external_hash: job.external_hash,
                         title: job.title,
