@@ -853,6 +853,90 @@ function isLikelyNonCareerUrl(url) {
   );
 }
 
+// Keep career-entry classification distinct from job discovery classification.
+// These patterns intentionally describe an individual vacancy below a career
+// or jobs collection path; collection roots such as /karriere/ and
+// /karriere/jobs/ remain valid career entries.
+const CAREER_JOB_DETAIL_PATTERNS = [
+  /\/(?:career|careers|karriere)\/jobs?\/[^/?#]+(?:[/?#]|$)/i,
+  /\/(?:career|careers|karriere)\/[^/?#]+(?:[/?#]|$)/i,
+  /\/jobs?\/[^/?#]+(?:[/?#]|$)/i,
+  /\/stellenangebote?\/[^/?#]+(?:[/?#]|$)/i,
+];
+
+const CAREER_LISTING_PATH_RE =
+  /\/(?:career|careers|karriere|jobs?|stellenangebote?|offene-stellen|vacancies)(?:\/|$)/i;
+
+function isIndividualCareerJobUrl(url) {
+  if (!url || isLikelyNonCareerUrl(url)) return false;
+
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    if (!CAREER_JOB_DETAIL_PATTERNS.some(pattern => pattern.test(`${pathname}/`))) {
+      return false;
+    }
+
+    const segments = pathname.split('/').filter(Boolean);
+    const lastSegment = segments[segments.length - 1] || '';
+    // A collection root is never a detail URL. A detail slug must be specific
+    // enough to represent a vacancy rather than a generic listing section.
+    return segments.length > 0 &&
+      lastSegment.length > 0 &&
+      !/^(?:career|careers|karriere|jobs?|stellenangebote?|offene-stellen|vacancies)$/i.test(lastSegment);
+  } catch {
+    return false;
+  }
+}
+
+function isCareerListingUrl(url) {
+  if (!url || isIndividualCareerJobUrl(url)) return false;
+
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    return CAREER_LISTING_PATH_RE.test(`${pathname}/`);
+  } catch {
+    return false;
+  }
+}
+
+function canonicalCareerListingCandidates(detailUrl) {
+  if (!isIndividualCareerJobUrl(detailUrl)) return [];
+
+  try {
+    const parsed = new URL(detailUrl);
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    const markerIndex = segments.findIndex(segment =>
+      /^(?:career|careers|karriere|jobs?|stellenangebote?|offene-stellen|vacancies)$/i.test(segment)
+    );
+    if (markerIndex < 0) return [];
+
+    const prefix = segments.slice(0, markerIndex + 1);
+    const listingCandidates = [];
+    const add = candidateSegments => {
+      const candidate = new URL(parsed.origin);
+      candidate.pathname = `/${candidateSegments.join('/')}/`;
+      candidate.search = '';
+      candidate.hash = '';
+      listingCandidates.push(candidate.toString());
+    };
+
+    // Prefer the canonical career root when the detail URL is nested below
+    // /karriere/jobs/, then retain the immediate listing parent as fallback.
+    if (/^karriere$/i.test(segments[markerIndex]) &&
+        /^jobs?$/i.test(segments[markerIndex + 1] || '')) {
+      add(segments.slice(0, markerIndex + 1));
+    }
+    const hasJobsCollection = /^(?:jobs?)$/i.test(segments[markerIndex + 1] || '');
+    add(hasJobsCollection ? prefix.concat(segments[markerIndex + 1]) : prefix);
+
+    return [...new Set(listingCandidates)];
+  } catch {
+    return [];
+  }
+}
+
 function rootDomainApprox(hostname) {
   if (!hostname) return null;
   const parts = hostname.replace(/^www\./, '').split('.').filter(Boolean);
@@ -1152,6 +1236,7 @@ function scoreCareerCandidate(candidate, websiteUrl) {
   if (source === 'sitemap') score += 8;
   if (source === 'common_path') score += 5;
   if (source === 'search_result') score += 12;
+  if (source === 'derived_parent_listing' && /\/karriere\/?$/i.test(lowerUrl)) score += 100;
 
   if (/\/(?:blog|news|press|privacy|terms|contact|login|signin|register)\b/i.test(lowerUrl)) {
     score -= 50;
@@ -1566,6 +1651,7 @@ async function validateCareerCandidate(candidate, websiteUrl, workerId, signal) 
   throwIfAborted(signal);
   const candidateUrl = safeUrl(candidate.url);
   if (!candidateUrl) return null;
+  if (isIndividualCareerJobUrl(candidateUrl)) return null;
 
   try {
     const fetched = await fetchWithMetadata(candidateUrl, {
@@ -2086,11 +2172,23 @@ async function discoverFromClaudeLinks(company, websiteUrl, homepageHtml, worker
 function collectHomepageCandidates(html, homepageFinalUrl) {
   if (!html) return [];
 
-  const anchorCandidates = extractAnchors(html, homepageFinalUrl)
+  const anchors = extractAnchors(html, homepageFinalUrl);
+  const detailParentCandidates = anchors
+    .filter(item => isIndividualCareerJobUrl(item.url))
+    .flatMap(item => canonicalCareerListingCandidates(item.url).map(url => ({
+      url,
+      text: 'Career listings',
+      source: 'derived_parent_listing',
+    })));
+
+  const anchorCandidates = anchors
     .filter(item =>
+      !isIndividualCareerJobUrl(item.url) &&
       hasCareerTerm(item.text) ||
-      hasCareerTerm(item.url) ||
-      isKnownAtsUrl(item.url)
+      (!isIndividualCareerJobUrl(item.url) && (
+        hasCareerTerm(item.url) ||
+        isKnownAtsUrl(item.url)
+      ))
     )
     .map(item => ({
       ...item,
@@ -2105,11 +2203,12 @@ function collectHomepageCandidates(html, homepageFinalUrl) {
   const resourceCandidates = extractNonAnchorCareerUrlsFromHtml(
     html,
     homepageFinalUrl
-  );
+  ).filter(item => !isIndividualCareerJobUrl(item.url));
 
   return dedupeByUrl([
     ...embeddedAtsCandidates,
     ...resourceCandidates,
+    ...detailParentCandidates,
     ...anchorCandidates,
   ])
     .map(item => ({
@@ -3300,7 +3399,16 @@ async function main() {
   );
 }
 
-main().catch(err => {
-  console.error('\n❌ Fatal error:', err.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(err => {
+    console.error('\n❌ Fatal error:', err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  canonicalCareerListingCandidates,
+  collectHomepageCandidates,
+  isCareerListingUrl,
+  isIndividualCareerJobUrl,
+};
