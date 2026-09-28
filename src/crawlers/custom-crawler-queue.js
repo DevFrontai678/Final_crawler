@@ -187,8 +187,6 @@ const CONFIG = {
     MAX_PAGINATION_LINKS_PER_PAGE: parseInt(process.env.MAX_PAGINATION_LINKS_PER_PAGE || '10', 10),
     MAX_JOB_API_RESPONSES_PER_PAGE: parseInt(process.env.MAX_JOB_API_RESPONSES_PER_PAGE || '20', 10),
     MAX_JOB_API_RESPONSE_BYTES: parseInt(process.env.MAX_JOB_API_RESPONSE_BYTES || String(2 * 1024 * 1024), 10),
-    MAX_JOB_API_JOBS_PER_COMPANY: parseInt(process.env.MAX_JOB_API_JOBS_PER_COMPANY || '200', 10),
-    MAX_JOB_API_CANDIDATES_PER_RESPONSE: parseInt(process.env.MAX_JOB_API_CANDIDATES_PER_RESPONSE || '100', 10),
     MAX_JOB_API_JSON_DEPTH: parseInt(process.env.MAX_JOB_API_JSON_DEPTH || '8', 10),
     API_RESPONSE_DRAIN_TIMEOUT_MS: parseInt(process.env.API_RESPONSE_DRAIN_TIMEOUT_MS || '5000', 10),
     API_RESPONSE_QUIET_WINDOW_MS: parseInt(process.env.API_RESPONSE_QUIET_WINDOW_MS || '150', 10),
@@ -434,12 +432,19 @@ const BLOCKED_OR_RETRYABLE_STATUSES = new Set([403, 408, 409, 425, 429, 500, 502
 
 const JOB_API_URL_SIGNAL_RE = /(?:api|job|jobs|career|careers|karriere|position|positions|vacanc(?:y|ies)|requisition|stellen|stellenangebote|search|listing|openings?)/i;
 const JOB_API_CONTENT_TYPE_RE = /(?:application\/(?:json|ld\+json)|text\/json)/i;
+const HEINRICH_SCHMID_LOADJOBS_URL_RE = /(?:^|[?&])tx_hsjobs_hj3(?:%5B|\[)action(?:%5D|\])=loadjobs(?:&|$)/i;
+const JOBS_WRAPPER_RE = /<jobs\b[^>]*>([\s\S]*?)<\/jobs>/i;
 const JOB_API_TITLE_KEYS = ['title', 'jobTitle', 'position', 'positionTitle', 'jobName', 'name'];
 const JOB_API_ID_KEYS = ['jobId', 'job_id', 'requisition', 'requisitionId', 'requisition_id', 'requisitionNumber', 'jobNumber'];
 const JOB_API_URL_KEYS = ['detailUrl', 'detailURL', 'jobUrl', 'jobURL', 'url', 'jobLink', 'link', 'applyUrl', 'applyURL', 'applicationUrl'];
 const JOB_API_LOCATION_KEYS = ['location', 'jobLocation', 'locations', 'city'];
 const JOB_API_DESCRIPTION_KEYS = ['description', 'jobDescription', 'descriptionHtml'];
 const JOB_API_EMPLOYMENT_KEYS = ['employmentType', 'employment_type'];
+
+function isHeinrichSchmidLoadJobsUrl(url) {
+    return HEINRICH_SCHMID_LOADJOBS_URL_RE.test(String(url || '')) &&
+        /heinrich-schmid\.com/i.test(String(url || ''));
+}
 
 const DISCOVERY_COUNTER_KEYS = [
     'html_candidates', 'onclick_candidates', 'embedded_json_candidates',
@@ -1689,19 +1694,44 @@ function hasJobApiEvidence(record) {
         const value = record[key];
         return typeof value === 'string' || (value && typeof value === 'object' && Boolean(value.url || value.href || value.link));
     });
+    const slug = getApiFieldValue(record, ['slug']);
+    const hasSlug = Boolean(slug && /^[a-z0-9][a-z0-9._%/-]*$/i.test(slug) && !/^https?:/i.test(slug));
     const hasLocation = Boolean(getApiFieldValue(record, JOB_API_LOCATION_KEYS));
     const hasDescription = Boolean(getApiFieldValue(record, JOB_API_DESCRIPTION_KEYS));
     const hasEmployment = Boolean(getApiFieldValue(record, JOB_API_EMPLOYMENT_KEYS));
     const hasJobSpecificKey = Object.keys(record).some(key =>
         /(?:responsibilities|requirements|qualifications|department|postingDate|company|apply)/i.test(key)
     );
+    const hasHeinrichJobMetadata = hasSlug && Boolean(
+        getApiFieldValue(record, ['entry', 'activity']) ||
+        typeof record.initiativ === 'boolean'
+    );
 
-    if (!titleLooksLikeRole && !hasDescription && !hasEmployment && !hasIdentifier) return false;
+    if (!titleLooksLikeRole && !hasDescription && !hasEmployment && !hasIdentifier && !hasHeinrichJobMetadata) return false;
 
     // A generic `name` or `title` alone is intentionally insufficient. An ID
     // is also not enough by itself because CMS/navigation payloads commonly
     // contain unrelated IDs.
-    return hasIdentifier || hasUrl || hasLocation || hasDescription || hasEmployment || hasJobSpecificKey;
+    return hasIdentifier || hasUrl || hasSlug || hasLocation || hasDescription || hasEmployment || hasJobSpecificKey;
+}
+
+function normalizeHeinrichSchmidSlug(slug, responseUrl, baseUrl) {
+    if (!isHeinrichSchmidLoadJobsUrl(responseUrl)) return null;
+    const value = String(slug || '').trim();
+    if (!value || /^https?:\/\//i.test(value) || /[?#]/.test(value) || /(?:^|\/)\.\.?(?:\/|$)/.test(value)) return null;
+
+    try {
+        const origin = new URL(responseUrl || baseUrl).origin;
+        const path = value.startsWith('/') ? value : `/karriere/jobs/${value}`;
+        const candidate = new URL(path, origin);
+        if (candidate.origin !== origin || !/^\/karriere\/jobs\//i.test(candidate.pathname)) return null;
+        candidate.search = '';
+        candidate.hash = '';
+        candidate.pathname = `${candidate.pathname.replace(/\/+$/, '')}/`;
+        return candidate.href;
+    } catch {
+        return null;
+    }
 }
 
 function normalizeApiJobRecord(record, responseUrl, baseUrl) {
@@ -1711,11 +1741,13 @@ function normalizeApiJobRecord(record, responseUrl, baseUrl) {
     const url = getApiFieldValue(record, ['url']);
     const link = getApiFieldValue(record, ['jobLink', 'link']);
     const applyUrl = getApiFieldValue(record, ['applyUrl', 'applyURL', 'applicationUrl']);
-    const urlSource = detailUrl ? 'detailUrl' : jobUrl ? 'jobUrl' : url ? 'url' : link ? 'link' : applyUrl ? 'applyUrl' : null;
-    const urlCandidates = [detailUrl, jobUrl, url, link, applyUrl].filter(Boolean);
-    const normalizedUrl = urlCandidates
+    const slug = getApiFieldValue(record, ['slug']);
+    const slugUrl = normalizeHeinrichSchmidSlug(slug, responseUrl, baseUrl);
+    const urlSource = detailUrl ? 'detailUrl' : jobUrl ? 'jobUrl' : url ? 'url' : link ? 'link' : applyUrl ? 'applyUrl' : slugUrl ? 'slug' : null;
+    const explicitUrlCandidates = [detailUrl, jobUrl, url, link, applyUrl].filter(Boolean);
+    const normalizedUrl = explicitUrlCandidates
         .map(value => normalizeUrl(value, responseUrl || baseUrl) || normalizeUrl(value, baseUrl))
-        .find(Boolean) || null;
+        .find(Boolean) || slugUrl || null;
     const title = getApiFieldValue(record, JOB_API_TITLE_KEYS);
     const jobId = getApiFieldValue(record, ['jobId', 'job_id']);
     const requisitionId = getApiFieldValue(record, ['requisition', 'requisitionId', 'requisition_id', 'requisitionNumber']);
@@ -1739,6 +1771,7 @@ function normalizeApiJobRecord(record, responseUrl, baseUrl) {
         detailUrl: normalizedUrl,
         jobUrl: jobUrl ? normalizeUrl(jobUrl, responseUrl || baseUrl) : null,
         applyUrl: applyUrl ? normalizeUrl(applyUrl, responseUrl || baseUrl) : null,
+        locationCount: getApiFieldValue(record, ['count']),
         urlSource,
         isApplyOnly: urlSource === 'applyUrl',
         employmentType: getApiFieldValue(record, JOB_API_EMPLOYMENT_KEYS),
@@ -1750,7 +1783,7 @@ function normalizeApiJobRecord(record, responseUrl, baseUrl) {
 
 function extractJobCandidatesFromApiPayload(payload, responseUrl, baseUrl, options = {}) {
     const maxDepth = Math.max(0, options.maxDepth ?? CONFIG.MAX_JOB_API_JSON_DEPTH);
-    const maxCandidates = Math.max(0, options.maxCandidates ?? CONFIG.MAX_JOB_API_CANDIDATES_PER_RESPONSE);
+    const maxCandidates = Number.isFinite(options.maxCandidates) ? Math.max(0, options.maxCandidates) : Infinity;
     const candidates = [];
     const seen = new Set();
     const visited = new Set();
@@ -1781,7 +1814,10 @@ function extractJobCandidatesFromApiPayload(payload, responseUrl, baseUrl, optio
 }
 
 function isJobApiResponseMetadata({ url, status, contentType, resourceType } = {}) {
-    if (!url || !JOB_API_CONTENT_TYPE_RE.test(String(contentType || ''))) return false;
+    if (!url) return false;
+    const normalizedContentType = String(contentType || '');
+    const isWrappedHeinrichResponse = isHeinrichSchmidLoadJobsUrl(url) && /text\/html/i.test(normalizedContentType);
+    if (!JOB_API_CONTENT_TYPE_RE.test(normalizedContentType) && !isWrappedHeinrichResponse) return false;
     if (Number.isFinite(status) && (status < 200 || status >= 300)) return false;
     const type = String(resourceType || '').toLowerCase();
     return Boolean(JOB_API_URL_SIGNAL_RE.test(url) || type === 'xhr' || type === 'fetch');
@@ -1798,7 +1834,8 @@ function isPotentialJobApiResponse(response) {
         const likelyApiResponse =
             JOB_API_URL_SIGNAL_RE.test(responseUrl) ||
             ['xhr', 'fetch'].includes(String(resourceType).toLowerCase());
-        return likelyApiResponse && (!contentType || JOB_API_CONTENT_TYPE_RE.test(contentType)) &&
+        const wrappedHeinrichResponse = isHeinrichSchmidLoadJobsUrl(responseUrl) && /text\/html/i.test(contentType);
+        return likelyApiResponse && (!contentType || JOB_API_CONTENT_TYPE_RE.test(contentType) || wrappedHeinrichResponse) &&
             status >= 200 && status < 300;
     } catch {
         return false;
@@ -1810,7 +1847,9 @@ function parseJobApiResponseBody(body, maxBytes = CONFIG.MAX_JOB_API_RESPONSE_BY
     const buffer = Buffer.isBuffer(body) ? body : Buffer.from(String(body));
     if (buffer.length > maxBytes) return null;
     try {
-        return JSON.parse(buffer.toString('utf8'));
+        const text = buffer.toString('utf8').trim();
+        const wrapped = text.match(JOBS_WRAPPER_RE);
+        return JSON.parse(wrapped ? wrapped[1].trim() : text);
     } catch {
         return null;
     }
@@ -1818,13 +1857,11 @@ function parseJobApiResponseBody(body, maxBytes = CONFIG.MAX_JOB_API_RESPONSE_BY
 
 function acceptApiCandidatesForCompany(candidates, apiState) {
     const unique = [];
-    const remaining = Math.max(0, CONFIG.MAX_JOB_API_JOBS_PER_COMPANY - apiState.jobsDetected);
     for (const candidate of candidates || []) {
-        if (!remaining || !candidate?.identity || candidate.identities.some(identity => apiState.identities.has(identity))) continue;
+        if (!candidate?.identity || candidate.identities.some(identity => apiState.identities.has(identity))) continue;
         candidate.identities.forEach(identity => apiState.identities.add(identity));
         apiState.jobsDetected++;
         unique.push(candidate);
-        if (unique.length >= remaining) break;
     }
     return unique;
 }
@@ -1848,11 +1885,7 @@ async function inspectJobApiResponse(response, pageUrl, apiState, pageResponseSt
         const payload = parseJobApiResponseBody(body);
         if (payload == null) return [];
 
-        const remaining = Math.max(0, CONFIG.MAX_JOB_API_JOBS_PER_COMPANY - apiState.jobsDetected);
-        if (!remaining) return [];
-        const candidates = extractJobCandidatesFromApiPayload(payload, responseUrl, pageUrl, {
-            maxCandidates: Math.min(CONFIG.MAX_JOB_API_CANDIDATES_PER_RESPONSE, remaining)
-        });
+        const candidates = extractJobCandidatesFromApiPayload(payload, responseUrl, pageUrl);
         return acceptApiCandidatesForCompany(candidates, apiState);
     } catch (error) {
         pageResponseState.processingFailures = (pageResponseState.processingFailures || 0) + 1;
@@ -4031,6 +4064,8 @@ module.exports = {
     extractJobCandidatesFromApiPayload,
     normalizeApiJobRecord,
     hasJobApiEvidence,
+    isHeinrichSchmidLoadJobsUrl,
+    normalizeHeinrichSchmidSlug,
     isJobApiResponseMetadata,
     isPotentialJobApiResponse,
     parseJobApiResponseBody,
@@ -4038,8 +4073,6 @@ module.exports = {
     API_DISCOVERY_CONFIG: {
         MAX_JOB_API_RESPONSES_PER_PAGE: CONFIG.MAX_JOB_API_RESPONSES_PER_PAGE,
         MAX_JOB_API_RESPONSE_BYTES: CONFIG.MAX_JOB_API_RESPONSE_BYTES,
-        MAX_JOB_API_JOBS_PER_COMPANY: CONFIG.MAX_JOB_API_JOBS_PER_COMPANY,
-        MAX_JOB_API_CANDIDATES_PER_RESPONSE: CONFIG.MAX_JOB_API_CANDIDATES_PER_RESPONSE,
         MAX_JOB_API_JSON_DEPTH: CONFIG.MAX_JOB_API_JSON_DEPTH,
     },
     extractRawJobFromHtml,
