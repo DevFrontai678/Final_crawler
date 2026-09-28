@@ -434,6 +434,7 @@ const JOB_API_URL_SIGNAL_RE = /(?:api|job|jobs|career|careers|karriere|position|
 const JOB_API_CONTENT_TYPE_RE = /(?:application\/(?:json|ld\+json)|text\/json)/i;
 const HEINRICH_SCHMID_LOADJOBS_URL_RE = /(?:^|[?&])tx_hsjobs_hj3(?:%5B|\[)action(?:%5D|\])=loadjobs(?:&|$)/i;
 const JOBS_WRAPPER_RE = /<jobs\b[^>]*>([\s\S]*?)<\/jobs>/i;
+const HEINRICH_SCHMID_JOB_COLLECTION_SEGMENTS = new Set(['jobs', 'emplois', 'empleos']);
 const JOB_API_TITLE_KEYS = ['title', 'jobTitle', 'position', 'positionTitle', 'jobName', 'name'];
 const JOB_API_ID_KEYS = ['jobId', 'job_id', 'requisition', 'requisitionId', 'requisition_id', 'requisitionNumber', 'jobNumber'];
 const JOB_API_URL_KEYS = ['detailUrl', 'detailURL', 'jobUrl', 'jobURL', 'url', 'jobLink', 'link', 'applyUrl', 'applyURL', 'applicationUrl'];
@@ -444,6 +445,21 @@ const JOB_API_EMPLOYMENT_KEYS = ['employmentType', 'employment_type'];
 function isHeinrichSchmidLoadJobsUrl(url) {
     return HEINRICH_SCHMID_LOADJOBS_URL_RE.test(String(url || '')) &&
         /heinrich-schmid\.com/i.test(String(url || ''));
+}
+
+function isSafeApiSlug(slug) {
+    const value = String(slug || '').trim();
+    return Boolean(value &&
+        !/^https?:\/\//i.test(value) &&
+        !/[?#]/.test(value) &&
+        !/(?:^|\/)\.\.(?:\/|$)/.test(value) &&
+        !value.includes('//') &&
+        /^\/?[a-z0-9][a-z0-9._%/-]*$/i.test(value));
+}
+
+function isHeinrichSchmidJobPath(pathname) {
+    const segments = String(pathname || '').split('/').filter(Boolean);
+    return segments.length >= 3 && HEINRICH_SCHMID_JOB_COLLECTION_SEGMENTS.has(segments[1].toLowerCase());
 }
 
 const DISCOVERY_COUNTER_KEYS = [
@@ -1695,7 +1711,7 @@ function hasJobApiEvidence(record) {
         return typeof value === 'string' || (value && typeof value === 'object' && Boolean(value.url || value.href || value.link));
     });
     const slug = getApiFieldValue(record, ['slug']);
-    const hasSlug = Boolean(slug && /^[a-z0-9][a-z0-9._%/-]*$/i.test(slug) && !/^https?:/i.test(slug));
+    const hasSlug = isSafeApiSlug(slug);
     const hasLocation = Boolean(getApiFieldValue(record, JOB_API_LOCATION_KEYS));
     const hasDescription = Boolean(getApiFieldValue(record, JOB_API_DESCRIPTION_KEYS));
     const hasEmployment = Boolean(getApiFieldValue(record, JOB_API_EMPLOYMENT_KEYS));
@@ -1718,13 +1734,13 @@ function hasJobApiEvidence(record) {
 function normalizeHeinrichSchmidSlug(slug, responseUrl, baseUrl) {
     if (!isHeinrichSchmidLoadJobsUrl(responseUrl)) return null;
     const value = String(slug || '').trim();
-    if (!value || /^https?:\/\//i.test(value) || /[?#]/.test(value) || /(?:^|\/)\.\.?(?:\/|$)/.test(value)) return null;
+    if (!isSafeApiSlug(value)) return null;
 
     try {
         const origin = new URL(responseUrl || baseUrl).origin;
         const path = value.startsWith('/') ? value : `/karriere/jobs/${value}`;
         const candidate = new URL(path, origin);
-        if (candidate.origin !== origin || !/^\/karriere\/jobs\//i.test(candidate.pathname)) return null;
+        if (candidate.origin !== origin || !isHeinrichSchmidJobPath(candidate.pathname)) return null;
         candidate.search = '';
         candidate.hash = '';
         candidate.pathname = `${candidate.pathname.replace(/\/+$/, '')}/`;

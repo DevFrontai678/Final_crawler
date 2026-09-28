@@ -118,7 +118,7 @@ test('API fixture 11a: Heinrich Schmid wrapped HTML response yields all unique s
     for (let index = 0; index < 460; index++) {
         records[`job-${index}`] = {
             title: `Projektstelle ${index}`,
-            slug: `projektstelle-${index}`,
+            slug: `/karriere/jobs/projektstelle-${index}`,
             entry: 'Berufserfahrene',
             activity: 'Technik',
             initiativ: false,
@@ -161,6 +161,25 @@ test('API fixture 11b: Heinrich wrapped response rejects malformed JSON, missing
     }, endpoint, 'https://www.heinrich-schmid.com/karriere/');
     assert.equal(candidates.length, 1);
     assert.equal(candidates[0].detailUrl, 'https://www.heinrich-schmid.com/karriere/jobs/valid-job/');
+});
+
+test('API fixture 11e: Heinrich German and localized paths are normalized safely', () => {
+    const endpoint = 'https://www.heinrich-schmid.com/karriere/?tx_hsjobs_hj3[action]=loadjobs&tx_hsjobs_hj3[controller]=Search';
+    const baseUrl = 'https://www.heinrich-schmid.com/karriere/';
+    const records = [
+        { title: 'German job', slug: '/karriere/jobs/test-job', entry: 'Entry', activity: 'Activity' },
+        { title: 'French job', slug: '/carriere/emplois/test-job-fr', entry: 'Entry', activity: 'Activity' },
+        { title: 'Spanish job', slug: '/trabajo/empleos/test-job-es', entry: 'Entry', activity: 'Activity' },
+        { title: 'Missing slug', entry: 'Entry', activity: 'Activity' },
+        { title: 'Traversal', slug: '/../test-job', entry: 'Entry', activity: 'Activity' },
+        { title: 'External', slug: 'https://evil.example/jobs/test-job', entry: 'Entry', activity: 'Activity' }
+    ];
+    const candidates = crawler.extractJobCandidatesFromApiPayload({ records }, endpoint, baseUrl);
+    assert.deepEqual(candidates.map(candidate => candidate.detailUrl), [
+        'https://www.heinrich-schmid.com/karriere/jobs/test-job/',
+        'https://www.heinrich-schmid.com/carriere/emplois/test-job-fr/',
+        'https://www.heinrich-schmid.com/trabajo/empleos/test-job-es/'
+    ]);
 });
 
 test('API fixture 11c: random HTML is not treated as a Heinrich job API', () => {
