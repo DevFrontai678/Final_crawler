@@ -17,7 +17,7 @@ async function run() {
         .from('companies')
         .select('"Id", "Name", "Website", detected_career_url')
         .eq('ats_type', 'personio')
-        .eq('crawl_status', 'pending');
+        .in('crawl_status', ['pending', 'ats_detected']);
 
     if (error) {
         console.error('❌ Supabase error:', error.message);
@@ -109,7 +109,7 @@ async function run() {
             });
 
             await supabase.from('companies')
-                .update({ crawl_status: 'ats_detected' })
+                .update({ crawl_status: 'completed' })
                 .eq('Id', company.Id);
 
             return { status: 'success', jobs: result.jobs };

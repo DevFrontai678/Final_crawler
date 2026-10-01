@@ -23,6 +23,7 @@ const STEPS = [
     { name: 'Rexx Crawler', cmd: 'node', args: ['scripts/run-rexx.js'] },
     { name: 'SmartRecruiters Crawler', cmd: 'node', args: ['scripts/run-smartrecruiters.js'] },
     { name: 'Umantis Crawler', cmd: 'node', args: ['scripts/run-umantis.js'] },
+    { name: 'Join Crawler', cmd: 'node', args: ['scripts/run-join.js'] },
     { name: 'Job Structuring', cmd: 'node', args: ['scripts/run-job-structuring.js'] },
     { name: 'Geocoding Backfill', cmd: 'node', args: ['scripts/geocode-jobs.js'] },
     { name: 'Voyage Embeddings Backfill', cmd: 'node', args: ['scripts/run-embeddings-queue.js'] }

@@ -478,7 +478,7 @@ async function run() {
         .from('companies')
         .select('"Id", "Name", "Website", detected_career_url')
         .eq('ats_type', 'smartrecruiters')
-        .eq('crawl_status', 'pending');
+        .in('crawl_status', ['pending', 'ats_detected']);
 
     if (error) {
         console.error('❌ Supabase error:', error.message);
