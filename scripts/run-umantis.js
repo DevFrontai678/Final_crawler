@@ -6,7 +6,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
 const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
-const { enrichJobForStorage } = require('../src/utils/job-enrichment');
+const { enrichJobForStorage, preserveAuthoritativeFieldsForUpsert } = require('../src/utils/job-enrichment');
 const { runCompaniesInBatches } = require('../src/utils/company-batch-runner');
 
 const supabase = createClient(
@@ -35,13 +35,6 @@ const CONFIG = {
     DELAY_BETWEEN_COMPANIES: 500
 };
 
-// ─── Remote Type ─────────────────────────────────────────────────────────────
-function detectRemoteType(description) {
-    const text = (description || '').toLowerCase();
-    if (text.includes('remote') || text.includes('homeoffice') || text.includes('100% remote') || text.includes('full remote')) return 'remote';
-    if (text.includes('hybrid') || text.includes('teilweise remote') || text.includes('mobile work') || text.includes('flexibles arbeiten')) return 'hybrid';
-    return 'onsite';
-}
 
 // ─── Skip binary files ───────────────────────────────────────────────────────
 const SKIP_EXTENSIONS = ['.pdf','.docx','.xlsx','.zip','.rar','.ppt','.pptx','.csv','.png','.jpg','.jpeg','.gif','.svg'];
@@ -205,7 +198,7 @@ async function scrapeJobPage(url) {
         description = $('body').text()
             .split('\n').map(l => l.trim()).filter(l => l.length > 20)
             .filter(l => !/impressum|datenschutz|cookie|copyright|©|navigation|menu/i.test(l))
-            .join('\n').slice(0, 5000);
+            .join('\n');
     }
 
     if (description.length < CONFIG.MIN_DESCRIPTION_LENGTH) return null;
@@ -214,7 +207,7 @@ async function scrapeJobPage(url) {
         '.location, .office, .city, .job-location, [itemprop="jobLocation"], [class*="location"], [class*="ort"]'
     ).first().text().trim() || null;
 
-    return { title, description: description.slice(0, 5000), location };
+    return { title, description, location };
 }
 
 // ─── Deep crawl: career page + one level of sub-pages ───────────────────────
@@ -373,7 +366,7 @@ async function processUmantisCompany(company) {
                         jobs.push({
                             external_job_id: id, title: g('title') || g('name') || 'Untitled',
                             location: g('location') || g('office') || null, employment_type: null,
-                            remote_type: detectRemoteType(desc), raw_description: desc.slice(0, 5000),
+                            raw_description: desc,
                             apply_url: `https://${companySlug}.umantis.com/jobs/${id}`, ats_source: 'umantis'
                         });
                     });
@@ -388,7 +381,7 @@ async function processUmantisCompany(company) {
                     title: item.title || item.name || item.jobTitle || 'Untitled',
                     location: item.location || item.office || item.city || null,
                     employment_type: item.employmentType || item.schedule || null,
-                    remote_type: detectRemoteType(desc), raw_description: desc.slice(0, 5000),
+                    raw_description: desc,
                     apply_url: `https://${companySlug}.umantis.com/jobs/${item.id || item.jobId}`,
                     ats_source: 'umantis'
                 });
@@ -429,7 +422,7 @@ async function processUmantisCompany(company) {
                         } else if (!link) { fullUrl = `https://${companySlug}.umantis.com/jobs/${id}`; }
 
                         jobs.push({ external_job_id: id, title, location: loc, employment_type: null,
-                            remote_type: detectRemoteType(desc), raw_description: desc.slice(0, 5000),
+                            raw_description: desc,
                             apply_url: fullUrl, ats_source: 'umantis' });
                     });
                     console.log(`   ✅ Layer 2: ${jobs.length} jobs (HTML elements)`);
@@ -449,8 +442,7 @@ async function processUmantisCompany(company) {
                                         jobs.push({
                                             external_job_id: String(item.id || Math.random()),
                                             title: item.title || 'Untitled', location: item.location || null,
-                                            employment_type: null, remote_type: detectRemoteType(desc),
-                                            raw_description: desc.slice(0, 5000),
+                            employment_type: null, raw_description: desc,
                                             apply_url: `https://${companySlug}.umantis.com/jobs/${item.id}`,
                                             ats_source: 'umantis'
                                         });
@@ -498,8 +490,7 @@ async function processUmantisCompany(company) {
             const id = Buffer.from(link).toString('base64').slice(0, 50);
             jobs.push({
                 external_job_id: id, title: data.title, location: data.location,
-                employment_type: null, remote_type: detectRemoteType(data.description),
-                raw_description: data.description.slice(0, 5000),
+                employment_type: null, raw_description: data.description,
                 apply_url: link, ats_source: 'umantis'
             });
         }
@@ -562,17 +553,18 @@ async function run() {
                         title: job.title,
                         location: job.location,
                         employment_type: job.employment_type,
-                        remote_type: job.remote_type,
                         raw_description: job.raw_description,
                         apply_url: job.apply_url,
                         ats_source: 'umantis',
                         is_active: true
                     });
 
-                    const { error: insertError } = await supabase
+                    const preparedStorageJob = await preserveAuthoritativeFieldsForUpsert(supabase, storageJob);
+
+            const { error: insertError } = await supabase
                         .from('jobs')
                         .upsert({
-                            ...storageJob,
+                            ...preparedStorageJob,
                             first_seen_at: new Date(),
                             last_seen_at: new Date()
                         }, { onConflict: 'company_id,external_job_id' });

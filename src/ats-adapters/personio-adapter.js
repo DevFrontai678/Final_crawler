@@ -354,7 +354,7 @@ async function fetchPersonioJobs(slug) {
         title: title,
         location: location,
         employment_type: employmentType,
-        raw_description: description ? description.slice(0, 8000) : null,
+        raw_description: description || null,
         apply_url: `https://${slug}.jobs.personio.de/job/${id}`,
         ats_source: 'personio'
       });
@@ -394,7 +394,7 @@ async function fetchPersonioJobs(slug) {
             title: title,
             location: location,
             employment_type: employmentType,
-            raw_description: description ? description.slice(0, 8000) : null,
+            raw_description: description || null,
             apply_url: `https://${slug}.jobs.personio.de/job/${id}`,
             ats_source: 'personio'
           });
@@ -456,7 +456,7 @@ async function fetchPersonioJobs(slug) {
           title: cleanOrNull(attrs.name) || 'Untitled',
           location: location,
           employment_type: cleanOrNull(attrs.schedule),
-          raw_description: description ? description.slice(0, 8000) : null,
+          raw_description: description || null,
           apply_url: `https://${slug}.jobs.personio.de/job/${item.id}`,
           ats_source: 'personio'
         });
@@ -566,7 +566,7 @@ async function fetchPersonioJobs(slug) {
               if (!job.raw_description) {
                 const bodyText = $$('main, .job-description, [class*="description"], article').first().text();
                 job.raw_description = cleanOrNull(
-                  bodyText ? bodyText.replace(/\s+/g, ' ').trim().slice(0, 8000) : null
+                  bodyText ? bodyText.replace(/\s+/g, ' ').trim() : null
                 );
               }
 

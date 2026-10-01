@@ -2,7 +2,7 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
 const { processPersonioCompany, closePersonioBrowser } = require('../src/ats-adapters/personio-adapter');
-const { enrichJobForStorage } = require('../src/utils/job-enrichment');
+const { enrichJobForStorage, preserveAuthoritativeFieldsForUpsert } = require('../src/utils/job-enrichment');
 const { runCompaniesInBatches } = require('../src/utils/company-batch-runner');
 
 const supabase = createClient(
@@ -86,10 +86,12 @@ async function run() {
                     is_active: true
                 });
 
-                const { error: insertError } = await supabase
+                const preparedStorageJob = await preserveAuthoritativeFieldsForUpsert(supabase, storageJob);
+
+            const { error: insertError } = await supabase
                     .from('jobs')
                     .upsert({
-                        ...storageJob,
+                        ...preparedStorageJob,
                         first_seen_at: new Date(),
                         last_seen_at: new Date()
                     }, { onConflict: 'company_id,external_job_id' });

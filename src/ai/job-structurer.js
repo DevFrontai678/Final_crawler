@@ -75,11 +75,6 @@ const PATTERNS = {
         { level: 'lead', keywords: ['lead', 'team lead', 'principal', 'head of', 'bereichsleiter'] },
         { level: 'executive', keywords: ['director', 'vp', 'c-level', 'geschäftsführer', 'vorstand'] },
     ],
-    remote: [
-        { type: 'remote', keywords: ['remote', 'homeoffice', 'von zuhause', '100% remote', 'full remote'] },
-        { type: 'hybrid', keywords: ['hybrid', 'teilweise remote', 'mobile work', 'flexible'] },
-        { type: 'onsite', keywords: ['onsite', 'vor ort', 'präsenz'] },
-    ],
     employment: [
         { type: 'fulltime', keywords: ['full-time', 'full time', 'vollzeit', 'unbefristet'] },
         { type: 'parttime', keywords: ['part-time', 'part time', 'teilzeit', 'minijob'] },
@@ -197,14 +192,12 @@ async function structureJob(job) {
 
     const skills = extractSkills(fullText);
     const seniority = matchPattern(fullText, PATTERNS.seniority) || 'mid';
-    const remote = matchPattern(fullText, PATTERNS.remote) || 'onsite';
     const employment = matchPattern(fullText, PATTERNS.employment) || 'fulltime';
     const city = extractCity(fullText) || null;
 
     const result = {
         skills,
         seniority_level: seniority,
-        remote_type: remote,
         employment_type: employment,
         location_city: city,
         location_country: null,

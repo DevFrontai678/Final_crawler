@@ -6,7 +6,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
 const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
-const { enrichJobForStorage } = require('../src/utils/job-enrichment');
+const { enrichJobForStorage, preserveAuthoritativeFieldsForUpsert } = require('../src/utils/job-enrichment');
 const { runCompaniesInBatches } = require('../src/utils/company-batch-runner');
 
 const supabase = createClient(
@@ -24,17 +24,6 @@ function generateExternalHash(companyId, externalJobId) {
         .slice(0, 64);
 }
 
-// ─── Remote Type Detection ──────────────────────────────────────────────
-function detectRemoteType(description) {
-    const text = (description || '').toLowerCase();
-    if (text.includes('remote') || text.includes('homeoffice') || text.includes('100% remote') || text.includes('full remote')) {
-        return 'remote';
-    }
-    if (text.includes('hybrid') || text.includes('teilweise remote') || text.includes('mobile work') || text.includes('flexibles arbeiten')) {
-        return 'hybrid';
-    }
-    return 'onsite';
-}
 
 // ─── CUSTOM CRAWLER HELPERS (IMPROVED) ────────────────────────────────
 
@@ -180,8 +169,7 @@ async function customCrawlerScrapeJob(url) {
             .map(l => l.trim())
             .filter(l => l.length > 20)
             .filter(l => !/impressum|datenschutz|agb|cookie|footer|menu|navigation|copyright|©/.test(l))
-            .join('\n')
-            .slice(0, 5000);
+            .join('\n');
     }
     const location = $('.location, .office, .city, .job-location').first().text().trim() || null;
     return { title, description, location };
@@ -304,8 +292,7 @@ async function processRecruiteeCompany(company) {
                     title: item.title || item.name || item.jobTitle || 'Untitled',
                     location: item.location || item.office || item.city || null,
                     employment_type: item.employmentType || item.schedule || item.contract_type || null,
-                    remote_type: detectRemoteType(description),
-                    raw_description: description.slice(0, 5000),
+                    raw_description: description,
                     apply_url: `https://${companySlug}.recruitee.com/offers/${item.id || item.offerId}`,
                     ats_source: 'recruitee'
                 });
@@ -352,8 +339,7 @@ async function processRecruiteeCompany(company) {
                         title: title,
                         location: location,
                         employment_type: null,
-                        remote_type: detectRemoteType(description),
-                        raw_description: description.slice(0, 5000),
+                        raw_description: description,
                         apply_url: fullUrl,
                         ats_source: 'recruitee'
                     });
@@ -377,8 +363,7 @@ async function processRecruiteeCompany(company) {
                                             title: item.title || 'Untitled',
                                             location: item.location || null,
                                             employment_type: null,
-                                            remote_type: detectRemoteType(description),
-                                            raw_description: description.slice(0, 5000),
+                                            raw_description: description,
                                             apply_url: `https://${companySlug}.recruitee.com/offers/${item.id}`,
                                             ats_source: 'recruitee'
                                         });
@@ -437,8 +422,7 @@ async function processRecruiteeCompany(company) {
                         title: jobData.title,
                         location: jobData.location,
                         employment_type: null,
-                        remote_type: detectRemoteType(jobData.description),
-                        raw_description: jobData.description.slice(0, 5000),
+                        raw_description: jobData.description,
                         apply_url: link,
                         ats_source: 'recruitee'
                     });
@@ -512,17 +496,18 @@ async function run() {
                         title: job.title,
                         location: job.location,
                         employment_type: job.employment_type,
-                        remote_type: job.remote_type,
                         raw_description: job.raw_description,
                         apply_url: job.apply_url,
                         ats_source: 'recruitee',
                         is_active: true
                     });
 
-                    const { error: insertError } = await supabase
+                    const preparedStorageJob = await preserveAuthoritativeFieldsForUpsert(supabase, storageJob);
+
+            const { error: insertError } = await supabase
                         .from('jobs')
                         .upsert({
-                            ...storageJob,
+                            ...preparedStorageJob,
                             first_seen_at: new Date(),
                             last_seen_at: new Date()
                         }, { onConflict: 'company_id,external_job_id' });

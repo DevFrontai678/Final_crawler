@@ -6,7 +6,7 @@ const { processSoftgardenCompany, closeSoftgardenBrowser } = require('../ats-ada
 const cheerio = require('cheerio');
 const axios = require('axios');
 const { CRAWLER_TIMEOUTS } = require('../utils/crawler-timeouts');
-const { enrichJobRows } = require('../utils/job-enrichment');
+const { enrichJobRows, preserveAuthoritativeFieldsForUpsert } = require('../utils/job-enrichment');
 require('dotenv').config();
 
 // ─── BACKFILL HELPERS ──────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ async function backfillMissingJobFields(companyId) {
             }
             if (!job.raw_description || job.raw_description.length < 100) {
                 const desc = extractDescriptionGeneric(jobHtml);
-                if (desc && desc.length > 100) updates.raw_description = desc.slice(0, 5000);
+                if (desc && desc.length > 100) updates.raw_description = desc;
             }
 
             if (Object.keys(updates).length === 0) continue;
@@ -233,7 +233,7 @@ const worker = new Worker(QUEUE_NAME, async job => {
             company_id: companyId,
             external_job_id: j.external_job_id || `fallback_${Date.now()}_${index}`,
             title: j.title || 'Untitled',
-            raw_description: j.raw_description ? j.raw_description.slice(0, 5000) : null,
+            raw_description: j.raw_description || null,
             apply_url: j.apply_url || null,
             ats_source: j.ats_source || 'softgarden',
             location: j.location || null,
@@ -244,9 +244,10 @@ const worker = new Worker(QUEUE_NAME, async job => {
         })), { companyId, companyName: company.Name, companyWebsite: company.Website, atsSource: 'softgarden' });
 
         if (jobsToSave.length > 0) {
+            const preparedJobs = await Promise.all(jobsToSave.map(row => preserveAuthoritativeFieldsForUpsert(supabase, row)));
             const { error: saveError } = await supabase
                 .from('jobs')
-                .upsert(jobsToSave, {
+                .upsert(preparedJobs, {
                     onConflict: 'company_id,external_job_id',
                     ignoreDuplicates: true
                 });

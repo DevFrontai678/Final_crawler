@@ -3161,6 +3161,7 @@ function calculatePrimaryRoleCompatibility(division, candidateFamilies, jobFamil
 function isRemoteJob(remoteType) {
   const value = normalizeText(remoteType);
   if (!value) return false;
+  if (value === 'unknown') return false;
 
   return (
     value === 'remote' ||

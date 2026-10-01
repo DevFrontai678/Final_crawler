@@ -79,14 +79,12 @@ Return ONLY valid JSON:
   "skills": ["skill1", "skill2", ...],
   "seniority_level": "junior|mid|senior|lead|executive",
   "employment_type": "fulltime|parttime|contract|internship",
-  "remote_type": "remote|hybrid|onsite",
-  "location_city": "city or null"
 }
 
 Rules:
 - cleaned_title: **CRITICAL** — If original title is missing, extract the job role from the FIRST LINES of the description. Never return null, empty, or the string "null".
 - skills: Extract real skills. If description is short, infer from title. ALWAYS include at least 3 skills.
-- If seniority unclear → "mid". If remote unclear → "onsite". If employment unclear → "fulltime".
+ - If seniority unclear → "mid". If employment unclear → "fulltime".
 - Return ONLY JSON. No extra text.
 `;
 }
@@ -142,9 +140,7 @@ async function extractWithGPT(title, description) {
         return {
             skills,
             seniority_level: parsed.seniority_level || 'mid',
-            remote_type: parsed.remote_type || 'onsite',
             employment_type: parsed.employment_type || 'fulltime',
-            location_city: parsed.location_city || null,
             cleaned_title: cleanedTitle
         };
     } catch (err) {
@@ -231,9 +227,7 @@ async function structureJob(job) {
         return {
             skills: [],
             seniority_level: 'mid',
-            remote_type: 'onsite',
             employment_type: 'fulltime',
-            location_city: null,
             cleaned_title: title || extractTitleFromDescription(description)
         };
     }
@@ -248,9 +242,7 @@ async function structureJob(job) {
         result = {
             skills,
             seniority_level: 'mid',
-            remote_type: 'onsite',
             employment_type: 'fulltime',
-            location_city: null,
             cleaned_title: fallbackTitle
         };
     }

@@ -4,7 +4,7 @@ const ws = require('ws');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
-const { enrichJobForStorage } = require('../src/utils/job-enrichment');
+const { enrichJobForStorage, preserveAuthoritativeFieldsForUpsert } = require('../src/utils/job-enrichment');
 const { runCompaniesInBatches } = require('../src/utils/company-batch-runner');
 
 const supabase = createClient(
@@ -142,7 +142,7 @@ async function genericFallbackCrawl(careerPageUrl) {
         jobs.push({
             external_job_id: externalId,
             title,
-            raw_description: description.slice(0, 5000),
+            raw_description: description,
             apply_url: link,
             location: null,
             employment_type: null,
@@ -314,16 +314,18 @@ async function run() {
                     title: job.title,
                     location: job.location,
                     employment_type: job.employment_type,
-                    raw_description: job.raw_description ? job.raw_description.slice(0, 5000) : null,
+                    raw_description: job.raw_description || null,
                     apply_url: job.apply_url,
                     ats_source: result.usedFallback ? 'softgarden_fallback' : 'softgarden',
                     is_active: true
                 });
 
-                const { error: insertError } = await supabase
+                const preparedStorageJob = await preserveAuthoritativeFieldsForUpsert(supabase, storageJob);
+
+            const { error: insertError } = await supabase
                     .from('jobs')
                     .upsert({
-                        ...storageJob,
+                        ...preparedStorageJob,
                         first_seen_at: new Date(),
                         last_seen_at: new Date(),
                     }, { onConflict: 'company_id,external_job_id' });

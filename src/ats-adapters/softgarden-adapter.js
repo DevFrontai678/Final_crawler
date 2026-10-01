@@ -622,7 +622,7 @@ async function genericFallbackCrawl(careerPageUrl) {
         jobs.push({
             external_job_id: externalId,
             title,
-            raw_description: description.slice(0, 5000),
+            raw_description: description,
             apply_url: link,
             location: location,
             company_name: companyName,
@@ -699,7 +699,7 @@ async function fetchSoftgardenJobs(userId, projectId, pageId, feedMap = new Map(
                 }
             }
             if (content && content.length > 100) {
-                job.raw_description = content.slice(0, 5000);
+                job.raw_description = content;
             }
         }
 

@@ -4,12 +4,13 @@ const axios = require('axios');
 const crypto = require('crypto');
 const cheerio = require('cheerio');
 const { CRAWLER_TIMEOUTS } = require('./crawler-timeouts');
+const { classifyJobWithLLM } = require('../ai/job-classifier');
 
 const geocodeCache = new Map();
 const embeddingCache = new Map();
 let lastGeoRequestAt = 0;
 
-const LOCATION_NOT_AVAILABLE = 'Location Not Available';
+const LOCATION_UNKNOWN = 'Unknown';
 const hqLocationCache = new Map();
 const hqLocationInFlightCache = new Map();
 
@@ -21,25 +22,6 @@ function asTrimmedString(value) {
 function normalizeLocation(location) {
     const value = asTrimmedString(location);
     return value.length > 0 ? value : null;
-}
-
-function resolveRemoteType(description) {
-    const text = asTrimmedString(description).toLowerCase();
-    if (!text) return 'onsite';
-
-    const negativeRemote = /\b(?:not remote|no remote|remote(?: work)? not available|no possibility to work remotely|office only)\b/i;
-    if (negativeRemote.test(text)) return 'onsite';
-
-    // Remove technical uses of "remote" before classifying employment mode.
-    const employmentText = text.replace(/\bremote (?:monitoring|access|support|diagnostics|system|administration)\b/gi, ' ');
-    const fullyRemote = /\b(?:fully remote|full remote|100\s*%?\s*remote|remote position|work from (?:anywhere|home)|work anywhere)\b/i;
-    const hybrid = /\b(?:hybrid(?: working| work| role)?|flexible remote|partly remote|partially remote|teilweise remote|mobile work)\b/i;
-    const remote = /\bremote\b|\bhome[ -]?office\b/i;
-
-    if (fullyRemote.test(employmentText)) return 'remote';
-    if (hybrid.test(employmentText)) return 'hybrid';
-    if (remote.test(employmentText)) return 'remote';
-    return 'onsite';
 }
 
 function companyWebsiteFrom(job = {}) {
@@ -121,19 +103,23 @@ async function findCompanyHqLocation(website, { signal } = {}) {
     }
 }
 
-async function resolveJobLocation(job = {}, { signal } = {}) {
+async function resolveJobLocation(job = {}, { signal, companyHq } = {}) {
     const normalizedExisting = normalizeLocation(job.location);
-    const existing = normalizedExisting && normalizedExisting.toLowerCase() !== LOCATION_NOT_AVAILABLE.toLowerCase()
+    const existing = normalizedExisting && normalizedExisting.toLowerCase() !== LOCATION_UNKNOWN.toLowerCase()
         ? normalizedExisting
         : null;
-    const location = existing || await findCompanyHqLocation(companyWebsiteFrom(job), { signal }) || LOCATION_NOT_AVAILABLE;
-    const shouldGeocode = location !== LOCATION_NOT_AVAILABLE &&
+    const hq = companyHq === undefined
+        ? await findCompanyHqLocation(companyWebsiteFrom(job), { signal })
+        : companyHq;
+    const location = existing || hq || LOCATION_UNKNOWN;
+    const source = existing ? 'job' : (hq ? 'company_hq' : 'unavailable');
+    const shouldGeocode = location !== LOCATION_UNKNOWN &&
         (job.location_lat === null || job.location_lat === undefined || job.location_lng === null || job.location_lng === undefined);
     const geo = shouldGeocode ? await geocodeCity(location, { signal }) : {
         lat: job.location_lat ?? null,
         lng: job.location_lng ?? null
     };
-    return { location, location_lat: geo.lat, location_lng: geo.lng };
+    return { location, location_lat: geo.lat, location_lng: geo.lng, source };
 }
 
 function buildEmbeddingText(job = {}) {
@@ -157,7 +143,7 @@ function buildEmbeddingText(job = {}) {
     }
 
     if (rawDescription) {
-        parts.push(`Description: ${rawDescription.slice(0, 12000)}`);
+        parts.push(`Description: ${rawDescription}`);
     }
 
     return parts.join('\n').trim();
@@ -246,11 +232,48 @@ async function enrichJobForStorage(job = {}) {
     };
 
     row.raw_description = asTrimmedString(row.raw_description || row.description) || null;
-    const resolvedLocation = await resolveJobLocation(row);
+    const companyHq = await findCompanyHqLocation(companyWebsiteFrom(row));
+    const classification = await classifyJobWithLLM({
+        ...row,
+        classification_description: row.classification_description || row.raw_description || row.description || null,
+        source_url: row.source_url || row.apply_url || row.url || null,
+        crawler_location: row.location || null,
+        structured_location: row.structured_location || null,
+        company_hq: companyHq
+    });
+
+    if (classification.ok) {
+        row.remote_type = classification.data.remote_type;
+        row.location = classification.data.job_location;
+        row.location_city = classification.data.location_city;
+        row.location_country = classification.data.location_country;
+        row._classification_source = 'llm';
+    } else {
+        // Never use a keyword or heuristic classifier after an LLM failure.
+        // Preserve a valid crawler location for fallback before using company HQ.
+        row.remote_type = 'unknown';
+        row._classification_source = 'failed';
+        row.location = normalizeLocation(row.location);
+    }
+
+    const resolvedLocation = await resolveJobLocation(row, { companyHq });
     row.location = resolvedLocation.location;
     row.location_lat = resolvedLocation.location_lat;
     row.location_lng = resolvedLocation.location_lng;
-    row.remote_type = resolveRemoteType(row.raw_description);
+    row._location_source = classification.ok && classification.data.job_location
+        ? 'llm'
+        : resolvedLocation.source;
+
+    if (!classification.ok || !classification.data.job_location) {
+        console.log(
+            '[LOCATION FALLBACK] company=' + (row.company_name || 'unknown') +
+            ' external_job_id=' + (row.external_job_id || 'unknown') +
+            ' reason=no_job_location' +
+            ' fallback=' + (resolvedLocation.source === 'company_hq' ? 'company_hq' : 'unavailable') +
+            ' location=' + (row.location || LOCATION_UNKNOWN)
+        );
+    }
+
     const needsEmbedding = !row.skill_embedding;
 
     const embedding = needsEmbedding ? await embedWithVoyage(buildEmbeddingText(row)) : null;
@@ -260,6 +283,48 @@ async function enrichJobForStorage(job = {}) {
     }
 
     return row;
+}
+
+async function preserveAuthoritativeFieldsForUpsert(supabase, row = {}) {
+    const cleanRow = { ...row };
+    const classificationSource = cleanRow._classification_source;
+    const locationSource = cleanRow._location_source;
+    delete cleanRow._classification_source;
+    delete cleanRow._location_source;
+    delete cleanRow.classification_description;
+    delete cleanRow.location_city;
+    delete cleanRow.location_country;
+
+    const { data: existing, error } = await supabase
+        .from('jobs')
+        .select('remote_type, location, location_lat, location_lng')
+        .eq('company_id', cleanRow.company_id)
+        .eq('external_job_id', cleanRow.external_job_id)
+        .maybeSingle();
+
+    if (error) {
+        throw new Error('Existing job authority lookup failed: ' + error.message);
+    }
+
+    const existingRemote = existing?.remote_type;
+    const existingLocation = normalizeLocation(existing?.location);
+    const existingRemoteIsValid = ['remote', 'hybrid', 'onsite', 'unknown'].includes(
+        String(existingRemote || '').trim().toLowerCase()
+    );
+    const existingLocationIsAuthoritative = existingLocation &&
+        existingLocation.toLowerCase() !== LOCATION_UNKNOWN.toLowerCase();
+
+    if (classificationSource !== 'llm' && existingRemoteIsValid) {
+        cleanRow.remote_type = existingRemote;
+    }
+
+    if (locationSource !== 'llm' && existingLocationIsAuthoritative) {
+        cleanRow.location = existing.location;
+        cleanRow.location_lat = existing.location_lat ?? null;
+        cleanRow.location_lng = existing.location_lng ?? null;
+    }
+
+    return cleanRow;
 }
 
 async function enrichJobRows(rows, options = {}) {
@@ -284,8 +349,8 @@ module.exports = {
     enrichJobForStorage,
     enrichJobRows,
     geocodeCity,
-    resolveRemoteType,
+    preserveAuthoritativeFieldsForUpsert,
     resolveJobLocation,
     findCompanyHqLocation,
-    LOCATION_NOT_AVAILABLE
+    LOCATION_UNKNOWN
 };

@@ -23,7 +23,6 @@ const { Queue, Worker } = ENABLE_RUNTIME ? require('bullmq') : { Queue: null, Wo
 const Redis = ENABLE_RUNTIME ? require('ioredis') : null;
 const { chromium } = TEST_MODE ? { chromium: null } : require('playwright');
 const { createClient } = ENABLE_RUNTIME ? require('@supabase/supabase-js') : { createClient: null };
-const OpenAI = ENABLE_RUNTIME ? require('openai') : null;
 const ws = ENABLE_RUNTIME ? require('ws') : null;
 const cheerio = require('cheerio');
 const crypto = require('crypto');
@@ -31,7 +30,8 @@ const axios = require('axios');
 const { AsyncLocalStorage } = require('async_hooks');
 const { fetchWithScraperAPI } = TEST_MODE ? { fetchWithScraperAPI: null } : require('../utils/scraperapi-config');
 const { CRAWLER_TIMEOUTS } = require('../utils/crawler-timeouts');
-const { resolveJobLocation, resolveRemoteType } = require('../utils/job-enrichment');
+const { resolveJobLocation, findCompanyHqLocation, preserveAuthoritativeFieldsForUpsert } = require('../utils/job-enrichment');
+const { classifyJobWithLLM } = require('../ai/job-classifier');
 require('dotenv').config();
 
 function ts() {
@@ -773,8 +773,7 @@ const redisConnection = ENABLE_RUNTIME ? new Redis({
     maxRetriesPerRequest: null
 }) : null;
 
-const openai = ENABLE_RUNTIME ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
-if (ENABLE_RUNTIME) logInfo('OPENAI', `Client initialized (${CONFIG.GPT_MODEL})`);
+
 
 const customCrawlQueue = ENABLE_RUNTIME ? new Queue(QUEUE_NAME, { connection: redisConnection }) : null;
 const CRAWLER_INSTANCE_LOCK_KEY = `bull:${QUEUE_NAME}:crawler-instance-lock`;
@@ -2802,7 +2801,7 @@ function cleanDescription(text) {
     if (!text) return null;
     text = text.replace(/\s+/g, ' ').trim().replace(/^[\s\-:]+/, '');
     if (text.split(/\s+/).length < 50 || text.length < 300) return null;
-    return text.slice(0, 6000);
+    return text;
 }
 
 function extractJsonLdJobPostings($) {
@@ -2960,85 +2959,18 @@ async function structureJobWithGPT(rawJobOrTitle, maybeDescription, signal) {
     const rawJob = typeof rawJobOrTitle === 'object'
         ? rawJobOrTitle
         : { title: rawJobOrTitle, rawDescription: maybeDescription };
-    const title = rawJob.title || '';
-    const description = rawJob.rawDescription || maybeDescription || '';
-    const divisionList = Object.keys(DIVISIONS).join(', ');
-    const divisionKeywords = Object.entries(DIVISIONS)
-        .map(([d, kws]) => `• ${d}: ${kws.slice(0, 25).join(', ')}`)
-        .join('\n');
-
-    const prompt = `You are an expert HR data analyst. Structure ONLY the source job posting below.
-
-Source URL: ${rawJob.canonicalUrl || rawJob.url || 'MISSING'}
-Company: ${rawJob.companyName || 'MISSING'}
-Candidate title from page: ${title || 'MISSING'}
-Raw page content:
-${(description || '').slice(0, 7000)}
-
-Return ONLY valid JSON:
-{
-  "is_job": true|false,
-  "reason": "if is_job=false, brief reason",
-  "is_relevant": true|false,
-  "relevance_reason": "if is_relevant=false, why",
-  "division": "IT Consulting" | "Business (Finance & Legal)" | "Engineering (Construction)" | null,
-  "cleaned_title": "actual position title or null",
-  "skills": ["skill1", ...],
-  "seniority_level": "junior|mid|senior|lead|executive|null",
-  "employment_type": "fulltime|parttime|contract|internship|apprenticeship|null",
-  "remote_type": "remote|hybrid|onsite|null",
-  "location_city": "city or null"
-}
-
-RULES:
-1. is_job = FALSE if this is: navigation/category page, legal page (datenschutz/impressum/agb/cookie), marketing page, company culture page, product page, error page, or contains no actual job description.
-2. division = the closest matching division name, or null.
-3. cleaned_title: clean job role. Remove (m/w/d), (w/m/d), gender tags, location, company name.
-4. Do not use category labels, department names, marketing headings, product names, or career-page labels as a title.
-5. skills: only skills stated or strongly supported by this source text. Do not invent filler skills.
-6. If seniority, remote type, employment type, location, or skills are not present, return null or [].
-7. Return ONLY JSON.`;
-
-    try {
-        const res = await openai.chat.completions.create({
-            model: CONFIG.GPT_MODEL,
-            messages: [
-                { role: 'system', content: 'Precise job data extractor. Return only valid JSON.' },
-                { role: 'user', content: prompt }
-            ],
-            temperature: 0,
-            max_tokens: 700,
-            response_format: { type: 'json_object' }
-        }, { signal });
-        const content = res.choices[0]?.message?.content?.trim() || '';
-        const p = JSON.parse(content);
-
-        const blacklist = ['professional experience', 'general professional skills',
-            'team player', 'communication', 'problem solving', 'teamwork',
-            'collaboration', 'leadership', 'time management', 'flexibility', 'adaptability'];
-        const skills = (Array.isArray(p.skills) ? p.skills : [])
-            .map(s => String(s).trim())
-            .filter(s => s.length > 1 && !blacklist.includes(s.toLowerCase()))
-            .slice(0, 15);
-
-        return {
-            is_job: p.is_job !== false,
-            reason: p.reason || null,
-            is_relevant: p.is_relevant === true,
-            relevance_reason: p.relevance_reason || null,
-            division: p.division || null,
-            cleaned_title: p.cleaned_title || null,
-            skills,
-            seniority_level: p.seniority_level || null,
-            employment_type: p.employment_type || null,
-            remote_type: p.remote_type || null,
-            location_city: p.location_city || null
-        };
-    } catch (err) {
-        throwIfAborted(signal);
-        console.warn(`⚠️ GPT error: ${err.message}`);
-        return null;
-    }
+    const result = await classifyJobWithLLM({
+        company_name: rawJob.companyName,
+        title: rawJob.title || '',
+        raw_description: rawJob.rawDescription || maybeDescription || '',
+        source_url: rawJob.canonicalUrl || rawJob.url || null,
+        crawler_location: rawJob.location || null,
+        structured_location: rawJob.structuredLocation || null,
+        company_hq: rawJob.companyHq || await findCompanyHqLocation(rawJob.companyWebsiteUrl, { signal }),
+        model: CONFIG.GPT_MODEL
+    }, { signal });
+    if (!result.ok) return null;
+    return result.data;
 }
 
 // ─── GEOCODING ────────────────────────────────────────────────────────────
@@ -3129,7 +3061,8 @@ async function batchInsertJobs(rows) {
     let inserted = 0;
     for (let i = 0; i < rows.length; i += CONFIG.BATCH_INSERT_SIZE) {
         const batch = rows.slice(i, i + CONFIG.BATCH_INSERT_SIZE);
-        const { error } = await supabase.from('jobs').upsert(batch, {
+        const preparedBatch = await Promise.all(batch.map(row => preserveAuthoritativeFieldsForUpsert(supabase, row)));
+        const { error } = await supabase.from('jobs').upsert(preparedBatch, {
             onConflict: 'company_id,external_job_id',
             ignoreDuplicates: false
         });
@@ -3172,81 +3105,6 @@ async function getActiveJobCount(companyId) {
 }
 
 // ─── PER-JOB PIPELINE ─────────────────────────────────────────────────────
-async function processJobLink(url, companyId, companyName) {
-    // 1. Fetch
-    let html = null, pdfText = '';
-    if (isPdfUrl(url)) {
-        pdfText = await downloadAndParsePDF(url) || '';
-    } else {
-        const r = await fetchPageWithFallback(url, { waitForSelector: 'body' });
-        if (r) html = r.html;
-        if (!html && !pdfText) return { skip: true, reason: 'fetch_failed' };
-    }
-
-    // 2. Extract
-    let title, description, location, applyUrl;
-    if (pdfText) {
-        const lines = pdfText.split('\n').filter(l => l.trim().length > 20);
-        title = lines[0]?.trim().slice(0, 255) || 'PDF Job';
-        description = pdfText.slice(0, 6000);
-        if (!description || description.length < 200) return { skip: true, reason: 'short_pdf' };
-        location = null;
-        applyUrl = url;
-    } else {
-        const $ = cheerio.load(html);
-        const container = findJobContainer($);
-        if (!container || container.text().length < 200) return { skip: true, reason: 'no_container' };
-        title = extractJobTitleFromContainer(container, $);
-        if (!title || title.length < 5) return { skip: true, reason: 'no_title' };
-        description = extractDescriptionFromHTML(html);
-        if (!description || description.length < 300) return { skip: true, reason: 'short_desc' };
-        location = extractLocationFromContainer(container, $);
-        applyUrl = extractApplyUrlFromPage($, url);
-    }
-
-    // 3. GPT: validate + relevance + structure
-    const s = await structureJobWithGPT(title, description);
-    if (!s) return { skip: true, reason: 'gpt_failed' };
-    if (!s.is_job) {
-        logInfo('JOB', `SKIP not a job: "${title}" (${s.reason || 'rejected'})`);
-        return { skip: true, reason: 'not_a_job' };
-    }
-    // 4. Geocode
-    let lat = null, lng = null;
-    if (location) {
-        const g = await geocodeCity(location);
-        lat = g.lat; lng = g.lng;
-    }
-
-    // 5. Embed
-    const rawDescription = `${s.cleaned_title}\n\n${description}`.trim().slice(0, 6000);
-    const embedding = await embedWithVoyage(rawDescription);
-
-    // 6. Return row
-    return {
-        skip: false,
-        row: {
-            company_id: companyId,
-            external_job_id: generateExternalJobId(url),
-            title: s.cleaned_title.slice(0, 255),
-            raw_description: rawDescription,
-            structured_skills: s.skills.length > 0 ? s.skills : null,
-            seniority_level: s.seniority_level,
-            location: location ? location.slice(0, 100) : null,
-            location_lat: lat,
-            location_lng: lng,
-            remote_type: s.remote_type,
-            employment_type: s.employment_type,
-            skill_embedding: embedding,
-            apply_url: applyUrl,
-            company_name: companyName.slice(0, 100),
-            is_active: true,
-            first_seen_at: new Date().toISOString(),
-            last_seen_at: new Date().toISOString()
-        }
-    };
-}
-
 async function processJobLink(url, companyId, companyName, signal, companyWebsiteUrl) {
     throwIfAborted(signal);
     const normalizedInputUrl = normalizeUrl(url) || url;
@@ -3279,6 +3137,7 @@ async function processJobLink(url, companyId, companyName, signal, companyWebsit
     throwIfAborted(signal);
     rawJob.url = finalUrl;
     rawJob.companyName = companyName;
+    rawJob.companyWebsiteUrl = companyWebsiteUrl;
 
     if (!rawJob.valid) {
         return {
@@ -3302,7 +3161,7 @@ async function processJobLink(url, companyId, companyName, signal, companyWebsit
     }
 
     const resolvedLocation = await resolveJobLocation({
-        location: rawJob.location || structured.location_city,
+        location: structured.job_location,
         company_website: companyWebsiteUrl,
         location_lat: null,
         location_lng: null
@@ -3340,10 +3199,12 @@ async function processJobLink(url, companyId, companyName, signal, companyWebsit
             raw_description: rawDescription,
             structured_skills: Array.isArray(structured.skills) && structured.skills.length > 0 ? structured.skills : null,
             seniority_level: structured.seniority_level,
-            location: location ? String(location).slice(0, 100) : null,
+            location: location ? String(location) : null,
             location_lat: lat,
             location_lng: lng,
-            remote_type: resolveRemoteType(rawJob.rawDescription),
+            remote_type: structured.remote_type,
+            _classification_source: 'llm',
+            _location_source: structured.job_location ? 'llm' : resolvedLocation.source,
             employment_type: structured.employment_type,
             skill_embedding: embedding,
             apply_url: jobPageUrl,
