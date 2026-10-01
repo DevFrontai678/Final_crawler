@@ -165,6 +165,22 @@ async function discoverImpressumUrls(website, { signal } = {}) {
     base.hash = ''; base.search = '';
     const origin = base.origin;
     const urls = new Set(candidateWebsiteUrls(base.toString()));
+    try {
+        const homepage = await axios.get(base.toString(), {
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
+            maxRedirects: 5,
+            signal,
+            headers: { 'User-Agent': process.env.CRAWLER_USER_AGENT || 'customer-matching-crawler/1.0' }
+        });
+        const $ = cheerio.load(String(homepage.data || ''));
+        $('a[href]').each((_, element) => {
+            const href = absoluteUrl($(element).attr('href'), base.toString());
+            const text = `${$(element).text()} ${href || ''}`;
+            if (href && /impressum|imprint|legal[- ]?notice|mentions[- ]?legales|aviso[- ]?legal|colophon|rechtlich|company information|corporate information/i.test(text)) {
+                urls.add(href);
+            }
+        });
+    } catch { /* homepage link discovery is optional */ }
     const sitemapQueue = [`${origin}/robots.txt`, `${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`];
     const visited = new Set();
     let sitemapCount = 0;
@@ -202,59 +218,172 @@ async function discoverImpressumUrls(website, { signal } = {}) {
     return [...urls].filter(url => /impressum|imprint|legal|rechtlich|mentions-legales|legal-notice|aviso-legal|colophon/i.test(url));
 }
 
-function extractCompanyLocationFromHtml(html) {
+const HQ_LABEL_PATTERN = /\b(?:sitz|geschäftssitz|unternehmenssitz|geschäftsanschrift|anschrift|adresse|registered office|headquarters?|company address)\b/i;
+const HQ_NEGATIVE_PATTERN = /\b(?:supervisory board|aufsichtsrat|vorstand|legal form|rechtsform|register court|registergericht|registration number|handelsregister|tax(?:\s+id| number)|ust\.?|steuer|telefon|phone|fax|email|e-mail)\b/i;
+
+function cleanAddressText(value) {
+    return asTrimmedString(value)
+        .replace(/\s+/g, ' ')
+        .replace(/[|]+/g, ' ')
+        .replace(/\s+(?:telefon|tel\.?|phone|fax|email|e-mail|www\.?)\b.*$/i, '')
+        .replace(/[;,]+$/, '')
+        .trim();
+}
+
+function addressHasPostalCode(value) {
+    return /\b\d{4,6}\s+[A-ZÄÖÜÀ-ÖØ-Þ][A-Za-zÄÖÜÀ-öø-ÿ' .-]{2,80}\b/.test(value);
+}
+
+function addressHasStreetAndNumber(value) {
+    return /\b[A-ZÄÖÜÀ-ÖØ-Þ][A-Za-zÄÖÜÀ-öø-ÿ' .-]{2,70}\s+\d+[A-Za-z]?\b/.test(value) ||
+        /\b\d+[A-Za-z]?\s+[A-ZÄÖÜÀ-ÖØ-Þ][A-Za-zÄÖÜÀ-öø-ÿ' .-]{2,70}\b/.test(value);
+}
+
+function validatePostalAddress(value, { structured = false, structuredLocality = false } = {}) {
+    const candidate = cleanAddressText(value);
+    if (!candidate || candidate.length < 5 || candidate.length > 400) return null;
+    if (HQ_NEGATIVE_PATTERN.test(candidate)) return null;
+    const postal = addressHasPostalCode(candidate);
+    const street = addressHasStreetAndNumber(candidate);
+    const locality = structuredLocality || /\b(?:city|locality|ort|stadt|town)\s*[:\-]/i.test(candidate);
+    if (!postal && !(structured && street && locality)) return null;
+    if (!street && !postal) return null;
+    if (!postal && structured && !locality) return null;
+    return candidate;
+}
+
+function addressObjectToCandidate(address) {
+    if (!address || typeof address !== 'object' || Array.isArray(address)) return null;
+    const street = address.streetAddress || address.street || '';
+    const postal = address.postalCode || address.zip || '';
+    const locality = address.addressLocality || address.city || '';
+    const region = address.addressRegion || address.region || '';
+    const country = typeof address.addressCountry === 'object'
+        ? (address.addressCountry.name || address.addressCountry.value || '')
+        : (address.addressCountry || address.country || '');
+    const parts = [street, [postal, locality].filter(Boolean).join(' '), region, country]
+        .map(cleanAddressText)
+        .filter(Boolean);
+    return parts.length > 0
+        ? validatePostalAddress(parts.join(', '), { structured: true, structuredLocality: Boolean(locality) })
+        : null;
+}
+
+function collectJsonLdAddresses(value, output = []) {
+    if (!value || typeof value !== 'object') return output;
+    if (Array.isArray(value)) {
+        value.forEach(item => collectJsonLdAddresses(item, output));
+        return output;
+    }
+    if (value.address && typeof value.address === 'object') {
+        const candidate = addressObjectToCandidate(value.address);
+        if (candidate) output.push({ value: candidate, source: 'json_ld', score: 100 });
+    }
+    if (String(value['@type'] || '').toLowerCase().includes('postaladdress')) {
+        const candidate = addressObjectToCandidate(value);
+        if (candidate) output.push({ value: candidate, source: 'json_ld', score: 105 });
+    }
+    Object.values(value).forEach(child => collectJsonLdAddresses(child, output));
+    return output;
+}
+
+function extractJsonLdAddressCandidates($) {
+    const candidates = [];
+    $('script[type="application/ld+json"]').each((_, element) => {
+        try {
+            const parsed = JSON.parse($(element).contents().text().trim());
+            collectJsonLdAddresses(parsed, candidates);
+        } catch { /* malformed JSON-LD is ignored */ }
+    });
+    return candidates;
+}
+
+function extractMicrodataAddressCandidates($) {
+    const candidates = [];
+    $('[itemprop="address"]').each((_, element) => {
+        const root = $(element);
+        const fields = {};
+        root.find('[itemprop]').addBack('[itemprop]').each((__, field) => {
+            const key = $(field).attr('itemprop');
+            if (key && !fields[key]) fields[key] = $(field).attr('content') || $(field).text();
+        });
+        const candidate = addressObjectToCandidate(fields) || validatePostalAddress(root.text());
+        if (candidate) candidates.push({ value: candidate, source: 'microdata', score: 90 });
+    });
+    const rdfa = $('[property="streetAddress"], [property="schema:streetAddress"]');
+    if (rdfa.length > 0) {
+        const fields = {};
+        rdfa.add('[property="postalCode"], [property="schema:postalCode"], [property="addressLocality"], [property="schema:addressLocality"], [property="addressCountry"], [property="schema:addressCountry"]').each((_, field) => {
+            const property = ($(field).attr('property') || '').split(':').pop();
+            fields[property] = $(field).attr('content') || $(field).text();
+        });
+        const candidate = addressObjectToCandidate(fields);
+        if (candidate) candidates.push({ value: candidate, source: 'rdfa', score: 88 });
+    }
+    return candidates;
+}
+
+function extractAddressElementCandidates($) {
+    const candidates = [];
+    $('address').each((_, element) => {
+        const root = $(element);
+        const clone = root.clone();
+        clone.find('br').replaceWith(' ');
+        const text = cleanAddressText(clone.text());
+        const contextRoot = root.closest('section, article, main, div').first();
+        const contextText = cleanAddressText(String(contextRoot.html() || '').replace(/<[^>]+>/g, ' '));
+        const context = `${contextText} ${root.parent().text()} ${root.attr('class') || ''} ${root.attr('id') || ''}`;
+        const candidate = validatePostalAddress(text);
+        if (candidate) candidates.push({
+            value: candidate,
+            source: 'address_element',
+            score: 70 + (HQ_LABEL_PATTERN.test(context) ? 25 : 0) - (HQ_NEGATIVE_PATTERN.test(context) ? 50 : 0)
+        });
+    });
+    return candidates;
+}
+
+function extractLabelledAddressCandidates($) {
+    const candidates = [];
+    $('main, section, article, div, p, li, footer').each((_, element) => {
+        const root = $(element);
+        const text = cleanAddressText(root.text());
+        if (!HQ_LABEL_PATTERN.test(text) || text.length > 800) return;
+        const labelled = text.match(/(?:sitz|geschäftssitz|unternehmenssitz|geschäftsanschrift|anschrift|adresse|registered office|headquarters?|company address)\s*[:\-]?\s*(.{5,300}?)(?=\b(?:supervisory board|aufsichtsrat|vorstand|legal form|rechtsform|register court|registergericht|registration number|handelsregister|tax(?:\s+id| number)|ust\.?|steuer|telefon|phone|fax|email|e-mail)\b|$)/i);
+        const labelledText = labelled ? labelled[1] : text;
+        const candidate = validatePostalAddress(labelledText);
+        if (candidate) candidates.push({
+            value: candidate,
+            source: 'labelled_block',
+            score: 60 + (/\b(?:headquarters?|registered office|company address|unternehmenssitz|geschäftsanschrift|geschäftssitz)\b/i.test(text) ? 25 : 0)
+        });
+    });
+    return candidates;
+}
+
+function extractLegalCompanyAddressEvidence(html) {
     if (!html) return null;
     const $ = cheerio.load(html);
-    const fragments = [];
-    $('address, [itemprop="address"], footer, .address, [class*="address"], [class*="impressum"], [class*="contact"]').each((_, el) => {
-        const text = $(el).text().replace(/\s+/g, ' ').trim();
-        if (text) fragments.push(text);
-    });
-    fragments.push($('body').text().replace(/\s+/g, ' ').trim());
-
-    for (const fragment of fragments) {
-        const postal = fragment.match(/\b\d{4,5}\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß' -]{2,60}/);
-        if (postal) return postal[0].trim().replace(/[.,;]+$/, '');
-
-        const labelled = fragment.match(/(?:address|adresse|standort|location|sitz|headquarters?)\s*[:\-]\s*([^|]{2,100})/i);
-        if (labelled) return labelled[1].trim().replace(/[.,;]+$/, '');
+    const candidates = [
+        ...extractJsonLdAddressCandidates($),
+        ...extractMicrodataAddressCandidates($),
+        ...extractAddressElementCandidates($),
+        ...extractLabelledAddressCandidates($)
+    ];
+    const grouped = new Map();
+    for (const candidate of candidates) {
+        const key = candidate.value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+        const previous = grouped.get(key);
+        if (!previous || candidate.score > previous.score) grouped.set(key, candidate);
     }
-    return null;
+    const ranked = [...grouped.values()].sort((a, b) => b.score - a.score);
+    if (ranked.length === 0) return null;
+    if (ranked.length > 1 && ranked[0].score === ranked[1].score && ranked[0].value.toLowerCase() !== ranked[1].value.toLowerCase()) return null;
+    return ranked[0];
 }
 
 function extractLegalCompanyAddress(html) {
-    if (!html) return null;
-    const $ = cheerio.load(html);
-    const fragments = [];
-    $('address, [itemprop="address"], [class*="impressum"], [id*="impressum"], [class*="legal"], footer').each((_, el) => {
-        const text = $(el).text().replace(/\s+/g, ' ').trim();
-        if (text) fragments.push(text);
-    });
-    fragments.push($('body').text().replace(/\s+/g, ' ').trim());
-    const priority = fragments.sort((a, b) => {
-        const score = value => (/(?:sitz|headquarters?|registered office|company address|geschäftssitz|unternehmenssitz|hauptsitz)/i.test(value) ? 4 : 0) +
-            (/(?:impressum|imprint|anbieter|company information)/i.test(value) ? 2 : 0);
-        return score(b) - score(a);
-    });
-    for (const fragment of priority) {
-        const labelledHq = fragment.match(/(?:sitz|headquarters?|registered office|company address|geschäftssitz|unternehmenssitz|hauptsitz)\s*[:\-]?\s*([^|]{2,180})/i);
-        if (labelledHq) {
-            const postalInLabel = labelledHq[1].match(/\b\d{4,5}\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß' .-]{2,80}/);
-            if (postalInLabel) return postalInLabel[0].trim()
-                .replace(/\s+(?:telefon|tel\.?|phone|email|e-mail|fax|www\.?|vertreten|register|ust\.?|hrb)\b.*$/i, '')
-                .replace(/[.,;]+$/, '');
-            if (labelledHq[1].trim()) return labelledHq[1].trim().replace(/[.,;]+$/, '');
-        }
-        const postal = fragment.match(/\b\d{4,5}\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß' .-]{2,80}/);
-        if (postal) {
-            return postal[0].trim()
-                .replace(/\s+(?:telefon|tel\.?|phone|email|e-mail|fax|www\.?|vertreten|register|ust\.?|hrb)\b.*$/i, '')
-                .replace(/[.,;]+$/, '');
-        }
-        const labelled = fragment.match(/(?:sitz|headquarters?|registered office|company address|geschäftssitz|unternehmenssitz|hauptsitz|adresse|address)\s*[:\-]\s*([^|]{2,140})/i);
-        if (labelled) return labelled[1].trim().replace(/[.,;]+$/, '');
-    }
-    return null;
+    return extractLegalCompanyAddressEvidence(html)?.value || null;
 }
 
 async function findCompanyHqLocation(website, { signal } = {}) {
@@ -547,6 +676,7 @@ module.exports = {
     hasHybridEmploymentEvidence,
     hasExplicitFullRemoteEvidence,
     discoverImpressumUrls,
+    extractLegalCompanyAddressEvidence,
     extractLegalCompanyAddress,
     LOCATION_UNKNOWN
 };
