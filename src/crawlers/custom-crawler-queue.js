@@ -32,6 +32,14 @@ const { fetchWithScraperAPI } = TEST_MODE ? { fetchWithScraperAPI: null } : requ
 const { CRAWLER_TIMEOUTS } = require('../utils/crawler-timeouts');
 const { resolveJobLocation, findCompanyHqLocation, preserveAuthoritativeFieldsForUpsert } = require('../utils/job-enrichment');
 const { classifyJobWithLLM } = require('../ai/job-classifier');
+const {
+    createDiscoveryState,
+    fingerprint: discoveryFingerprint,
+    validateJobCandidate: validateGenericJobCandidate,
+    semanticInteractionScore,
+    extractContinuationUrls,
+    extractContinuationRequests
+} = require('./generic-discovery-engine');
 require('dotenv').config();
 
 function ts() {
@@ -174,16 +182,16 @@ const CONFIG = {
     RATE_LIMIT_DURATION_MS: parseInt(process.env.CRAWLER_RATE_LIMIT_DURATION_MS || '1000', 10),
     BATCH_INSERT_SIZE: 50,
     LOAD_MORE_MAX_CLICKS: 50,
-    AUTO_SCROLL_MAX_STEPS: 15,
+    AUTO_SCROLL_MAX_STEPS: parseInt(process.env.AUTO_SCROLL_MAX_STEPS || '100', 10),
     MAX_ONCLICK_CANDIDATES_PER_PAGE: parseInt(process.env.MAX_ONCLICK_CANDIDATES_PER_PAGE || '100', 10),
     MAX_EMBEDDED_JSON_SCRIPTS_PER_PAGE: parseInt(process.env.MAX_EMBEDDED_JSON_SCRIPTS_PER_PAGE || '20', 10),
     MAX_EMBEDDED_JSON_BYTES: parseInt(process.env.MAX_EMBEDDED_JSON_BYTES || String(1024 * 1024), 10),
     MAX_EMBEDDED_JSON_CANDIDATES_PER_PAGE: parseInt(process.env.MAX_EMBEDDED_JSON_CANDIDATES_PER_PAGE || '100', 10),
     MAX_DYNAMIC_DOM_CANDIDATES_PER_PAGE: parseInt(process.env.MAX_DYNAMIC_DOM_CANDIDATES_PER_PAGE || '250', 10),
-    MAX_IFRAMES_PER_PAGE: parseInt(process.env.MAX_IFRAMES_PER_PAGE || '5', 10),
+    MAX_IFRAMES_PER_PAGE: parseInt(process.env.MAX_IFRAMES_PER_PAGE || '50', 10),
     MAX_SHADOW_DOM_ROOTS_PER_PAGE: parseInt(process.env.MAX_SHADOW_DOM_ROOTS_PER_PAGE || '50', 10),
     MAX_SHADOW_DOM_CANDIDATES_PER_PAGE: parseInt(process.env.MAX_SHADOW_DOM_CANDIDATES_PER_PAGE || '250', 10),
-    MAX_PAGINATION_LINKS_PER_PAGE: parseInt(process.env.MAX_PAGINATION_LINKS_PER_PAGE || '10', 10),
+    MAX_PAGINATION_LINKS_PER_PAGE: parseInt(process.env.MAX_PAGINATION_LINKS_PER_PAGE || '100', 10),
     MAX_JOB_API_RESPONSES_PER_PAGE: parseInt(process.env.MAX_JOB_API_RESPONSES_PER_PAGE || '20', 10),
     MAX_JOB_API_RESPONSE_BYTES: parseInt(process.env.MAX_JOB_API_RESPONSE_BYTES || String(2 * 1024 * 1024), 10),
     MAX_JOB_API_JSON_DEPTH: parseInt(process.env.MAX_JOB_API_JSON_DEPTH || '8', 10),
@@ -431,35 +439,13 @@ const BLOCKED_OR_RETRYABLE_STATUSES = new Set([403, 408, 409, 425, 429, 500, 502
 
 const JOB_API_URL_SIGNAL_RE = /(?:api|job|jobs|career|careers|karriere|position|positions|vacanc(?:y|ies)|requisition|stellen|stellenangebote|search|listing|openings?)/i;
 const JOB_API_CONTENT_TYPE_RE = /(?:application\/(?:json|ld\+json)|text\/json)/i;
-const HEINRICH_SCHMID_LOADJOBS_URL_RE = /(?:^|[?&])tx_hsjobs_hj3(?:%5B|\[)action(?:%5D|\])=loadjobs(?:&|$)/i;
 const JOBS_WRAPPER_RE = /<jobs\b[^>]*>([\s\S]*?)<\/jobs>/i;
-const HEINRICH_SCHMID_JOB_COLLECTION_SEGMENTS = new Set(['jobs', 'emplois', 'empleos']);
 const JOB_API_TITLE_KEYS = ['title', 'jobTitle', 'position', 'positionTitle', 'jobName', 'name'];
-const JOB_API_ID_KEYS = ['jobId', 'job_id', 'requisition', 'requisitionId', 'requisition_id', 'requisitionNumber', 'jobNumber'];
+const JOB_API_ID_KEYS = ['jobId', 'job_id', 'requisition', 'requisitionId', 'requisition_id', 'requisitionNumber', 'jobNumber', 'externalJobId', 'external_job_id', 'externalId', 'external_id', 'referenceId', 'reference_id', 'reference', 'id', 'uuid', 'uid'];
 const JOB_API_URL_KEYS = ['detailUrl', 'detailURL', 'jobUrl', 'jobURL', 'url', 'jobLink', 'link', 'applyUrl', 'applyURL', 'applicationUrl'];
 const JOB_API_LOCATION_KEYS = ['location', 'jobLocation', 'locations', 'city'];
 const JOB_API_DESCRIPTION_KEYS = ['description', 'jobDescription', 'descriptionHtml'];
 const JOB_API_EMPLOYMENT_KEYS = ['employmentType', 'employment_type'];
-
-function isHeinrichSchmidLoadJobsUrl(url) {
-    return HEINRICH_SCHMID_LOADJOBS_URL_RE.test(String(url || '')) &&
-        /heinrich-schmid\.com/i.test(String(url || ''));
-}
-
-function isSafeApiSlug(slug) {
-    const value = String(slug || '').trim();
-    return Boolean(value &&
-        !/^https?:\/\//i.test(value) &&
-        !/[?#]/.test(value) &&
-        !/(?:^|\/)\.\.(?:\/|$)/.test(value) &&
-        !value.includes('//') &&
-        /^\/?[a-z0-9][a-z0-9._%/-]*$/i.test(value));
-}
-
-function isHeinrichSchmidJobPath(pathname) {
-    const segments = String(pathname || '').split('/').filter(Boolean);
-    return segments.length >= 3 && HEINRICH_SCHMID_JOB_COLLECTION_SEGMENTS.has(segments[1].toLowerCase());
-}
 
 const DISCOVERY_COUNTER_KEYS = [
     'html_candidates', 'onclick_candidates', 'embedded_json_candidates',
@@ -987,13 +973,26 @@ async function acceptCookies(page) {
 // ─── SCROLL ───────────────────────────────────────────────────────────────
 async function autoScroll(page, maxSteps = CONFIG.AUTO_SCROLL_MAX_STEPS) {
     let lastH = 0;
+    let lastContentState = '';
+    let idleSteps = 0;
+    let meaningfulChanges = 0;
     for (let i = 0; i < maxSteps; i++) {
-        const h = await page.evaluate(() => document.body.scrollHeight).catch(() => 0);
-        if (h === lastH) break;
-        lastH = h;
+        const state = await page.evaluate(() => ({
+            height: document.body?.scrollHeight || 0,
+            links: document.querySelectorAll('a[href], [data-url], [data-href]').length,
+            records: document.querySelectorAll('article, li, tr, [role="listitem"], [class*="job" i]').length
+        })).catch(() => ({ height: 0, links: 0, records: 0 }));
+        const contentState = `${state.height}:${state.links}:${state.records}`;
+        const changed = contentState !== lastContentState;
+        if (changed) meaningfulChanges++;
+        idleSteps = changed ? 0 : idleSteps + 1;
+        if (idleSteps >= 3) return { steps: i, exhausted: true, limitReached: false, meaningfulChanges };
+        lastH = state.height;
+        lastContentState = contentState;
         await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
         await page.waitForTimeout(600);
     }
+    return { steps: maxSteps, exhausted: false, limitReached: true, meaningfulChanges };
 }
 
 // ─── FETCH HELPERS ────────────────────────────────────────────────────────
@@ -1263,79 +1262,6 @@ async function extractLinksFromPage(baseUrl, companyName) {
     return result;
 }
 
-// ─── DEEP CRAWL: category → jobs ──────────────────────────────────────────
-async function extractAllJobLinks(baseUrl, companyName) {
-    logInfo('CRAWL', `Deep-crawling: ${baseUrl}`);
-    const allJobs = new Set();
-    const allCategories = new Set();
-    const allSubdomains = new Set();
-    const allAts = new Set();
-
-    // ── PASS 1: Base page ─────────────────────────────────────────────
-    const p1 = await extractLinksFromPage(baseUrl, companyName);
-    p1.jobs.forEach(u => allJobs.add(u));
-    p1.categories.forEach(u => allCategories.add(u));
-    p1.subdomains.forEach(u => allSubdomains.add(u));
-    p1.ats.forEach(u => allAts.add(u));
-    logInfo('PASS 1', `jobs=${p1.jobs.size} categories=${p1.categories.size} subdomains=${p1.subdomains.size} ats=${p1.ats.size}`);
-
-    // ── PASS 2: Crawl INTO each category (max N) ──────────────────────
-    const cats = [...allCategories].slice(0, CONFIG.MAX_CATEGORIES_PER_COMPANY);
-    for (const catUrl of cats) {
-        logInfo('PASS 2', `→ category: ${catUrl}`);
-        const p2 = await extractLinksFromPage(catUrl, companyName);
-        p2.jobs.forEach(u => allJobs.add(u));
-        p2.subdomains.forEach(u => allSubdomains.add(u));
-        p2.ats.forEach(u => allAts.add(u));
-        // Nested categories (one level deep)
-        p2.categories.forEach(u => {
-            if (!cats.includes(u) && allCategories.size < CONFIG.MAX_CATEGORIES_PER_COMPANY * 2) {
-                allCategories.add(u);
-            }
-        });
-    }
-
-    // ── PASS 2b: Any newly discovered categories ──────────────────────
-    const newCats = [...allCategories].filter(u => !cats.includes(u)).slice(0, CONFIG.MAX_CATEGORIES_PER_COMPANY);
-    for (const catUrl of newCats) {
-        logInfo('PASS 2b', `→ category: ${catUrl}`);
-        const p2 = await extractLinksFromPage(catUrl, companyName);
-        p2.jobs.forEach(u => allJobs.add(u));
-        p2.ats.forEach(u => allAts.add(u));
-    }
-
-    // ── PASS 3: Subdomain job portals ─────────────────────────────────
-    const subs = [...allSubdomains].slice(0, CONFIG.MAX_SUBDOMAINS_PER_COMPANY);
-    for (const subUrl of subs) {
-        logInfo('PASS 3', `→ subdomain: ${subUrl}`);
-        const p3 = await extractLinksFromPage(subUrl, companyName);
-        p3.jobs.forEach(u => allJobs.add(u));
-        p3.categories.forEach(u => allCategories.add(u));
-    }
-
-    // ── PASS 3b: Crawl into subdomain categories too ──────────────────
-    const subCats = [...allCategories].filter(u => !cats.includes(u) && !newCats.includes(u)).slice(0, 5);
-    for (const catUrl of subCats) {
-        logInfo('PASS 3b', `→ ${catUrl}`);
-        const p = await extractLinksFromPage(catUrl, companyName);
-        p.jobs.forEach(u => allJobs.add(u));
-    }
-
-    // ── PASS 4: ATS portals (take first N as-is; they have their own crawlers) ─
-    const atsList = [...allAts].slice(0, 3);
-    for (const atsUrl of atsList) {
-        logInfo('PASS 4', `ATS detected: ${atsUrl} (handled by dedicated crawlers)`);
-        // Not crawled here — dedicated ATS crawlers handle these.
-        // But we record the URL so the pipeline knows about it.
-    }
-
-    // Filter out garbage
-    const finalJobs = [...allJobs].filter(u => !isNonJobUrl(u) && !isCategoryUrl(u));
-
-    logInfo('LINKS', `Final job links: ${finalJobs.length} (scanned ${1 + cats.length + newCats.length + subs.length + subCats.length} pages)`);
-    return finalJobs.slice(0, CONFIG.MAX_JOB_LINKS_PER_COMPANY);
-}
-
 // ─── CONTAINER FIND ───────────────────────────────────────────────────────
 async function validateCareerPage(candidateUrl, companyName, companyWebsiteUrl, options = {}) {
     const url = normalizeUrl(candidateUrl);
@@ -1428,34 +1354,88 @@ async function discoverCareerPage(baseUrl, companyName = '') {
 
 function isStrongLoadMoreControl(text = '', aria = '', title = '', className = '') {
     const value = `${text} ${aria} ${title} ${className}`.toLowerCase();
-    return /(?:load\s*more|show\s*more|view\s*more|mehr\s+laden|weitere\s+(?:stellen|jobs|anzeigen)|alle\s+stellen(?:\s+anzeigen)?|jobs\s+anzeigen|more\s+jobs)/i.test(value);
+    const label = `${text} ${aria} ${title}`.trim();
+    return label.length > 0 && !/cookie|privacy|login|sign\s*in|submit|send|apply|application|contact|register|delete|remove|share|social|language|menu/i.test(value);
+}
+
+async function discoverAlternativeCareerUrls(rootUrl, state) {
+    let origin;
+    try { origin = new URL(rootUrl).origin; } catch { return []; }
+    const sitemapUrls = new Set([`${origin}/sitemap.xml`]);
+    try {
+        const robots = await axios.get(`${origin}/robots.txt`, {
+            timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
+            responseType: 'text'
+        });
+        for (const line of String(robots.data || '').split(/\r?\n/)) {
+            const match = line.match(/^\s*sitemap:\s*(\S+)/i);
+            if (match) sitemapUrls.add(match[1]);
+        }
+    } catch {}
+
+    const discovered = [];
+    for (const sitemapUrl of [...sitemapUrls].slice(0, 10)) {
+        try {
+            const response = await axios.get(sitemapUrl, {
+                timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
+                responseType: 'text'
+            });
+            const locations = [...String(response.data || '').matchAll(/<loc[^>]*>([\s\S]*?)<\/loc>/gi)]
+                .map(match => match[1].trim())
+                .map(url => state.normalize(url, rootUrl))
+                .filter(Boolean)
+                .filter(url => !isNonJobUrl(url) && (hasStrongExternalCareerSignal(url, '', '', rootUrl) || isJobDetailUrl(url)));
+            discovered.push(...locations.slice(0, 500));
+        } catch {}
+    }
+    return [...new Set(discovered)];
 }
 
 async function clickLoadMore(page, options = {}) {
-    const selectors = [
-        'button:has-text("Mehr laden")', 'button:has-text("Load more")',
-        'button:has-text("Weitere anzeigen")', 'button:has-text("Weitere Stellen")',
-        'button:has-text("Weitere Jobs")', 'button:has-text("Alle Stellen anzeigen")',
-        'button:has-text("Show more")', 'button:has-text("View more")',
-        'a:has-text("Mehr laden")', 'a:has-text("Load more")',
-        '.load-more', '[class*="load-more"]', '[data-testid*="load-more"]',
-        '[aria-label*="Load more" i]', '[aria-label*="Mehr" i]', '[aria-label*="Weitere" i]'
-    ];
+    const selectors = ['button:not([type="submit"]):not([disabled])', '[role="button"]:not([aria-disabled="true"])'];
 
     let clicks = 0;
     let lastFingerprint = '';
     while (clicks < CONFIG.LOAD_MORE_MAX_CLICKS) {
         let clicked = false;
+        const controls = [];
         for (const sel of selectors) {
             try {
-                const btn = page.locator(sel).first();
-                if (await btn.isVisible({ timeout: 600 })) {
+                const locator = page.locator(sel);
+                const count = Math.min(await locator.count().catch(() => 0), 160);
+                for (let index = 0; index < count; index++) controls.push(locator.nth(index));
+            } catch {}
+        }
+        for (const btn of controls) {
+            try {
+                if (await btn.isVisible({ timeout: 250 })) {
                     const text = await btn.innerText({ timeout: 300 }).catch(() => '');
                     const aria = await btn.getAttribute('aria-label').catch(() => '');
                     const title = await btn.getAttribute('title').catch(() => '');
                     const className = await btn.getAttribute('class').catch(() => '');
                     if (!isStrongLoadMoreControl(text, aria, title, className)) continue;
+                    const structuralScore = semanticInteractionScore({
+                        role: await btn.getAttribute('role').catch(() => 'button'),
+                        tagName: await btn.evaluate(node => node.tagName).catch(() => 'BUTTON'),
+                        textContent: text,
+                        ariaLabel: aria,
+                        title,
+                        nearbyRecordCount: await btn.locator('xpath=ancestor::*[self::article or self::li or self::tr or @data-record]').count().catch(() => 0),
+                        nearbyLinkCount: await btn.locator('xpath=ancestor::*[self::section or self::main or self::form]//a[@href]').count().catch(() => 0),
+                        hasFormControl: await btn.locator('xpath=ancestor::form').count().catch(() => 0) > 0,
+                        hasTarget: Boolean(await btn.getAttribute('data-target').catch(() => null) || await btn.getAttribute('aria-controls').catch(() => null))
+                    });
+                    if (structuralScore < 4) continue;
                     const before = await page.locator('a[href]').count().catch(() => 0);
+                    const controlKey = `${text}|${aria}|${title}|${className}|${before}`;
+                    if (options.seenControls?.has(controlKey)) continue;
+                    options.seenControls?.add(controlKey);
+                    if (options.discoveryState) {
+                        const state = options.discoveryState.interactionState(
+                            page.url(), controlKey, await page.url()
+                        );
+                        if (!state.fresh) continue;
+                    }
                     await btn.click({ timeout: CRAWLER_TIMEOUTS.CLICK_TIMEOUT_MS });
                     clicks++;
                     clicked = true;
@@ -1463,8 +1443,8 @@ async function clickLoadMore(page, options = {}) {
                     await autoScroll(page, 3);
                     const after = await page.locator('a[href]').count().catch(() => before);
                     const fingerprint = `${after}:${await page.evaluate(() => document.body.innerText.length).catch(() => 0)}`;
+                    if (after <= before && fingerprint === lastFingerprint) continue;
                     await options.onClick?.({ page, clicks, before, after });
-                    if (after <= before && fingerprint === lastFingerprint) return clicks;
                     lastFingerprint = fingerprint;
                     break;
                 }
@@ -1475,11 +1455,47 @@ async function clickLoadMore(page, options = {}) {
     return clicks;
 }
 
+async function exploreEmploymentFilters(page, pageUrl, rootUrl, signal, options = {}) {
+    const controls = page.locator('select, [role="combobox"]');
+    const count = Math.min(await controls.count().catch(() => 0), 20);
+    let explored = 0;
+    for (let index = 0; index < count; index++) {
+        throwIfAborted(signal);
+        const control = controls.nth(index);
+        try {
+            if (!(await control.isVisible({ timeout: 300 }))) continue;
+            const optionsData = await control.locator('option').evaluateAll(nodes => nodes.map(node => ({
+                value: node.value,
+                label: (node.textContent || '').trim(),
+                disabled: node.disabled
+            }))).catch(() => []);
+            const usable = optionsData.filter(option => option.value && !option.disabled);
+            const formContext = await control.locator('xpath=ancestor::form | xpath=ancestor::*[self::section or self::main or @role="search"]').count().catch(() => 0);
+            const nearbyRecords = await control.locator('xpath=ancestor::*[self::article or self::li or self::tr or @data-record] | xpath=ancestor::*[self::section or self::main]//a[@href]').count().catch(() => 0);
+            if (usable.length < 1 || usable.length > 50 || (formContext === 0 && nearbyRecords === 0)) continue;
+            for (const option of usable) {
+                const stateKey = `${page.url()}|${index}|${option.value}`;
+                if (options.discoveryState?.interactionState(page.url(), stateKey, option.value).fresh === false) continue;
+                await control.selectOption(option.value).catch(() => null);
+                await page.waitForTimeout(700);
+                const html = await page.content().catch(() => '');
+                if (!html) continue;
+                options.onResults?.(extractLinksFromHtml(html, normalizeUrl(page.url()) || pageUrl, rootUrl, {
+                    allowUnknownExternal: options.allowUnknownExternal !== false,
+                    externalHosts: options.externalHosts || new Set(),
+                    restrictedExternalHost: options.restrictedExternalHost || null
+                }));
+                explored++;
+            }
+        } catch {}
+    }
+    return explored;
+}
+
 async function clickPaginationControls(page, signal, options = {}) {
     const locator = page.locator(
-        'button[data-page], button[data-offset], [role="button"][data-page], [role="button"][data-offset], ' +
-        '[aria-label*="next page" i], [aria-label*="nächste" i], [aria-label*="weiter" i], ' +
-        'button:has-text("Next"), button:has-text("Weiter"), button:has-text("Nächste")'
+        'a[rel], a[href], button[data-page], button[data-offset], button[data-cursor], ' +
+        '[role="button"], [role="link"]'
     );
     const count = Math.min(await locator.count().catch(() => 0), CONFIG.MAX_PAGINATION_LINKS_PER_PAGE);
     const seenControls = new Set();
@@ -1493,14 +1509,24 @@ async function clickPaginationControls(page, signal, options = {}) {
             const text = compactText(await control.innerText({ timeout: 300 }).catch(() => ''), 80);
             const aria = await control.getAttribute('aria-label').catch(() => '');
             const title = await control.getAttribute('title').catch(() => '');
+            const rel = await control.getAttribute('rel').catch(() => '');
+            const href = await control.getAttribute('href').catch(() => '');
             const pageNumber = await control.getAttribute('data-page').catch(() => '');
             const offset = await control.getAttribute('data-offset').catch(() => '');
-            const signature = `${text}|${aria}|${title}|${pageNumber}|${offset}`;
+            const cursor = await control.getAttribute('data-cursor').catch(() => '');
+            const signature = `${text}|${aria}|${title}|${pageNumber}|${offset}|${cursor}`;
             if (seenControls.has(signature)) continue;
             seenControls.add(signature);
-            if (!isPaginationControlEvidence({ text, aria, title, pageNumber, offset })) continue;
+            const paginationContainer = await control.locator('xpath=ancestor::*[contains(@class,"pagination") or @role="navigation" or @aria-label]').count().catch(() => 0);
+            if (!isPaginationControlEvidence({ text, aria, title, pageNumber, offset, rel, href, paginationContainer })) continue;
 
             const beforeUrl = normalizeUrl(page.url()) || '';
+            if (options.discoveryState) {
+                const state = options.discoveryState.interactionState(
+                    beforeUrl, signature, `${pageNumber}|${offset}|${cursor}`
+                );
+                if (!state.fresh) continue;
+            }
             await control.click({ timeout: CRAWLER_TIMEOUTS.CLICK_TIMEOUT_MS });
             clicks++;
             await page.waitForLoadState('domcontentloaded', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS / 2 }).catch(() => {});
@@ -1512,11 +1538,11 @@ async function clickPaginationControls(page, signal, options = {}) {
     return clicks;
 }
 
-function isPaginationControlEvidence({ text = '', aria = '', title = '', pageNumber = '', offset = '' } = {}) {
+function isPaginationControlEvidence({ text = '', aria = '', title = '', pageNumber = '', offset = '', rel = '', href = '', paginationContainer = 0 } = {}) {
     if (pageNumber || offset) return true;
-    return /(?:next|weiter|nächste|page|seite|offset|start|[?&](?:page|seite|offset|start)=\d+)/i.test(
-        `${text} ${aria} ${title}`
-    );
+    if (/\bnext\b|\bweiter\b|nächste|rel\s*next/i.test(`${text} ${aria} ${title} ${rel}`)) return true;
+    if (paginationContainer > 0 && /^\d+$/.test(text.trim())) return true;
+    return paginationContainer > 0 && /[?&](?:page|seite|offset|start|cursor|after)=/i.test(`${href}`);
 }
 
 function extractJsonLdJobUrls($, baseUrl) {
@@ -1664,6 +1690,27 @@ function extractJobCardUrls($, pageUrl, rootUrl, options = {}) {
             if (kind === 'job' || isLikelyIndividualJobUrl(full)) jobs.add(full);
         }
     });
+
+    // Structural fallback: many portals use generated class names or no job
+    // class at all. Repeated sibling records with distinct terminal links are
+    // stronger evidence than a URL keyword, while final detail validation
+    // remains authoritative before persistence.
+    $('a[href]').each((_, el) => {
+        if (inspected >= (options.maxCandidates ?? CONFIG.MAX_DYNAMIC_DOM_CANDIDATES_PER_PAGE)) return false;
+        const anchor = $(el);
+        const full = normalizeUrl(anchor.attr('href'), pageUrl);
+        if (!full || isNonJobUrl(full) || isCareerListingUrl(full)) return;
+        const container = anchor.closest('li,article,tr,[role="listitem"],section,div').first();
+        const siblingLinks = container.find('a[href]').filter((__, child) => normalizeUrl($(child).attr('href'), pageUrl)).length;
+        const parentLinks = anchor.parent().children('a[href]').length;
+        const title = compactText(anchor.text(), 240);
+        const context = compactText(container.text(), 1200);
+        const repeatedRecord = (siblingLinks === 1 || parentLinks >= 2) && container.parent().children().length >= 2;
+        if (!repeatedRecord || !title || wordCount(context) > 80) return;
+        inspected++;
+        const kind = classifyLink(full, title, context, rootUrl, { ...options, pageUrl });
+        if (kind === 'job' || isLikelyIndividualJobUrl(full) || !isCareerListingUrl(full)) jobs.add(full);
+    });
     return jobs;
 }
 
@@ -1709,43 +1756,20 @@ function hasJobApiEvidence(record) {
         return typeof value === 'string' || (value && typeof value === 'object' && Boolean(value.url || value.href || value.link));
     });
     const slug = getApiFieldValue(record, ['slug']);
-    const hasSlug = isSafeApiSlug(slug);
     const hasLocation = Boolean(getApiFieldValue(record, JOB_API_LOCATION_KEYS));
     const hasDescription = Boolean(getApiFieldValue(record, JOB_API_DESCRIPTION_KEYS));
     const hasEmployment = Boolean(getApiFieldValue(record, JOB_API_EMPLOYMENT_KEYS));
     const hasJobSpecificKey = Object.keys(record).some(key =>
         /(?:responsibilities|requirements|qualifications|department|postingDate|company|apply)/i.test(key)
     );
-    const hasHeinrichJobMetadata = hasSlug && Boolean(
-        getApiFieldValue(record, ['entry', 'activity']) ||
-        typeof record.initiativ === 'boolean'
-    );
-
-    if (!titleLooksLikeRole && !hasDescription && !hasEmployment && !hasIdentifier && !hasHeinrichJobMetadata) return false;
+    const hasRealEmploymentSignal = titleLooksLikeRole || hasEmployment ||
+        hasLocation || hasUrl || hasJobSpecificKey;
+    if (!hasRealEmploymentSignal) return false;
 
     // A generic `name` or `title` alone is intentionally insufficient. An ID
     // is also not enough by itself because CMS/navigation payloads commonly
     // contain unrelated IDs.
-    return hasIdentifier || hasUrl || hasSlug || hasLocation || hasDescription || hasEmployment || hasJobSpecificKey;
-}
-
-function normalizeHeinrichSchmidSlug(slug, responseUrl, baseUrl) {
-    if (!isHeinrichSchmidLoadJobsUrl(responseUrl)) return null;
-    const value = String(slug || '').trim();
-    if (!isSafeApiSlug(value)) return null;
-
-    try {
-        const origin = new URL(responseUrl || baseUrl).origin;
-        const path = value.startsWith('/') ? value : `/karriere/jobs/${value}`;
-        const candidate = new URL(path, origin);
-        if (candidate.origin !== origin || !isHeinrichSchmidJobPath(candidate.pathname)) return null;
-        candidate.search = '';
-        candidate.hash = '';
-        candidate.pathname = `${candidate.pathname.replace(/\/+$/, '')}/`;
-        return candidate.href;
-    } catch {
-        return null;
-    }
+    return hasIdentifier || hasUrl || hasLocation || hasDescription || hasEmployment || hasJobSpecificKey;
 }
 
 function normalizeApiJobRecord(record, responseUrl, baseUrl) {
@@ -1755,20 +1779,24 @@ function normalizeApiJobRecord(record, responseUrl, baseUrl) {
     const url = getApiFieldValue(record, ['url']);
     const link = getApiFieldValue(record, ['jobLink', 'link']);
     const applyUrl = getApiFieldValue(record, ['applyUrl', 'applyURL', 'applicationUrl']);
-    const slug = getApiFieldValue(record, ['slug']);
-    const slugUrl = normalizeHeinrichSchmidSlug(slug, responseUrl, baseUrl);
-    const urlSource = detailUrl ? 'detailUrl' : jobUrl ? 'jobUrl' : url ? 'url' : link ? 'link' : applyUrl ? 'applyUrl' : slugUrl ? 'slug' : null;
+    const urlSource = detailUrl ? 'detailUrl' : jobUrl ? 'jobUrl' : url ? 'url' : link ? 'link' : applyUrl ? 'applyUrl' : null;
     const explicitUrlCandidates = [detailUrl, jobUrl, url, link, applyUrl].filter(Boolean);
     const normalizedUrl = explicitUrlCandidates
         .map(value => normalizeUrl(value, responseUrl || baseUrl) || normalizeUrl(value, baseUrl))
-        .find(Boolean) || slugUrl || null;
+        .find(Boolean) || null;
     const title = getApiFieldValue(record, JOB_API_TITLE_KEYS);
     const jobId = getApiFieldValue(record, ['jobId', 'job_id']);
     const requisitionId = getApiFieldValue(record, ['requisition', 'requisitionId', 'requisition_id', 'requisitionNumber']);
+    const externalJobId = getApiFieldValue(record, ['externalJobId', 'external_job_id', 'externalId', 'external_id']);
+    const referenceId = getApiFieldValue(record, ['referenceId', 'reference_id', 'reference', 'jobNumber']);
+    const stableApiId = getApiFieldValue(record, ['id', 'uuid', 'uid']);
     const identities = [
-        normalizedUrl ? `url:${normalizeJobIdentityUrl(normalizedUrl, baseUrl) || normalizedUrl}` : null,
-        jobId ? `job_id:${jobId}` : null,
+        externalJobId ? `external_id:${externalJobId}` : null,
         requisitionId ? `requisition:${requisitionId}` : null,
+        jobId ? `job_id:${jobId}` : null,
+        referenceId ? `reference:${referenceId}` : null,
+        stableApiId ? `api_id:${stableApiId}` : null,
+        normalizedUrl ? `url:${normalizeJobIdentityUrl(normalizedUrl, baseUrl) || normalizedUrl}` : null,
         `record:${crypto.createHash('sha1').update(JSON.stringify({
             title,
             location: getApiFieldValue(record, JOB_API_LOCATION_KEYS),
@@ -1782,6 +1810,9 @@ function normalizeApiJobRecord(record, responseUrl, baseUrl) {
         description: getApiFieldValue(record, JOB_API_DESCRIPTION_KEYS),
         jobId,
         requisitionId,
+        externalJobId,
+        referenceId,
+        stableApiId,
         detailUrl: normalizedUrl,
         jobUrl: jobUrl ? normalizeUrl(jobUrl, responseUrl || baseUrl) : null,
         applyUrl: applyUrl ? normalizeUrl(applyUrl, responseUrl || baseUrl) : null,
@@ -1789,6 +1820,11 @@ function normalizeApiJobRecord(record, responseUrl, baseUrl) {
         urlSource,
         isApplyOnly: urlSource === 'applyUrl',
         employmentType: getApiFieldValue(record, JOB_API_EMPLOYMENT_KEYS),
+        department: getApiFieldValue(record, ['department', 'team', 'businessUnit', 'category']),
+        requirements: getApiFieldValue(record, ['requirements', 'qualifications', 'skills']),
+        responsibilities: getApiFieldValue(record, ['responsibilities', 'duties', 'tasks']),
+        salary: getApiFieldValue(record, ['salary', 'salaryRange', 'compensation']),
+        company: getApiFieldValue(record, ['company', 'companyName', 'hiringOrganization']),
         responseUrl,
         identity: identities[0] || null,
         identities,
@@ -1830,8 +1866,7 @@ function extractJobCandidatesFromApiPayload(payload, responseUrl, baseUrl, optio
 function isJobApiResponseMetadata({ url, status, contentType, resourceType } = {}) {
     if (!url) return false;
     const normalizedContentType = String(contentType || '');
-    const isWrappedHeinrichResponse = isHeinrichSchmidLoadJobsUrl(url) && /text\/html/i.test(normalizedContentType);
-    if (!JOB_API_CONTENT_TYPE_RE.test(normalizedContentType) && !isWrappedHeinrichResponse) return false;
+    if (!JOB_API_CONTENT_TYPE_RE.test(normalizedContentType)) return false;
     if (Number.isFinite(status) && (status < 200 || status >= 300)) return false;
     const type = String(resourceType || '').toLowerCase();
     return Boolean(JOB_API_URL_SIGNAL_RE.test(url) || type === 'xhr' || type === 'fetch');
@@ -1848,8 +1883,7 @@ function isPotentialJobApiResponse(response) {
         const likelyApiResponse =
             JOB_API_URL_SIGNAL_RE.test(responseUrl) ||
             ['xhr', 'fetch'].includes(String(resourceType).toLowerCase());
-        const wrappedHeinrichResponse = isHeinrichSchmidLoadJobsUrl(responseUrl) && /text\/html/i.test(contentType);
-        return likelyApiResponse && (!contentType || JOB_API_CONTENT_TYPE_RE.test(contentType) || wrappedHeinrichResponse) &&
+        return likelyApiResponse && (!contentType || JOB_API_CONTENT_TYPE_RE.test(contentType)) &&
             status >= 200 && status < 300;
     } catch {
         return false;
@@ -1872,16 +1906,27 @@ function parseJobApiResponseBody(body, maxBytes = CONFIG.MAX_JOB_API_RESPONSE_BY
 function acceptApiCandidatesForCompany(candidates, apiState) {
     const unique = [];
     for (const candidate of candidates || []) {
-        if (!candidate?.identity || candidate.identities.some(identity => apiState.identities.has(identity))) continue;
-        candidate.identities.forEach(identity => apiState.identities.add(identity));
+        if (!candidate?.identity || apiState.identities.has(candidate.identity)) continue;
+        apiState.identities.add(candidate.identity);
+        (candidate.identities || []).forEach(identity => apiState.identities.add(identity));
         apiState.jobsDetected++;
         unique.push(candidate);
     }
     return unique;
 }
 
+function syncApiTelemetry(apiState, discoveryState) {
+    if (!discoveryState?.metrics) return;
+    discoveryState.metrics.apiRequestsAttempted = apiState.requestsAttempted || 0;
+    discoveryState.metrics.apiRequestsCompleted = apiState.requestsCompleted || 0;
+    discoveryState.metrics.apiRequestsFailed = apiState.requestsFailed || 0;
+    discoveryState.metrics.apiRequestsRemaining = apiState.continuationRequests?.length || 0;
+}
+
 async function inspectJobApiResponse(response, pageUrl, apiState, pageResponseState) {
     try {
+        apiState.requestsAttempted = (apiState.requestsAttempted || 0) + 1;
+        syncApiTelemetry(apiState, pageResponseState.discoveryState);
         const headers = await response.allHeaders().catch(() => ({}));
         const contentType = headers['content-type'] || headers['Content-Type'] || '';
         const request = response.request();
@@ -1889,7 +1934,10 @@ async function inspectJobApiResponse(response, pageUrl, apiState, pageResponseSt
         const status = response.status();
         const responseUrl = response.url();
         if (!isJobApiResponseMetadata({ url: responseUrl, status, contentType, resourceType })) return [];
-        if (pageResponseState.count >= CONFIG.MAX_JOB_API_RESPONSES_PER_PAGE) return [];
+        if (pageResponseState.count >= CONFIG.MAX_JOB_API_RESPONSES_PER_PAGE) {
+            pageResponseState.discoveryState?.recordLimit('api_response_budget', CONFIG.MAX_JOB_API_RESPONSES_PER_PAGE);
+            return [];
+        }
         const contentLength = Number(headers['content-length'] || headers['Content-Length'] || 0);
         if (contentLength > CONFIG.MAX_JOB_API_RESPONSE_BYTES) return [];
         pageResponseState.count++;
@@ -1898,10 +1946,31 @@ async function inspectJobApiResponse(response, pageUrl, apiState, pageResponseSt
         if (!body || body.length > CONFIG.MAX_JOB_API_RESPONSE_BYTES) return [];
         const payload = parseJobApiResponseBody(body);
         if (payload == null) return [];
+        apiState.requestsCompleted = (apiState.requestsCompleted || 0) + 1;
+        syncApiTelemetry(apiState, pageResponseState.discoveryState);
 
+        for (const continuationUrl of extractContinuationUrls(payload, responseUrl)) {
+            apiState.continuationUrls ??= new Set();
+            apiState.continuationUrls.add(continuationUrl);
+        }
+        apiState.continuationRequests ??= [];
+        const requestBody = request?.postData?.() || null;
+        for (const continuation of extractContinuationRequests(payload, responseUrl, {
+            url: responseUrl,
+            method: request?.method?.() || 'GET',
+            body: requestBody
+        })) {
+            const signature = `${continuation.method} ${continuation.url} ${continuation.body || ''}`;
+            if (!apiState.requestStates?.has(signature)) {
+                apiState.requestStates ??= new Set();
+                apiState.continuationRequests.push({ ...continuation, signature });
+            }
+        }
         const candidates = extractJobCandidatesFromApiPayload(payload, responseUrl, pageUrl);
         return acceptApiCandidatesForCompany(candidates, apiState);
     } catch (error) {
+        apiState.requestsFailed = (apiState.requestsFailed || 0) + 1;
+        syncApiTelemetry(apiState, pageResponseState.discoveryState);
         pageResponseState.processingFailures = (pageResponseState.processingFailures || 0) + 1;
         logInfo('API_DISCOVERY', `Ignored response ${truncateForLog(response?.url?.() || '', 120)} (${error.message})`);
         return [];
@@ -1919,25 +1988,29 @@ function addPaginationUrls($, baseUrl, result) {
         const full = normalizeUrl($(el).attr('href'), baseUrl);
         if (!full) return;
         const combined = `${text} ${rel} ${aria} ${title} ${full}`.toLowerCase();
-        if (/\b(?:next|next page|weiter|naechste|nächste|more jobs|mehr stellen|weitere stellen|weitere jobs)\b|rel=["']?next|(?:[?&](?:page|seite|offset|start|p)=\d+)|data-page|data-offset/i.test(combined)) {
+        const inPaginationContainer = $(el).closest('nav, [role="navigation"], [class*="pagination" i], [class*="pager" i]').length > 0;
+        const sequentialPageLink = inPaginationContainer && /^\d+$/.test(text.trim());
+        if (rel === 'next' || sequentialPageLink || /\b(?:next|next page|weiter|naechste|nächste|more jobs|mehr stellen|weitere stellen|weitere jobs)\b|(?:[?&](?:page|seite|offset|start|p|cursor|after)=)/i.test(combined)) {
             if (!isNonJobUrl(full) && !isJobDetailUrl(full)) {
                 result.listings.add(full);
                 added++;
             }
         }
     });
-    $('[rel="next" i], [data-page], [data-offset], [data-url]').each((_, el) => {
+    $('[rel="next" i], [data-page], [data-offset], [data-cursor], [data-url], nav a[href], [role="navigation"] a[href], [class*="pagination" i] a[href]').each((_, el) => {
         if (added >= CONFIG.MAX_PAGINATION_LINKS_PER_PAGE) return false;
         const text = compactText($(el).text(), 80).toLowerCase();
         const rel = String($(el).attr('rel') || '').toLowerCase();
         const raw = $(el).attr('href') || $(el).attr('data-url');
         const full = normalizeUrl(raw, baseUrl);
         if (!full || isJobDetailUrl(full) || isNonJobUrl(full)) return;
-        if (!/next|weiter|naechste|nächste|page|seite|offset|start|pagination/i.test(`${text} ${rel} ${raw || ''}`)) return;
+        const structuralPagination = $(el).closest('nav, [role="navigation"], [class*="pagination" i], [class*="pager" i]').length > 0;
+        if (!structuralPagination && !/next|weiter|naechste|nächste|page|seite|offset|start|pagination|cursor|after/i.test(`${text} ${rel} ${raw || ''}`)) return;
         result.listings.add(full);
         added++;
     });
     result.pagination_candidates = (result.pagination_candidates || 0) + added;
+    result.paginationLimitReached = added >= CONFIG.MAX_PAGINATION_LINKS_PER_PAGE;
 }
 
 function extractLinksFromHtml(html, pageUrl, rootUrl, options = {}) {
@@ -1969,6 +2042,16 @@ function extractLinksFromHtml(html, pageUrl, rootUrl, options = {}) {
 
         const text = compactText($(el).text(), 160);
         const context = compactText($(el).closest('li,article,section,div,tr').text(), 1200);
+        const rel = String($(el).attr('rel') || '').toLowerCase();
+        const aria = String($(el).attr('aria-label') || '').toLowerCase();
+        const title = String($(el).attr('title') || '').toLowerCase();
+        if (!isJobDetailUrl(full) && (rel === 'next' || rel === 'prev' ||
+            $(el).is('[data-page], [data-offset], [data-cursor]') ||
+            isPaginationControlEvidence({ text, aria, title }))) {
+            result.listings.add(full);
+            result.counters.pagination_candidates++;
+            return;
+        }
         const kind = classifyLink(full, text, context, rootUrl, {
             ...options,
             pageUrl
@@ -2008,8 +2091,7 @@ async function discoverJobDetailUrlsByClicking(page, pageUrl, rootUrl, signal) {
             text = compactText(await el.innerText({ timeout: 500 }).catch(() => ''), 240);
             href = await el.getAttribute('href')
                 || await el.getAttribute('data-href')
-                || await el.getAttribute('data-url')
-                || await el.getAttribute('aria-label');
+                || await el.getAttribute('data-url');
             const onclick = await el.getAttribute('onclick');
             if (!href && onclick) {
                 href = extractNavigationUrlsFromOnclick(onclick)[0] || null;
@@ -2019,11 +2101,41 @@ async function discoverJobDetailUrlsByClicking(page, pageUrl, rootUrl, signal) {
         }
 
         const normalizedHref = normalizeUrl(href, pageUrl);
+        const role = await el.getAttribute('role').catch(() => '');
+        const tagName = await el.evaluate(node => node.tagName).catch(() => '');
+        const ariaLabel = await el.getAttribute('aria-label').catch(() => '');
+        const title = await el.getAttribute('title').catch(() => '');
+        const ariaControls = await el.getAttribute('aria-controls').catch(() => '');
+        const dataTarget = await el.getAttribute('data-target').catch(() => '');
+        const nearbyRecordCount = await el.locator('xpath=ancestor::*[self::article or self::li or self::tr or @data-record]').count().catch(() => 0);
+        const nearbyLinkCount = await el.locator('xpath=ancestor::*[self::section or self::main]//a[@href]').count().catch(() => 0);
+        const insideForm = await el.locator('xpath=ancestor::form').count().catch(() => 0) > 0;
+        const employmentControl = /load\s*more|show\s*(?:more|jobs|positions)|next|weiter|filter|search|location|department|category|vacanc|career|stellen|jobs?/i.test(`${text} ${ariaLabel} ${title}`);
+        const interactionScore = semanticInteractionScore({
+            role,
+            tagName,
+            textContent: text,
+            ariaLabel,
+            title,
+            href: normalizedHref,
+            nearbyRecordCount,
+            nearbyLinkCount,
+            hasFormControl: insideForm,
+            hasTarget: Boolean(ariaControls || dataTarget)
+        });
         if (normalizedHref && isLikelyIndividualJobUrl(normalizedHref)) {
             found.add(normalizedHref);
             continue;
         }
-        if (!looksLikeJobCardText(text)) continue;
+        // Links are discovery candidates, not interaction controls. Only click
+        // controls without a direct destination when their surrounding
+        // structure or label indicates that they can reveal employment data.
+        if (normalizedHref) continue;
+        const controlLike = /^(BUTTON|SUMMARY|SELECT|INPUT)$/.test(String(tagName).toUpperCase()) ||
+            ['button', 'tab', 'menuitem'].includes(String(role).toLowerCase()) || Boolean(ariaControls || dataTarget);
+        if (!controlLike || !employmentControl || interactionScore < 4 ||
+            (nearbyRecordCount === 0 && nearbyLinkCount === 0 && !insideForm && !ariaControls && !dataTarget)) continue;
+        logInfo('INTERACTION', `clicking employment control score=${interactionScore} reason=${employmentControl ? 'employment_label_and_structure' : 'structure'} text=${truncateForLog(text || ariaLabel || title, 100)}`);
 
         const beforeUrl = normalizeUrl(page.url()) || pageUrl;
         try {
@@ -2079,6 +2191,7 @@ function mergeLinkExtraction(target, source) {
     }
     if (source.embeddedApiCandidates?.length) target.embeddedApiCandidates.push(...source.embeddedApiCandidates);
     addDiscoveryCounters(target.counters, source.counters);
+    if (source.paginationLimitReached) target.paginationLimitReached = true;
     return target;
 }
 
@@ -2162,15 +2275,23 @@ async function extractOpenShadowDomJobUrls(page, pageUrl, rootUrl, options = {})
 
 async function extractBoundedIframeLinks(page, pageUrl, rootUrl, options = {}) {
     const result = { jobs: new Set(), listings: new Set(), pages: new Set(), ats: new Set(), embeddedApiCandidates: [], counters: createDiscoveryCounters() };
-    const frames = page.frames().filter(frame => frame !== page.mainFrame()).slice(0, options.maxIframes ?? CONFIG.MAX_IFRAMES_PER_PAGE);
+    const iframeState = options.iframeState || { inspected: 0, visited: new Set(), limitReached: false };
+    const maxIframes = options.maxIframes ?? CONFIG.MAX_IFRAMES_PER_PAGE;
+    const frames = page.frames().filter(frame => frame !== page.mainFrame());
     let inspected = 0;
     for (const frame of frames) {
+        if (inspected >= maxIframes) {
+            iframeState.limitReached = true;
+            break;
+        }
         const frameUrl = normalizeUrl(frame.url(), pageUrl);
         if (!frameUrl) continue;
+        if (iframeState.visited?.has(frameUrl)) continue;
         const allowed = isAllowedDiscoveryExternalUrl(frameUrl, rootUrl, options.externalHosts || new Set()) ||
             hasStrongExternalCareerSignal(frameUrl, '', '', pageUrl);
         if (!allowed) continue;
         try {
+            iframeState.visited?.add(frameUrl);
             const html = await frame.content();
             const extracted = extractLinksFromHtml(html, frameUrl, rootUrl, {
                 ...options,
@@ -2180,10 +2301,12 @@ async function extractBoundedIframeLinks(page, pageUrl, rootUrl, options = {}) {
             });
             mergeLinkExtraction(result, extracted);
             inspected++;
+            iframeState.inspected = (iframeState.inspected || 0) + 1;
         } catch {}
     }
     result.counters.iframe_candidates += result.jobs.size;
     result.iframePagesInspected = inspected;
+    result.iframeLimitReached = iframeState.limitReached;
     return result;
 }
 
@@ -2197,7 +2320,7 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
     let page = null;
     let closeOnAbort = null;
     const responseTasks = new Set();
-    const pageResponseState = { count: 0 };
+    const pageResponseState = { count: 0, discoveryState: options.discoveryState };
     let responseDrainPromise = null;
     let lastRelevantResponseAt = 0;
     let responseListener = null;
@@ -2206,6 +2329,7 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
     apiState.identities ??= new Set();
     const mergeExtracted = extracted => {
         mergeLinkExtraction(result, extracted);
+        if (extracted?.paginationLimitReached) options.discoveryState?.recordLimit('pagination_budget', CONFIG.MAX_PAGINATION_LINKS_PER_PAGE);
         if (extracted?.embeddedApiCandidates?.length) {
             result.apiCandidates.push(...acceptApiCandidatesForCompany(extracted.embeddedApiCandidates, apiState));
         }
@@ -2236,6 +2360,20 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
         page = trackCompanyPage(await context.newPage());
         closeOnAbort = () => page.close().catch(() => {});
         if (signal) signal.addEventListener('abort', closeOnAbort, { once: true });
+        await page.addInitScript(() => {
+            const routes = [];
+            const record = () => routes.push(location.href);
+            for (const method of ['pushState', 'replaceState']) {
+                const original = history[method];
+                history[method] = function (...args) {
+                    const result = original.apply(this, args);
+                    record();
+                    return result;
+                };
+            }
+            addEventListener('popstate', record);
+            Object.defineProperty(window, '__crawlerRoutes', { value: routes, configurable: true });
+        }).catch(() => {});
         // Register before navigation so initial XHR/fetch responses are visible.
         // Bodies are read only after lightweight response metadata passes the
         // JSON/status/resource-type filters in inspectJobApiResponse().
@@ -2258,8 +2396,10 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
         const initialHtml = await page.content().catch(() => '');
         await page.waitForLoadState('networkidle', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS }).catch(() => {});
         await page.waitForTimeout(1500);
-        await autoScroll(page);
-        await clickLoadMore(page, {
+        const scrollResult = await autoScroll(page);
+        if (scrollResult?.limitReached) options.discoveryState?.recordLimit('scroll_budget', CONFIG.AUTO_SCROLL_MAX_STEPS);
+        const loadMoreClicks = await clickLoadMore(page, {
+            discoveryState: options.discoveryState,
             onClick: async () => {
                 const iterationHtml = await page.content().catch(() => '');
                 if (!iterationHtml) return;
@@ -2272,7 +2412,16 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
                 result.counters.load_more_candidates += Math.max(0, result.jobs.size - jobsBefore);
             }
         });
-        await clickPaginationControls(page, signal, {
+        if (loadMoreClicks >= CONFIG.LOAD_MORE_MAX_CLICKS) options.discoveryState?.recordLimit('load_more_budget', CONFIG.LOAD_MORE_MAX_CLICKS);
+        await exploreEmploymentFilters(page, pageUrl, rootUrl, signal, {
+            discoveryState: options.discoveryState,
+            allowUnknownExternal: options.allowUnknownExternal !== false,
+            externalHosts: options.externalHosts || new Set(),
+            restrictedExternalHost: options.restrictedExternalHost || null,
+            onResults: extracted => mergeExtracted(extracted)
+        });
+        const paginationClicks = await clickPaginationControls(page, signal, {
+            discoveryState: options.discoveryState,
             onClick: async () => {
                 const iterationHtml = await page.content().catch(() => '');
                 if (!iterationHtml) return;
@@ -2285,9 +2434,66 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
                 result.counters.pagination_candidates += Math.max(0, result.jobs.size - jobsBefore);
             }
         });
+        if (paginationClicks >= CONFIG.MAX_PAGINATION_LINKS_PER_PAGE) options.discoveryState?.recordLimit('pagination_interaction_budget', CONFIG.MAX_PAGINATION_LINKS_PER_PAGE);
 
-        const html = await page.content();
-        result.finalUrl = normalizeUrl(page.url()) || pageUrl;
+        // Drain continuation states discovered in JSON responses. This covers
+        // URL, cursor, GraphQL-variable, and JSON POST pagination without
+        // assuming a particular parameter name.
+        await collectApiResults();
+        apiState.continuationRequests ??= [];
+        apiState.requestStates ??= new Set();
+        let continuationCount = 0;
+        while (apiState.continuationRequests.length > 0 &&
+            continuationCount < CONFIG.MAX_JOB_API_RESPONSES_PER_PAGE) {
+            const continuation = apiState.continuationRequests.shift();
+            if (!continuation || apiState.requestStates.has(continuation.signature)) continue;
+            apiState.requestStates.add(continuation.signature);
+            continuationCount++;
+            try {
+                apiState.requestsAttempted = (apiState.requestsAttempted || 0) + 1;
+                syncApiTelemetry(apiState, options.discoveryState);
+                const responsePayload = await page.evaluate(async requestInfo => {
+                    const response = await fetch(requestInfo.url, {
+                        method: requestInfo.method,
+                        headers: requestInfo.method === 'POST' ? { 'content-type': 'application/json' } : undefined,
+                        body: requestInfo.method === 'POST' ? requestInfo.body : undefined,
+                        credentials: 'include'
+                    });
+                    return { status: response.status, url: response.url, text: await response.text() };
+                }, continuation);
+                if (responsePayload.status < 200 || responsePayload.status >= 300) continue;
+                const payload = parseJobApiResponseBody(responsePayload.text);
+                if (!payload) continue;
+                apiState.requestsCompleted = (apiState.requestsCompleted || 0) + 1;
+                syncApiTelemetry(apiState, options.discoveryState);
+                const candidates = acceptApiCandidatesForCompany(
+                    extractJobCandidatesFromApiPayload(payload, responsePayload.url, pageUrl), apiState
+                );
+                result.apiCandidates.push(...candidates);
+                for (const next of extractContinuationRequests(payload, responsePayload.url, continuation)) {
+                    if (!apiState.requestStates.has(next.signature || `${next.method} ${next.url} ${next.body || ''}`)) {
+                        next.signature ||= `${next.method} ${next.url} ${next.body || ''}`;
+                        apiState.continuationRequests.push(next);
+                    }
+                }
+            } catch (error) {
+                apiState.requestsFailed = (apiState.requestsFailed || 0) + 1;
+                syncApiTelemetry(apiState, options.discoveryState);
+                pageResponseState.processingFailures = (pageResponseState.processingFailures || 0) + 1;
+                logInfo('API_DISCOVERY', `Continuation failed ${truncateForLog(continuation.url, 120)} (${error.message})`);
+            }
+        }
+        if (apiState.continuationRequests.length > 0) {
+            options.discoveryState?.recordLimit('api_response_budget', CONFIG.MAX_JOB_API_RESPONSES_PER_PAGE);
+        }
+
+            const html = await page.content();
+            result.finalUrl = normalizeUrl(page.url()) || pageUrl;
+            const routeUrls = await page.evaluate(() => window.__crawlerRoutes || []).catch(() => []);
+            for (const routeUrl of routeUrls.map(url => normalizeUrl(url, result.finalUrl)).filter(Boolean)) {
+                if (isJobDetailUrl(routeUrl)) result.jobs.add(routeUrl);
+                else result.listings.add(routeUrl);
+            }
         const finalHostAllowed = isAllowedDiscoveryExternalUrl(
             result.finalUrl,
             rootUrl,
@@ -2359,12 +2565,16 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
             const iframeResult = await extractBoundedIframeLinks(page, result.finalUrl, rootUrl, {
                 ...options,
                 externalHosts: options.externalHosts || new Set(),
+                iframeState: options.iframeState,
                 maxIframes: options.iframeState
                     ? Math.max(0, CONFIG.MAX_IFRAMES_PER_PAGE - (options.iframeState.inspected || 0))
                     : CONFIG.MAX_IFRAMES_PER_PAGE
             });
             mergeExtracted(iframeResult);
-            if (options.iframeState) options.iframeState.inspected = (options.iframeState.inspected || 0) + (iframeResult.iframePagesInspected || 0);
+            if (options.iframeState) {
+                options.iframeState.inspected = (options.iframeState.inspected || 0) + (iframeResult.iframePagesInspected || 0);
+                if (iframeResult.iframeLimitReached) options.discoveryState?.recordLimit('iframe_budget');
+            }
 
             const shadowJobs = await extractOpenShadowDomJobUrls(page, result.finalUrl, rootUrl, {
                 ...options,
@@ -2399,6 +2609,11 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
         }
     } finally {
         await collectApiResults();
+        for (const continuationUrl of apiState.continuationUrls || []) {
+            if (!isJobDetailUrl(continuationUrl) && !isNonJobUrl(continuationUrl)) {
+                result.listings.add(continuationUrl);
+            }
+        }
         if (pageResponseState.processingFailures > 0 && !result.failed) {
             result.failed = true;
             result.error = 'api_response_processing_failed';
@@ -2414,7 +2629,7 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
     return result;
 }
 
-async function extractAllJobLinks(baseUrl, companyName, { onJobLink, signal, companyWebsiteUrl, trustedCareerUrl } = {}) {
+async function extractAllJobLinks(baseUrl, companyName, { onJobLink, onDiscoveryState, signal, companyWebsiteUrl, trustedCareerUrl } = {}) {
     logInfo('CRAWL', `Discovering listings and job details from: ${baseUrl}`);
     const rootUrl = normalizeUrl(baseUrl) || baseUrl;
     const queues = new Map([[10, []], [5, []], [1, []]]);
@@ -2426,11 +2641,38 @@ async function extractAllJobLinks(baseUrl, companyName, { onJobLink, signal, com
     const blockedExternalDomains = new Set();
     const externalHosts = new Set();
     const externalDiscoveryUrls = new Set();
-    const apiState = { jobsDetected: 0, identities: new Set() };
-    const iframeState = { inspected: 0 };
+    const apiState = { jobsDetected: 0, identities: new Set(), continuationUrls: new Set(), continuationRequests: [], requestStates: new Set(), requestsAttempted: 0, requestsCompleted: 0, requestsFailed: 0 };
+    let apiDirectCandidates = 0;
+    const iframeState = { inspected: 0, visited: new Set(), limitReached: false };
+    const discoveryState = createDiscoveryState(baseUrl);
+    onDiscoveryState?.(discoveryState);
     const discoveryCounters = createDiscoveryCounters();
     let listingPagesScanned = 0;
     let externalPagesScanned = 0;
+    let verificationPass = false;
+    let verificationSnapshot = null;
+    let verificationMeaningful = false;
+
+    function snapshotDiscoveryState() {
+        return {
+            jobs: jobLinks.size,
+            apiJobs: apiState.jobsDetected,
+            apiIdentities: apiState.identities.size,
+            apiRequests: apiState.requestStates.size,
+            pending: discoveryState.pendingTasks.size,
+            queued: queuedUrls.size,
+            interactions: discoveryState.interactionStates.size,
+            resultSets: discoveryState.resultHashes.size,
+            pagination: discoveryState.metrics.paginationStatesExplored,
+            iframes: iframeState.inspected
+        };
+    }
+
+    function didDiscoveryChange(before, after) {
+        if (!before) return true;
+        return ['jobs', 'apiJobs', 'apiIdentities', 'apiRequests', 'pending', 'queued', 'interactions',
+            'resultSets', 'pagination', 'iframes'].some(key => after[key] > before[key]);
+    }
 
     if (trustedCareerUrl && companyWebsiteUrl &&
         !areRelatedCompanyDomains(trustedCareerUrl, companyWebsiteUrl) &&
@@ -2450,6 +2692,8 @@ async function extractAllJobLinks(baseUrl, companyName, { onJobLink, signal, com
         const priority = priorityOverride || getDiscoveryUrlPriority(normalized);
         queues.get(priority).push(normalized);
         queuedUrls.add(normalized);
+        discoveryState.queuedUrls.add(normalized);
+        discoveryState.pendingTasks.set(normalized, { type: 'page', priority, external });
         if (external) {
             externalDiscoveryUrls.add(normalized);
             externalHosts.add(getDomainHost(normalized));
@@ -2457,12 +2701,9 @@ async function extractAllJobLinks(baseUrl, companyName, { onJobLink, signal, com
     }
 
     function dequeueDiscoveryUrl() {
-        for (const priority of [10, 5]) {
+        for (const priority of [10, 5, 1]) {
             if (queues.get(priority).length > 0) return queues.get(priority).shift();
         }
-        // Normal pages are a fallback only. Once a job listing has produced
-        // jobs, remaining generic pages cannot improve the current crawl.
-        if (jobLinks.size === 0 && queues.get(1).length > 0) return queues.get(1).shift();
         return null;
     }
 
@@ -2481,16 +2722,48 @@ async function extractAllJobLinks(baseUrl, companyName, { onJobLink, signal, com
 
     enqueueDiscoveryUrl(rootUrl, 10);
 
+    // Sitemaps and robots references are alternative discovery edges. They
+    // supplement the browser graph and are never treated as authoritative job
+    // records until each URL is fetched and validated.
+    for (const sitemapCandidate of await discoverAlternativeCareerUrls(rootUrl, discoveryState)) {
+        enqueueDiscoveryUrl(sitemapCandidate);
+    }
+
     while (visited.size < CONFIG.MAX_DISCOVERY_PAGES_PER_COMPANY) {
         throwIfAborted(signal);
         const current = dequeueDiscoveryUrl();
-        if (!current) break;
+        if (!current) {
+            if (!verificationPass) {
+                verificationPass = true;
+                verificationSnapshot = snapshotDiscoveryState();
+                verificationMeaningful = false;
+                visited.delete(rootUrl);
+                queuedUrls.delete(rootUrl);
+                discoveryState.queuedUrls.delete(rootUrl);
+                enqueueDiscoveryUrl(rootUrl, 10);
+                continue;
+            }
+            const afterVerification = snapshotDiscoveryState();
+            verificationMeaningful = didDiscoveryChange(verificationSnapshot, afterVerification);
+            discoveryState.recordDiscoveryCycle({ meaningful: verificationMeaningful });
+            if (verificationMeaningful) {
+                // New employment data appeared during verification. Drain any
+                // newly created tasks and require another measured verification
+                // pass before declaring exhaustion.
+                verificationPass = false;
+                verificationSnapshot = null;
+                continue;
+            }
+            break;
+        }
         if (visited.has(current) || isNonJobUrl(current) || isClearlyIrrelevantDiscoveryUrl(current)) continue;
         if (!isAllowedQueuedDiscoveryUrl(current, rootUrl, externalDiscoveryUrls, externalHosts)) {
             blockExternalUrl(current, 'discovery_queue_external_domain');
             continue;
         }
         visited.add(current);
+        discoveryState.pendingTasks.delete(current);
+        discoveryState.visitedUrls.add(current);
         const currentIsExternal = externalDiscoveryUrls.has(current);
         if (currentIsExternal) externalPagesScanned++;
         setLogContext({ pageUrl: current, step: 'DISCOVERY' });
@@ -2499,6 +2772,7 @@ async function extractAllJobLinks(baseUrl, companyName, { onJobLink, signal, com
             externalHosts,
             apiState,
             iframeState,
+            discoveryState,
             allowUnknownExternal: !externalHosts.has(getDomainHost(current)),
             restrictedExternalHost: externalHosts.has(getDomainHost(current))
                 ? getDomainHost(current)
@@ -2508,6 +2782,18 @@ async function extractAllJobLinks(baseUrl, companyName, { onJobLink, signal, com
         addDiscoveryCounters(discoveryCounters, extracted.counters);
         discoveryCounters.api_candidates += extracted.apiCandidates.length;
         listingPagesScanned++;
+        discoveryState.metrics.listingPagesDiscovered++;
+        discoveryState.pageState(
+            extracted.finalUrl || current,
+            `${extracted.jobs.size}|${extracted.listings.size}|${extracted.pages.size}|${extracted.apiCandidates.length}`,
+            extracted.finalUrl || current
+        );
+        discoveryState.recordResultSet([
+            ...[...extracted.jobs].map(url => ({ identity: normalizeUrl(url, current), url })),
+            ...extracted.apiCandidates.map(candidate => ({ identity: candidate.identity || candidate.jobId || candidate.detailUrl, url: candidate.detailUrl }))
+        ]);
+        discoveryState.metrics.iframeSourcesDiscovered += extracted.counters?.iframe_candidates || 0;
+        discoveryState.metrics.apiJobRecordsDiscovered += extracted.apiCandidates.length;
         if (extracted.failed) failedPages.push({ url: current, reason: extracted.error || 'unknown' });
 
         extracted.jobs.forEach(u => {
@@ -2536,22 +2822,28 @@ async function extractAllJobLinks(baseUrl, companyName, { onJobLink, signal, com
             }
             jobLinks.add(normalized);
             discoveryCounters.accepted_job_links++;
+            discoveryState.recordCandidate({ detailUrl: normalized }, null);
             setLogContext({ jobsFound: jobLinks.size });
             onJobLink?.(normalized);
         });
         extracted.apiCandidates.forEach(candidate => {
             const normalized = normalizeUrl(candidate.detailUrl || candidate.jobUrl || candidate.applyUrl, current);
-            if (!normalized || jobLinks.has(normalized) || jobLinks.size >= CONFIG.MAX_JOB_LINKS_PER_COMPANY) {
+            if (jobLinks.size >= CONFIG.MAX_JOB_LINKS_PER_COMPANY) {
+                discoveryState.recordLimit('max_job_links');
+                discoveryCounters.rejected_job_candidates++;
+                return;
+            }
+            if (normalized && jobLinks.has(normalized)) {
                 if (normalized && jobLinks.has(normalized)) discoveryCounters.duplicate_job_links++;
                 else discoveryCounters.rejected_job_candidates++;
                 return;
             }
-            if (candidate.isApplyOnly && !isLikelyIndividualJobUrl(normalized)) {
+            if (normalized && candidate.isApplyOnly && !isLikelyIndividualJobUrl(normalized)) {
                 discoveryCounters.rejected_job_candidates++;
                 return;
             }
 
-            const allowed = isAllowedDiscoveryExternalUrl(normalized, rootUrl, externalHosts);
+            const allowed = !normalized || isAllowedDiscoveryExternalUrl(normalized, rootUrl, externalHosts);
             if (!allowed) {
                 if (isAtsUrl(normalized)) {
                     atsLinks.add(normalized);
@@ -2569,10 +2861,13 @@ async function extractAllJobLinks(baseUrl, companyName, { onJobLink, signal, com
                 externalHosts.add(getDomainHost(normalized));
             }
 
-            jobLinks.add(normalized);
-            discoveryCounters.accepted_job_links++;
-            setLogContext({ jobsFound: jobLinks.size });
-            onJobLink?.(normalized);
+            if (normalized) {
+                jobLinks.add(normalized);
+                discoveryCounters.accepted_job_links++;
+            } else apiDirectCandidates++;
+            discoveryState.recordCandidate(candidate, null);
+            setLogContext({ jobsFound: jobLinks.size + apiState.jobsDetected });
+            onJobLink?.(candidate);
         });
         if (extracted.apiCandidates.length) {
             const urlCount = extracted.apiCandidates.filter(candidate => candidate.detailUrl || candidate.jobUrl || candidate.applyUrl).length;
@@ -2605,33 +2900,48 @@ async function extractAllJobLinks(baseUrl, companyName, { onJobLink, signal, com
         }
     }
 
-    const pendingHighPriority = queues.get(10).length + queues.get(5).length;
-    const deferredNormalPages = jobLinks.size > 0 ? queues.get(1).length : 0;
-    if (pendingHighPriority > 0) {
-        logWarn('DISCOVERY', `Stopped after ${visited.size} listing pages; ${pendingHighPriority} priority pages remain. Increase MAX_DISCOVERY_PAGES_PER_COMPANY for this site.`);
-    } else if (deferredNormalPages > 0) {
-        logInfo('DISCOVERY', `Skipped ${deferredNormalPages} normal pages after finding job links.`);
+    const pendingPages = queuedCount();
+    const hitPageLimit = visited.size >= CONFIG.MAX_DISCOVERY_PAGES_PER_COMPANY && pendingPages > 0;
+    const hitJobLimit = jobLinks.size >= CONFIG.MAX_JOB_LINKS_PER_COMPANY;
+    if (hitPageLimit) discoveryState.recordLimit('max_pages', CONFIG.MAX_DISCOVERY_PAGES_PER_COMPANY);
+    if (hitJobLimit) discoveryState.recordLimit('max_job_links', CONFIG.MAX_JOB_LINKS_PER_COMPANY);
+    discoveryState.updateRemaining();
+    discoveryState.finish({ finalCycleComplete: verificationPass && !verificationMeaningful && pendingPages === 0 });
+    if (hitPageLimit) {
+        logWarn('DISCOVERY', `Stopped at MAX_DISCOVERY_PAGES_PER_COMPANY=${CONFIG.MAX_DISCOVERY_PAGES_PER_COMPANY}; ${pendingPages} pages remain.`);
+    }
+    if (hitJobLimit) {
+        logWarn('DISCOVERY', `Stopped at MAX_JOB_LINKS_PER_COMPANY=${CONFIG.MAX_JOB_LINKS_PER_COMPANY}.`);
     }
     for (const atsUrl of atsLinks) {
         logInfo('DISCOVERY', `ATS portal found but left for dedicated crawler: ${atsUrl}`);
     }
 
     const links = [...jobLinks].slice(0, CONFIG.MAX_JOB_LINKS_PER_COMPANY);
+    discoveryState.metrics.apiRequestsAttempted = apiState.requestsAttempted || 0;
+    discoveryState.metrics.apiRequestsCompleted = apiState.requestsCompleted || 0;
+    discoveryState.metrics.apiRequestsFailed = apiState.requestsFailed || 0;
+    discoveryState.metrics.apiRequestsRemaining = apiState.continuationRequests?.length || 0;
     logInfo('LINKS', `job_links=${links.length} listing_pages_scanned=${listingPagesScanned} failed_listing_pages=${failedPages.length} discovery_counters=${JSON.stringify(discoveryCounters)}`);
     return {
         links,
         stats: {
-            jobLinksFound: links.length,
+            jobLinksFound: links.length + apiDirectCandidates,
             listingPagesScanned,
             externalPagesScanned,
             failedListingPages: failedPages.length,
             atsLinksFound: atsLinks.size,
-            stoppedByPageLimit: pendingHighPriority > 0,
-            stoppedByJobLimit: jobLinks.size >= CONFIG.MAX_JOB_LINKS_PER_COMPANY,
+            stoppedByPageLimit: hitPageLimit,
+            stoppedByJobLimit: hitJobLimit,
+            discoveryExhausted: discoveryState.metrics.discoveryExhausted,
+            tasksRemaining: discoveryState.metrics.tasksRemaining,
+            apiDirectCandidates,
+            telemetry: discoveryState.metrics,
             discoveryCounters,
             iframePagesInspected: iframeState.inspected
         },
-        failures: failedPages
+        failures: failedPages,
+        state: discoveryState
     };
 }
 
@@ -2711,7 +3021,9 @@ function chooseJobPageUrl({ pageUrl, canonicalUrl, jsonUrl, applyUrl }) {
 
 function isAcceptableSavedJobUrl(url, rawJob) {
     const normalized = normalizeUrl(url, rawJob?.url || url);
-    if (!normalized || isNonJobUrl(normalized) || isCareerListingUrl(normalized)) return false;
+    if (!normalized || isNonJobUrl(normalized)) return false;
+    if (rawJob?.sourceType === 'api') return true;
+    if (isCareerListingUrl(normalized)) return false;
     return isLikelyIndividualJobUrl(normalized) || Boolean(rawJob?.valid);
 }
 
@@ -3037,14 +3349,22 @@ async function embedWithVoyage(text, signal) {
 }
 
 // ─── DEDUP ────────────────────────────────────────────────────────────────
-function generateExternalJobId(url) {
-    const identity = normalizeJobIdentityUrl(url) || String(url || '').trim();
+function generateExternalJobId(value) {
+    if (value && typeof value === 'object') {
+        const identity = value.externalJobId || value.requisitionId || value.apiJobId || value.canonicalUrl;
+        if (identity) {
+            const companyPrefix = value.companyId ? `${value.companyId}:` : '';
+            return crypto.createHash('sha256').update(`${companyPrefix}${identity}`.toLowerCase()).digest('hex').slice(0, 40);
+        }
+        value = value.canonicalUrl;
+    }
+    const identity = normalizeJobIdentityUrl(value) || String(value || '').trim();
     return crypto.createHash('sha256').update(identity.toLowerCase()).digest('hex').slice(0, 40);
 }
 
 // ─── DB ───────────────────────────────────────────────────────────────────
 async function markCompanyStatus(companyId, status, { touchTimestamp = true, error: companyError } = {}) {
-    if (companyRunContext.getStore()?.timedOut && status !== 'failed') return;
+    if (companyRunContext.getStore()?.timedOut && !['failed', 'partial'].includes(status)) return;
     const u = { crawl_status: status };
     if (touchTimestamp) u.last_crawled_at = new Date().toISOString();
     if (companyError) {
@@ -3075,8 +3395,8 @@ async function batchInsertJobs(rows) {
     return inserted;
 }
 
-async function logCrawlEvent(companyId, status, payload = {}) {
-    if (companyRunContext.getStore()?.timedOut) return;
+async function logCrawlEvent(companyId, status, payload = {}, { allowWhenTimedOut = false } = {}) {
+    if (companyRunContext.getStore()?.timedOut && !allowWhenTimedOut) return;
     const row = {
         company_id: companyId,
         crawl_type: 'custom',
@@ -3104,8 +3424,10 @@ async function getActiveJobCount(companyId) {
 }
 
 // ─── PER-JOB PIPELINE ─────────────────────────────────────────────────────
-async function processJobLink(url, companyId, companyName, signal, companyWebsiteUrl) {
+async function processJobLink(input, companyId, companyName, signal, companyWebsiteUrl) {
     throwIfAborted(signal);
+    const apiCandidate = input && typeof input === 'object' ? input : null;
+    const url = apiCandidate?.detailUrl || apiCandidate?.jobUrl || apiCandidate?.applyUrl || apiCandidate?.responseUrl || input;
     const normalizedInputUrl = normalizeUrl(url) || url;
     if (isEnglishLanguageVariant(normalizedInputUrl)) {
         logWarn('JOB', `SKIP English variant: ${normalizedInputUrl}`);
@@ -3115,7 +3437,11 @@ async function processJobLink(url, companyId, companyName, signal, companyWebsit
     let pdfText = '';
     let finalUrl = normalizedInputUrl;
 
-    if (isPdfUrl(normalizedInputUrl)) {
+    if (apiCandidate) {
+        // Complete API records are valid job sources even when no HTML detail
+        // page exists. They use the same validator/classifier/upsert path below.
+        finalUrl = normalizeUrl(apiCandidate.detailUrl || apiCandidate.jobUrl || apiCandidate.applyUrl || apiCandidate.responseUrl) || normalizedInputUrl;
+    } else if (isPdfUrl(normalizedInputUrl)) {
         pdfText = await downloadAndParsePDF(normalizedInputUrl, signal) || '';
     } else {
         const r = await fetchPageWithFallback(normalizedInputUrl, { waitForSelector: 'body', scroll: true, signal });
@@ -3130,13 +3456,69 @@ async function processJobLink(url, companyId, companyName, signal, companyWebsit
         if (!html && !pdfText) return { skip: true, reason: 'fetch_failed', url: finalUrl };
     }
 
-    const rawJob = pdfText
+    const rawJob = apiCandidate
+        ? {
+            sourceType: 'api',
+            valid: true,
+            reasons: [],
+            title: apiCandidate.title,
+            rawDescription: apiCandidate.description || apiCandidate.rawDescription,
+            location: apiCandidate.location,
+            applyUrl: apiCandidate.applyUrl || apiCandidate.detailUrl || apiCandidate.jobUrl || apiCandidate.responseUrl,
+            applicationUrl: apiCandidate.applyUrl,
+            canonicalUrl: apiCandidate.detailUrl || apiCandidate.jobUrl || apiCandidate.responseUrl || finalUrl,
+            jobPageUrl: apiCandidate.detailUrl || apiCandidate.jobUrl || apiCandidate.applyUrl || apiCandidate.responseUrl || finalUrl,
+            score: 10,
+            jsonLdCount: 0,
+            hiringOrganization: apiCandidate.company,
+            employmentType: apiCandidate.employmentType,
+            department: apiCandidate.department,
+            requirements: apiCandidate.requirements,
+            responsibilities: apiCandidate.responsibilities,
+            externalJobId: apiCandidate.externalJobId,
+            requisitionId: apiCandidate.requisitionId,
+            jobId: apiCandidate.jobId,
+            referenceId: apiCandidate.referenceId,
+            stableApiId: apiCandidate.stableApiId
+        }
+        : pdfText
         ? extractRawJobFromPdf(pdfText, finalUrl)
         : extractRawJobFromHtml(html, finalUrl, companyName);
     throwIfAborted(signal);
     rawJob.url = finalUrl;
     rawJob.companyName = companyName;
     rawJob.companyWebsiteUrl = companyWebsiteUrl;
+
+    const genericValidation = validateGenericJobCandidate({
+        sourceType: rawJob.sourceType,
+        apiRecord: rawJob.sourceType === 'api',
+        title: rawJob.title,
+        rawDescription: rawJob.rawDescription,
+        location: rawJob.location,
+        detailUrl: rawJob.jobPageUrl || rawJob.canonicalUrl || finalUrl,
+        applicationUrl: rawJob.applicationUrl || rawJob.applyUrl,
+        jsonLd: rawJob.jsonLdCount > 0,
+        metadata: rawJob.hiringOrganization || rawJob.department || rawJob.requirements || rawJob.responsibilities,
+        department: rawJob.department,
+        requirements: rawJob.requirements,
+        responsibilities: rawJob.responsibilities,
+        employmentType: rawJob.employmentType,
+        externalJobId: rawJob.externalJobId,
+        jobId: rawJob.jobId,
+        requisitionId: rawJob.requisitionId,
+        referenceId: rawJob.referenceId,
+        stableApiId: rawJob.stableApiId
+    });
+
+    if (!genericValidation.valid) {
+        return {
+            skip: true,
+            reason: `generic_job_evidence_failed:${genericValidation.reasons.join('|')}`,
+            url: finalUrl,
+            title: rawJob.title,
+            evidence: genericValidation.evidence
+        };
+    }
 
     if (!rawJob.valid) {
         return {
@@ -3186,14 +3568,20 @@ async function processJobLink(url, companyId, companyName, signal, companyWebsit
             title: finalTitle
         };
     }
-    const externalSourceId = jobPageUrl || rawJob.canonicalUrl || finalUrl;
+    const externalSourceId = {
+        companyId,
+        externalJobId: rawJob.externalJobId,
+        requisitionId: rawJob.requisitionId,
+        apiJobId: rawJob.jobId || rawJob.stableApiId || rawJob.referenceId,
+        canonicalUrl: jobPageUrl || rawJob.canonicalUrl || finalUrl
+    };
     throwIfAborted(signal);
 
     return {
         skip: false,
         row: {
             company_id: companyId,
-            external_job_id: generateExternalJobId(`${companyId}:${externalSourceId}`),
+            external_job_id: generateExternalJobId(externalSourceId),
             title: finalTitle.slice(0, 255),
             raw_description: rawDescription,
             structured_skills: Array.isArray(structured.skills) && structured.skills.length > 0 ? structured.skills : null,
@@ -3278,6 +3666,9 @@ function createStreamingJobProcessor({
     let fatalError = null;
 
     const isCancelled = () => signal?.aborted || companyRunContext.getStore()?.timedOut;
+    const candidateKey = candidate => typeof candidate === 'object'
+        ? (candidate.identity || candidate.jobId || candidate.requisitionId || candidate.detailUrl || candidate.applyUrl || candidate.responseUrl)
+        : candidate;
 
     async function processOne(link) {
         let result;
@@ -3285,31 +3676,42 @@ function createStreamingJobProcessor({
             result = await withTimeout(
                 jobSignal => processJobLink(link, companyId, companyName, jobSignal, companyWebsiteUrl),
                 CONFIG.JOB_TIMEOUT_MS,
-                `job ${link}`,
+                `job ${candidateKey(link)}`,
                 undefined,
                 signal
             );
         } catch (error) {
             metrics.failedPages++;
-            if (failedSamples.length < 20) failedSamples.push({ url: link, reason: error.message });
-            logError('JOB', `FAIL ${link}: ${error.message}`);
+            if (failedSamples.length < 20) failedSamples.push({ url: candidateKey(link), reason: error.message });
+            logError('JOB', `FAIL ${candidateKey(link)}: ${error.message}`);
             return;
         }
 
         if (result.skip) {
             metrics.invalidRejected++;
+            companyRunContext.getStore()?.discoveryState?.recordValidation({
+                detailUrl: result.url || candidateKey(link),
+                title: result.title
+            }, false);
             if (isNotFoundReason(result.reason)) metrics.notFoundPages++;
             const reason = result.reason || 'unknown_rejection';
             rejectionReasons.set(reason, (rejectionReasons.get(reason) || 0) + 1);
             if (rejectedSamples.length < 20) {
-                rejectedSamples.push({ url: result.url || link, title: result.title || null, reason });
+                rejectedSamples.push({ url: result.url || candidateKey(link), title: result.title || null, reason });
             }
-            logWarn('JOB', `REJECT ${result.title || link} (${reason})`);
+            logWarn('JOB', `REJECT ${result.title || candidateKey(link)} (${reason})`);
             return;
         }
 
         metrics.jobPagesFetched++;
         metrics.jobsStructured++;
+        companyRunContext.getStore()?.discoveryState?.recordValidation({
+            identity: result.row.external_job_id,
+            detailUrl: result.meta?.url,
+            title: result.row.title,
+            location: result.row.location,
+            description: result.row.raw_description
+        }, true);
         if (seen.has(result.row.external_job_id)) {
             metrics.duplicateSkipped++;
             return;
@@ -3327,7 +3729,7 @@ function createStreamingJobProcessor({
             logInfo('JOB', `OK ${result.row.title.slice(0, 55)} | ${result.row.location || '-'} | ${result.row.structured_skills?.length || 0} skills`);
         } catch (error) {
             fatalError = fatalError || error;
-            logError('DB', `Incremental save failed for ${link}: ${error.message}`);
+            logError('DB', `Incremental save failed for ${candidateKey(link)}: ${error.message}`);
         }
     }
 
@@ -3340,7 +3742,7 @@ function createStreamingJobProcessor({
             const link = pendingLinks.shift();
             const task = processOne(link).catch(error => {
                 fatalError = fatalError || error;
-                logError('JOB', `Unexpected streaming failure for ${link}: ${error.message}`);
+                logError('JOB', `Unexpected streaming failure for ${candidateKey(link)}: ${error.message}`);
             });
             activeTasks.add(task);
             task.finally(() => {
@@ -3351,8 +3753,9 @@ function createStreamingJobProcessor({
     }
 
     function enqueue(link) {
-        if (!link || isCancelled() || fatalError || queuedLinks.has(link)) return false;
-        queuedLinks.add(link);
+        const key = candidateKey(link);
+        if (!key || isCancelled() || fatalError || queuedLinks.has(key)) return false;
+        queuedLinks.add(key);
         pendingLinks.push(link);
         pump();
         return true;
@@ -3375,63 +3778,6 @@ function createStreamingJobProcessor({
     }
 
     return { enqueue, drain };
-}
-
-// ─── COMPANY PROCESSING ───────────────────────────────────────────────────
-async function processCompany(job) {
-    const { companyId, companyName, careerUrl, companyWebsiteUrl } = job.data;
-    const startedAt = Date.now();
-    logInfo('CRAWL', `Start company="${companyName}" companyId=${companyId} careerUrl=${careerUrl || 'n/a'}`);
-    await markCompanyStatus(companyId, 'in_progress', { touchTimestamp: false });
-
-    let effectiveUrl = careerUrl;
-    if (!effectiveUrl || effectiveUrl.trim() === '') {
-        logWarn('CAREER', `Missing career URL for companyId=${companyId}; skipping instead of guessing from company name`);
-        await markCompanyStatus(companyId, 'not_found');
-        return { status: 'not_found', companyId };
-    }
-
-    logInfo('CAREER', `Using careerUrl=${effectiveUrl}`);
-
-    const links = await extractAllJobLinks(effectiveUrl, companyName);
-    logInfo('DISCOVERY', `Found ${links.length} candidate job links for companyId=${companyId}`);
-    if (links.length === 0) {
-        logWarn('DISCOVERY', `No links discovered for companyId=${companyId}`);
-        await markCompanyStatus(companyId, 'no_jobs');
-        return { status: 'no_jobs', companyId };
-    }
-
-    const rows = [];
-    const seen = new Set();
-    let skipped = 0;
-
-    let linkIndex = 0;
-    for (const link of links) {
-        try {
-            linkIndex++;
-            logInfo('JOB', `Processing ${linkIndex}/${links.length} for companyId=${companyId}`);
-            const r = await withTimeout(
-                jobSignal => processJobLink(link, companyId, companyName, jobSignal, companyWebsiteUrl),
-                CONFIG.JOB_TIMEOUT_MS,
-                `job`
-            );
-            if (r.skip) { skipped++; continue; }
-            if (seen.has(r.row.external_job_id)) continue;
-            seen.add(r.row.external_job_id);
-            rows.push(r.row);
-            logInfo('JOB', `OK ${r.row.title.slice(0, 55)} | ${r.row.location || '-'} | ${r.row.structured_skills?.length || 0} skills`);
-        } catch (e) {
-            logError('JOB', e.message);
-        }
-    }
-
-    let saved = 0;
-    if (rows.length > 0) saved = await batchInsertJobs(rows);
-    logInfo('DB', `Saved ${saved} | Skipped ${skipped} (non-jobs/non-relevant)`);
-
-    await markCompanyStatus(companyId, 'completed');
-    logInfo('CRAWL', `Done company="${companyName}" companyId=${companyId} jobsSaved=${saved} skipped=${skipped} elapsedMs=${Date.now() - startedAt}`);
-    return { status: 'success', companyId, jobsSaved: saved };
 }
 
 // ─── QUEUE ────────────────────────────────────────────────────────────────
@@ -3472,6 +3818,8 @@ async function processCompany(job, signal) {
         notFoundReason: null,
         notFoundPages: 0
     };
+    const runContext = companyRunContext.getStore();
+    if (runContext) runContext.metrics = metrics;
 
     setLogContext({
         companyName,
@@ -3548,8 +3896,10 @@ async function processCompany(job, signal) {
             signal,
             companyWebsiteUrl,
             trustedCareerUrl: isTrustedCareerEntryUrl(effectiveUrl, careerRecord) ? effectiveUrl : null,
-            onJobLink: link => jobProcessor.enqueue(link)
+            onJobLink: link => jobProcessor.enqueue(link),
+            onDiscoveryState: state => { companyRunContext.getStore().discoveryState = state; }
         });
+        companyRunContext.getStore().discoveryState = discovery.state;
         await jobProcessor.drain();
     } catch (error) {
         // A company deadline drops work that has not started, but waits for
@@ -3570,7 +3920,8 @@ async function processCompany(job, signal) {
         notFoundPages: metrics.notFoundPages + (discovery.failures?.filter(f => isNotFoundReason(f.reason)).length || 0)
     });
 
-    if (links.length === 0) {
+    const discoveredJobCount = links.length + (discovery.stats?.apiDirectCandidates || 0);
+    if (discoveredJobCount === 0) {
         const status = getZeroLinkStatus(discovery);
         const technicalFailure = status === 'failed';
         const reason = technicalFailure ? 'discovery_failed_without_job_links' : 'zero_job_links';
@@ -3596,19 +3947,23 @@ async function processCompany(job, signal) {
     metrics.activeJobsAfter = await getActiveJobCount(companyId);
     setLogContext({ step: 'SAVE', jobsSaved: metrics.jobsSaved });
 
-    const fetchedRatio = links.length > 0 ? metrics.jobPagesFetched / links.length : 0;
-    const saveRatio = links.length > 0 ? metrics.jobsSaved / links.length : 0;
+    const fetchedRatio = discoveredJobCount > 0 ? metrics.jobPagesFetched / discoveredJobCount : 0;
+    const saveRatio = discoveredJobCount > 0 ? metrics.jobsSaved / discoveredJobCount : 0;
     const partial = discovery.stats?.stoppedByPageLimit ||
+        discovery.stats?.stoppedByJobLimit ||
+        discovery.stats?.discoveryExhausted === false ||
         metrics.failedPages > 0 ||
         fetchedRatio < CONFIG.PARTIAL_CRAWL_MIN_FETCH_RATIO ||
         saveRatio < CONFIG.PARTIAL_CRAWL_MIN_SAVE_RATIO;
     const partialReasons = [];
-    if (discovery.stats?.stoppedByPageLimit) partialReasons.push('discovery stopped at the existing page limit');
+    if (discovery.stats?.stoppedByPageLimit) partialReasons.push('discovery stopped at the page safety limit');
+    if (discovery.stats?.stoppedByJobLimit) partialReasons.push('discovery stopped at the job safety limit');
+    if (discovery.stats?.discoveryExhausted === false) partialReasons.push(`${discovery.stats?.tasksRemaining || 0} discovery task(s) remained`);
     if (metrics.failedPages > 0) partialReasons.push(`${metrics.failedPages} job page(s) failed`);
     if (fetchedRatio < CONFIG.PARTIAL_CRAWL_MIN_FETCH_RATIO) partialReasons.push(`fetch ratio ${fetchedRatio.toFixed(2)}`);
     if (saveRatio < CONFIG.PARTIAL_CRAWL_MIN_SAVE_RATIO) partialReasons.push(`save ratio ${saveRatio.toFixed(2)}`);
     const allDiscoveredJobsTechnicallyUnavailable = metrics.jobsSaved === 0 &&
-        links.length > 0 &&
+        discoveredJobCount > 0 &&
         hasTechnicalJobFailure(metrics, rejectionReasons);
 
     const rejectionSummary = [...rejectionReasons.entries()]
@@ -3629,6 +3984,7 @@ async function processCompany(job, signal) {
             rejectedSamples,
             failedSamples,
             discovery: discovery.stats,
+            discovery_telemetry: discovery.stats?.telemetry || null,
             ...metrics
         });
         return { status: 'failed', companyId, companyName, companyIndex, companyTotal, jobsSaved: 0, elapsedMs: Date.now() - startedAt, metrics };
@@ -3644,6 +4000,7 @@ async function processCompany(job, signal) {
             rejectedSamples,
             failedSamples,
             discovery: discovery.stats,
+            discovery_telemetry: discovery.stats?.telemetry || null,
             ...metrics
         });
         return { status: 'partial', companyId, companyName, companyIndex, companyTotal, jobsSaved: metrics.jobsSaved, elapsedMs: Date.now() - startedAt, metrics };
@@ -3656,6 +4013,7 @@ async function processCompany(job, signal) {
         rejectedSamples,
         failedSamples,
         discovery: discovery.stats,
+        discovery_telemetry: discovery.stats?.telemetry || null,
         ...metrics
     });
     setLogContext({ step: 'DONE', jobsSaved: metrics.jobsSaved, pageUrl: effectiveUrl });
@@ -3794,15 +4152,47 @@ const worker = ENABLE_RUNTIME ? new Worker(QUEUE_NAME, async job => {
     activeCompanyRuns.add(run);
     return companyRunContext.run(run, async () => {
         try {
-            return await withTimeout(
-                signal => processCompany(job, signal),
-                CONFIG.COMPANY_TIMEOUT_MS,
-                `company ${job.data.companyName}`,
-                async () => {
-                    run.timedOut = true;
-                    await closeCompanyPages(run);
-                }
-            );
+            try {
+                return await withTimeout(
+                    signal => processCompany(job, signal),
+                    CONFIG.COMPANY_TIMEOUT_MS,
+                    `company ${job.data.companyName}`,
+                    async () => {
+                        run.timedOut = true;
+                        await closeCompanyPages(run);
+                    }
+                );
+            } catch (error) {
+                if (error?.name !== 'TimeoutError') throw error;
+                const telemetry = {
+                    ...(run.discoveryState?.metrics || {}),
+                    ...(run.metrics || {}),
+                    timed_out: true,
+                    timeout_reason: error.message,
+                    discovery_tasks_remaining: run.discoveryState?.metrics?.tasksRemaining || 0,
+                    api_requests_attempted: run.discoveryState?.metrics?.apiRequestsAttempted || 0,
+                    api_requests_completed: run.discoveryState?.metrics?.apiRequestsCompleted || 0,
+                    api_requests_failed: run.discoveryState?.metrics?.apiRequestsFailed || 0,
+                    api_requests_remaining: run.discoveryState?.metrics?.apiRequestsRemaining || 0
+                };
+                const result = {
+                    status: 'partial',
+                    companyId: job.data.companyId,
+                    companyName: job.data.companyName,
+                    jobsSaved: run.metrics?.jobsSaved || 0,
+                    elapsedMs: Date.now() - (job.processedOn || Date.now()),
+                    metrics: { ...telemetry, discovery: telemetry, partialReason: 'company_timeout' }
+                };
+                await markCompanyStatus(job.data.companyId, 'partial');
+                await logCrawlEvent(job.data.companyId, 'partial', {
+                    reason: 'company_timeout',
+                    error_message: error.message,
+                    discovery: telemetry,
+                    duration_ms: result.elapsedMs,
+                    ...telemetry
+                }, { allowWhenTimedOut: true });
+                return result;
+            }
         } finally {
             await closeCompanyPages(run);
             activeCompanyRuns.delete(run);
@@ -3935,8 +4325,6 @@ module.exports = {
     extractJobCandidatesFromApiPayload,
     normalizeApiJobRecord,
     hasJobApiEvidence,
-    isHeinrichSchmidLoadJobsUrl,
-    normalizeHeinrichSchmidSlug,
     isJobApiResponseMetadata,
     isPotentialJobApiResponse,
     parseJobApiResponseBody,
@@ -3954,5 +4342,6 @@ module.exports = {
     getZeroLinkStatus,
     hasTechnicalJobFailure,
     validateStructuredJob,
-    pageHasCareerIntent
+    pageHasCareerIntent,
+    withTimeout
 };

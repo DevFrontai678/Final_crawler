@@ -8,6 +8,15 @@ const crawler = require('../src/crawlers/custom-crawler-queue');
 
 const responseUrl = 'https://company.example/careers';
 
+test('company timeout primitive rejects with a timeout error for partial handling', async () => {
+    await assert.rejects(
+        crawler.withTimeout(signal => new Promise((resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason));
+        }), 5, 'test company timeout'),
+        error => error.name === 'TimeoutError'
+    );
+});
+
 test('API fixture 1: jobs array produces one normalized candidate', () => {
     const candidates = crawler.extractJobCandidatesFromApiPayload({
         jobs: [{ title: 'Software Engineer', id: '123', url: '/jobs/123' }]
@@ -110,92 +119,6 @@ test('API fixture 11: valid API candidates are not truncated by job-count ceilin
     const state = { jobsDetected: 0, identities: new Set() };
     const accepted = crawler.acceptApiCandidatesForCompany(candidates, state);
     assert.equal(accepted.length, 500);
-});
-
-test('API fixture 11a: Heinrich Schmid wrapped HTML response yields all unique slug jobs', () => {
-    const endpoint = 'https://www.heinrich-schmid.com/karriere/?tx_hsjobs_hj3%5Baction%5D=loadjobs&tx_hsjobs_hj3%5Bcontroller%5D=Search';
-    const records = {};
-    for (let index = 0; index < 460; index++) {
-        records[`job-${index}`] = {
-            title: `Projektstelle ${index}`,
-            slug: `/karriere/jobs/projektstelle-${index}`,
-            entry: 'Berufserfahrene',
-            activity: 'Technik',
-            initiativ: false,
-            count: index % 3 + 1,
-            lang: 0
-        };
-    }
-    records.duplicate = { ...records['job-0'], title: 'Duplicate listing' };
-    records.malformed = { title: 'Missing slug', entry: 'Berufserfahrene' };
-    const body = `<jobs>${JSON.stringify(records)}</jobs>`;
-
-    assert.equal(crawler.isHeinrichSchmidLoadJobsUrl(endpoint), true);
-    assert.equal(crawler.isJobApiResponseMetadata({
-        url: endpoint, status: 200, contentType: 'text/html; charset=utf-8', resourceType: 'xhr'
-    }), true);
-    const payload = crawler.parseJobApiResponseBody(body);
-    assert.equal(Object.keys(payload).length, 462);
-
-    const candidates = crawler.extractJobCandidatesFromApiPayload(payload, endpoint, 'https://www.heinrich-schmid.com/karriere/');
-    assert.equal(candidates.length, 460);
-    assert.equal(candidates[0].detailUrl, 'https://www.heinrich-schmid.com/karriere/jobs/projektstelle-0/');
-    assert.equal(candidates[0].locationCount, '1');
-    assert.equal(candidates.some(candidate => candidate.title === 'Missing slug'), false);
-    assert.equal(candidates.some(candidate => candidate.detailUrl.endsWith('/projektstelle-0/')), true);
-    assert.equal(crawler.classifyLink(candidates[0].detailUrl, candidates[0].title, 'career job listing', 'https://www.heinrich-schmid.com/karriere/'), 'job');
-
-    const state = { jobsDetected: 0, identities: new Set() };
-    const accepted = crawler.acceptApiCandidatesForCompany(candidates, state);
-    assert.equal(accepted.length, 460);
-    assert.equal(state.jobsDetected, 460);
-});
-
-test('API fixture 11b: Heinrich wrapped response rejects malformed JSON, missing slugs, and duplicate slugs', () => {
-    const endpoint = 'https://www.heinrich-schmid.com/karriere/?tx_hsjobs_hj3[action]=loadjobs&tx_hsjobs_hj3[controller]=Search';
-    assert.equal(crawler.parseJobApiResponseBody('<jobs>{malformed}</jobs>'), null);
-    const candidates = crawler.extractJobCandidatesFromApiPayload({
-        valid: { title: 'Valid job', slug: 'valid-job', entry: 'Entry', activity: 'Activity', count: 99 },
-        duplicate: { title: 'Same job', slug: 'valid-job', entry: 'Entry', activity: 'Activity', count: 1 },
-        missing: { title: 'No slug', entry: 'Entry', activity: 'Activity' }
-    }, endpoint, 'https://www.heinrich-schmid.com/karriere/');
-    assert.equal(candidates.length, 1);
-    assert.equal(candidates[0].detailUrl, 'https://www.heinrich-schmid.com/karriere/jobs/valid-job/');
-});
-
-test('API fixture 11e: Heinrich German and localized paths are normalized safely', () => {
-    const endpoint = 'https://www.heinrich-schmid.com/karriere/?tx_hsjobs_hj3[action]=loadjobs&tx_hsjobs_hj3[controller]=Search';
-    const baseUrl = 'https://www.heinrich-schmid.com/karriere/';
-    const records = [
-        { title: 'German job', slug: '/karriere/jobs/test-job', entry: 'Entry', activity: 'Activity' },
-        { title: 'French job', slug: '/carriere/emplois/test-job-fr', entry: 'Entry', activity: 'Activity' },
-        { title: 'Spanish job', slug: '/trabajo/empleos/test-job-es', entry: 'Entry', activity: 'Activity' },
-        { title: 'Missing slug', entry: 'Entry', activity: 'Activity' },
-        { title: 'Traversal', slug: '/../test-job', entry: 'Entry', activity: 'Activity' },
-        { title: 'External', slug: 'https://evil.example/jobs/test-job', entry: 'Entry', activity: 'Activity' }
-    ];
-    const candidates = crawler.extractJobCandidatesFromApiPayload({ records }, endpoint, baseUrl);
-    assert.deepEqual(candidates.map(candidate => candidate.detailUrl), [
-        'https://www.heinrich-schmid.com/karriere/jobs/test-job/',
-        'https://www.heinrich-schmid.com/carriere/emplois/test-job-fr/',
-        'https://www.heinrich-schmid.com/trabajo/empleos/test-job-es/'
-    ]);
-});
-
-test('API fixture 11c: random HTML is not treated as a Heinrich job API', () => {
-    const page = 'https://www.heinrich-schmid.com/karriere/';
-    const response = (url, contentType, resourceType) => ({
-        url: () => url,
-        status: () => 200,
-        headers: () => ({ 'content-type': contentType }),
-        request: () => ({ resourceType: () => resourceType })
-    });
-    assert.equal(crawler.isPotentialJobApiResponse(response(page, 'text/html; charset=utf-8', 'document')), false);
-    assert.equal(crawler.isPotentialJobApiResponse(response(
-        `${page}?tx_hsjobs_hj3%5Baction%5D=loadjobs&tx_hsjobs_hj3%5Bcontroller%5D=Search`,
-        'text/html; charset=utf-8', 'fetch'
-    )), true);
-    assert.equal(crawler.parseJobApiResponseBody('<html><body>ordinary page</body></html>'), null);
 });
 
 test('API fixture 11d: wrapped response still obeys the response byte safety limit', () => {
