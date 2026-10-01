@@ -3030,62 +3030,207 @@ function isAcceptableSavedJobUrl(url, rawJob) {
     return isLikelyIndividualJobUrl(normalized) || Boolean(rawJob?.valid);
 }
 
-// ─── LOCATION EXTRACTION ──────────────────────────────────────────────────
-function extractLocationFromContainer(container, $) {
-    const text = container.text();
-    const jsonLd = $('script[type="application/ld+json"]');
-    for (let i = 0; i < jsonLd.length; i++) {
-        try {
-            const parsed = JSON.parse($(jsonLd[i]).html());
-            const items = Array.isArray(parsed) ? parsed : [parsed];
-            for (const it of items) {
-                if (it && it['@type'] === 'JobPosting' && it.jobLocation) {
-                    const loc = it.jobLocation;
-                    if (typeof loc === 'string') {
-                        const c = extractCity(loc); if (c) return c;
-                    }
-                    if (loc.address) {
-                        const c = loc.address.addressLocality || loc.address.addressRegion;
-                        if (c) { const x = extractCity(c); if (x) return x; }
-                    }
-                }
-            }
-        } catch {}
-    }
-    const patterns = [
-        /(?:Ort|Standort|Arbeitsort|Location|Stadt|City)[:\s]+([^\n,;.!?]{2,150})/i,
-        /(?:Work Location|Job Location)[:\s]+([^\n,;.!?]{2,150})/i
-    ];
-    for (const p of patterns) {
-        const m = text.match(p);
-        if (m) { const c = extractCity(m[1].trim()); if (c) return c; }
-    }
-    return null;
+// ─── GENERIC JOB LOCATION EVIDENCE ────────────────────────────────────────
+const JOB_LOCATION_LABEL_PATTERN = /^(?:location|locations|arbeitsort|arbeitsplatz|arbeitsplatzort|einsatzort|einsatzorte|standort|dienstort|ort|stadt|city|job location|work location|place of work|place of employment|location\(s\))$/i;
+const JOB_LOCATION_LABEL_SEARCH_PATTERN = /\b(?:location|locations|arbeitsort|arbeitsplatz|arbeitsplatzort|einsatzort|einsatzorte|standort|dienstort|ort|stadt|city|job location|work location|place of work|place of employment|location\(s\))\b/i;
+const NON_LOCATION_VALUE_PATTERN = /^(?:remote|hybrid|homeoffice|home office|vollzeit|teilzeit|full[- ]?time|part[- ]?time|n\/a|none|unknown|unspecified)$/i;
+const LOCATION_EXCLUDED_SELECTOR = 'footer, header, nav, aside, [class*="footer"], [id*="footer"], [class*="impressum"], [id*="impressum"], [class*="contact"], [id*="contact"], [class*="cookie"], [id*="cookie"], [class*="breadcrumb"], [id*="breadcrumb"]';
+
+function normalizeLocationEvidenceText(value) {
+    return String(value || '')
+        .replace(/\u00a0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/[|]+/g, ' ')
+        .trim();
 }
 
-function extractCity(text) {
-    if (!text || typeof text !== 'string') return null;
-    let cleaned = text.replace(/\s+/g, ' ').trim();
-    if (cleaned.length < 2 || cleaned.length > 120) return null;
-    // Look for known German city names
-    const cities = ['Berlin', 'Hamburg', 'Munich', 'München', 'Cologne', 'Köln',
-        'Frankfurt', 'Stuttgart', 'Düsseldorf', 'Dortmund', 'Essen', 'Leipzig',
-        'Dresden', 'Hannover', 'Hanover', 'Nürnberg', 'Nuremberg', 'Duisburg',
-        'Bochum', 'Wuppertal', 'Bielefeld', 'Bonn', 'Mannheim', 'Karlsruhe',
-        'Wiesbaden', 'Aachen', 'Kiel', 'Magdeburg', 'Braunschweig', 'Chemnitz',
-        'Göttingen', 'Rostock', 'Kassel', 'Saarbrücken', 'Augsburg', 'Ulm',
-        'Oldenburg', 'Potsdam', 'Halle', 'Erfurt', 'Jena', 'Ludwigshafen',
-        'Trier', 'Freiburg', 'Heidelberg', 'Koblenz', 'Krefeld', 'Neuss',
-        'Reutlingen', 'Landshut', 'Passau', 'Regensburg', 'Ingolstadt', 'Fürth',
-        'Erlangen', 'Würzburg', 'Darmstadt', 'Mainz', 'Marburg', 'Fulda',
-        'Wolfsburg', 'Lübeck', 'Worms', 'Konstanz', 'Kempten', 'Tübingen',
-        'Böblingen', 'Ludwigsburg', 'Göppingen', 'Heidenheim', 'Aalen',
-        'Vienna', 'Wien', 'Graz', 'Linz', 'Salzburg', 'Innsbruck',
-        'Zurich', 'Zürich', 'Geneva', 'Genf', 'Basel', 'Bern', 'Lausanne'];
-    for (const c of cities) {
-        if (cleaned.includes(c)) return c;
+function isJobLocationLabel(value) {
+    return JOB_LOCATION_LABEL_PATTERN.test(normalizeLocationEvidenceText(value).replace(/[:：]+$/, ''));
+}
+
+function validJobLocationValue(value) {
+    const cleaned = normalizeLocationEvidenceText(value)
+        .replace(/^(?:[:：\-]\s*)+/, '')
+        .replace(/[.,;|]+$/, '')
+        .trim();
+    if (!cleaned || cleaned.length < 2 || cleaned.length > 220) return null;
+    if (NON_LOCATION_VALUE_PATTERN.test(cleaned)) return null;
+    if (/^(?:telefon|tel\.?|phone|fax|email|e-mail|register|legal form|rechtsform|supervisory board|aufsichtsrat)\b/i.test(cleaned)) return null;
+    if (/^[+\d\s()./-]{6,}$/.test(cleaned) || /@/.test(cleaned)) return null;
+    return cleaned;
+}
+
+function splitLocationValues(value) {
+    const text = normalizeLocationEvidenceText(value);
+    if (!text) return [];
+    return text
+        .split(/\s*(?:\n|\r|•|\u2022|\|)\s*|\s*(?<=\d{4,6}\s+[A-ZÄÖÜÀ-ÖØ-Þ][A-Za-zÄÖÜÀ-öø-ÿ' .-]{2,60})\s+(?=[A-ZÄÖÜÀ-ÖØ-Þ][A-Za-zÄÖÜÀ-öø-ÿ' .-]{2,60},?\s+\d{4,6}\b)/u)
+        .map(validJobLocationValue)
+        .filter(Boolean);
+}
+
+function createJobLocationEvidence() {
+    return { values: [], raw_evidence: [], source_types: [] };
+}
+
+function addJobLocationEvidence(evidence, value, source, label, confidence) {
+    for (const item of splitLocationValues(value)) {
+        const duplicate = evidence.values.find(existing => existing.value.toLowerCase() === item.toLowerCase());
+        if (duplicate) {
+            duplicate.confidence = Math.max(duplicate.confidence, confidence);
+            if (!duplicate.source_types.includes(source)) duplicate.source_types.push(source);
+            continue;
+        }
+        evidence.values.push({ value: item, source, label: label || null, confidence, source_types: [source] });
+        evidence.raw_evidence.push(label ? `${label}: ${item}` : item);
+        if (!evidence.source_types.includes(source)) evidence.source_types.push(source);
     }
-    return null;
+}
+
+function locationValueFromStructuredPlace(place) {
+    if (typeof place === 'string') return place;
+    if (!place || typeof place !== 'object') return null;
+    const address = place.address && typeof place.address === 'object' ? place.address : place;
+    const street = address.streetAddress || address.street || '';
+    const postal = address.postalCode || address.zip || '';
+    const locality = address.addressLocality || address.city || '';
+    const region = address.addressRegion || address.region || '';
+    const country = typeof address.addressCountry === 'object'
+        ? (address.addressCountry.name || address.addressCountry.value || '')
+        : (address.addressCountry || address.country || '');
+    const structured = [street, [postal, locality].filter(Boolean).join(' '), region, country]
+        .map(normalizeLocationEvidenceText)
+        .filter(Boolean)
+        .join(', ');
+    return structured || null;
+}
+
+function collectJobPostingLocationObjects(value, output = []) {
+    if (!value || typeof value !== 'object') return output;
+    if (Array.isArray(value)) {
+        value.forEach(item => collectJobPostingLocationObjects(item, output));
+        return output;
+    }
+    const type = value['@type'];
+    const isJobPosting = type === 'JobPosting' || (Array.isArray(type) && type.includes('JobPosting'));
+    if (isJobPosting && value.jobLocation) {
+        const locations = Array.isArray(value.jobLocation) ? value.jobLocation : [value.jobLocation];
+        locations.forEach(location => output.push(location));
+    }
+    Object.values(value).forEach(child => collectJobPostingLocationObjects(child, output));
+    return output;
+}
+
+function addJsonLdJobLocationEvidence($, evidence) {
+    $('script[type="application/ld+json"]').each((_, element) => {
+        try {
+            const parsed = JSON.parse($(element).contents().text().trim());
+            for (const location of collectJobPostingLocationObjects(parsed)) {
+                addJobLocationEvidence(evidence, locationValueFromStructuredPlace(location), 'json_ld', 'jobLocation', 1);
+            }
+        } catch { /* malformed or non-JSON-LD scripts are ignored */ }
+    });
+}
+
+function addMicrodataJobLocationEvidence($, root, evidence) {
+    root.find('[itemprop="jobLocation"], [itemprop="location"]').each((_, element) => {
+        const root = $(element);
+        const fields = {};
+        root.find('[itemprop]').addBack('[itemprop]').each((__, field) => {
+            const key = $(field).attr('itemprop');
+            if (key) fields[key] = $(field).attr('content') || $(field).text();
+        });
+        addJobLocationEvidence(evidence, locationValueFromStructuredPlace(fields) || root.text(), 'microdata', 'jobLocation', 0.98);
+    });
+    root.find('[property="jobLocation"], [property="schema:jobLocation"]').each((_, element) => {
+        addJobLocationEvidence(evidence, $(element).attr('content') || $(element).text(), 'rdfa', 'jobLocation', 0.96);
+    });
+}
+
+function elementTextWithSeparators($, element) {
+    const clone = $(element).clone();
+    const html = String(clone.html() || '')
+        .replace(/<br\s*\/?\s*>/gi, ' ')
+        .replace(/<\/(?:h[1-6]|p|div|section|article|li|dt|dd|th|td)>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ');
+    return normalizeLocationEvidenceText(html);
+}
+
+function addLabelValueEvidence($, root, evidence) {
+    const addPair = (labelElement, valueElements, source, confidence) => {
+        const label = normalizeLocationEvidenceText($(labelElement).text()).replace(/[:：]+$/, '');
+        if (!isJobLocationLabel(label)) return;
+        for (const valueElement of valueElements) {
+            addJobLocationEvidence(evidence, elementTextWithSeparators($, valueElement), source, label, confidence);
+        }
+    };
+
+    root.find('dt').each((_, element) => {
+        const values = [];
+        let sibling = $(element).next();
+        while (sibling.length && sibling.is('dd')) {
+            values.push(sibling[0]);
+            sibling = sibling.next();
+        }
+        addPair(element, values, 'definition_list', 0.96);
+    });
+
+    root.find('tr').each((_, element) => {
+        const cells = $(element).find('th,td').toArray();
+        if (cells.length >= 2) addPair(cells[0], cells.slice(1), 'table', 0.95);
+    });
+
+    root.find('div, li, p, section, article').each((_, element) => {
+        const root = $(element);
+        const children = root.children().toArray();
+        if (children.length >= 2) {
+            const label = normalizeLocationEvidenceText($(children[0]).text()).replace(/[:：]+$/, '');
+            if (isJobLocationLabel(label)) addPair(children[0], children.slice(1), 'label_value', 0.92);
+        }
+        const text = elementTextWithSeparators($, element);
+        if (text.length <= 320 && JOB_LOCATION_LABEL_SEARCH_PATTERN.test(text)) {
+            const match = text.match(/^(.{2,60}?)\s*[:：-]\s*(.+)$/i);
+            if (match && isJobLocationLabel(match[1])) addJobLocationEvidence(evidence, match[2], 'label_value', match[1], 0.9);
+        }
+    });
+}
+
+function addSemanticAddressEvidence($, root, evidence) {
+    root.find('address').each((_, element) => {
+        const root = $(element);
+        const context = `${elementTextWithSeparators($, root.parent())} ${root.attr('class') || ''} ${root.attr('id') || ''}`;
+        if (JOB_LOCATION_LABEL_SEARCH_PATTERN.test(context)) {
+            addJobLocationEvidence(evidence, elementTextWithSeparators($, element), 'address_element', 'job location', 0.9);
+        } else {
+            addJobLocationEvidence(evidence, elementTextWithSeparators($, element), 'address_element', null, 0.82);
+        }
+    });
+}
+
+function addDescriptionLocationEvidence(text, evidence) {
+    const normalized = String(text || '').replace(/\r/g, '');
+    const labelled = /(?:Arbeitsort|Arbeitsplatz|Arbeitsplatzort|Einsatzort|Einsatzorte|Standort|Dienstort|Location(?:s)?|Job Location|Work Location|Place of Work)\s*[:：-]\s*([^\n|]{2,180})/gi;
+    for (const match of normalized.matchAll(labelled)) addJobLocationEvidence(evidence, match[1], 'description', match[0].split(/[:：-]/)[0], 0.84);
+    const prose = /(?:die stelle|the position|this role|the job)\s+(?:ist|is|liegt|liegt in|is based|based)\s+(?:in|at)\s+([A-ZÄÖÜÀ-ÖØ-Þ][A-Za-zÄÖÜÀ-öø-ÿ' .-]{2,100}?)(?:\s+(?:angesiedelt|located|based))?(?=[.!?,;]|$)/gi;
+    for (const match of normalized.matchAll(prose)) addJobLocationEvidence(evidence, match[1], 'description', 'employment location statement', 0.78);
+    const based = /\bposition\s+based\s+in\s+([A-ZÄÖÜÀ-ÖØ-Þ][A-Za-zÄÖÜÀ-öø-ÿ' .-]{2,100})/gi;
+    for (const match of normalized.matchAll(based)) addJobLocationEvidence(evidence, match[1], 'description', 'position based in', 0.78);
+}
+
+function extractJobLocationEvidence(container, $, descriptionText = '') {
+    const evidence = createJobLocationEvidence();
+    const scoped = container.clone();
+    scoped.find(LOCATION_EXCLUDED_SELECTOR).remove();
+    addJsonLdJobLocationEvidence($, evidence);
+    addMicrodataJobLocationEvidence($, scoped, evidence);
+    addSemanticAddressEvidence($, scoped, evidence);
+    addLabelValueEvidence($, scoped, evidence);
+    addDescriptionLocationEvidence(descriptionText || elementTextWithSeparators($, scoped), evidence);
+    evidence.values.sort((a, b) => b.confidence - a.confidence);
+    evidence.locations = evidence.values.map(item => item.value);
+    evidence.location = evidence.locations.join('; ') || null;
+    evidence.raw_evidence = evidence.raw_evidence.join(' | ');
+    return evidence;
 }
 
 // ─── DESCRIPTION EXTRACTION ───────────────────────────────────────────────
@@ -3182,6 +3327,8 @@ function extractRawJobFromHtml(html, pageUrl, companyName) {
     const jsonJobs = extractJsonLdJobPostings($);
     const jsonJob = jsonJobs[0] || null;
     const canonicalUrl = normalizeUrl($('link[rel="canonical"]').attr('href'), pageUrl) || pageUrl;
+    const locationContainer = findJobContainer($);
+    const locationEvidence = extractJobLocationEvidence(locationContainer, $, null);
     $('script,style,noscript,nav,footer,header,.cookie-banner,#cookie,[class*="cookie"],[class*="navigation"],[class*="breadcrumb"]').remove();
     const jsonUrl = normalizeUrl(jsonJob?.url, pageUrl);
     const applicationUrl = normalizeUrl(jsonJob?.applicationContact?.url, pageUrl) ||
@@ -3192,9 +3339,17 @@ function extractRawJobFromHtml(html, pageUrl, companyName) {
     const container = findJobContainer($);
     const htmlTitle = extractJobTitleFromContainer(container, $);
     const title = compactText(jsonJob?.title || htmlTitle, 220);
-    const visibleText = compactText(container.text() || $('body').text(), 12000);
+    const visibleText = compactText(elementTextWithSeparators($, container) || $('body').text(), 12000);
     const rawDescription = cleanDescription([title, jsonDescription, visibleText].filter(Boolean).join('\n\n'));
-    const location = extractLocationFromJsonLd(jsonJob) || extractLocationFromContainer(container, $);
+    locationEvidence.raw_evidence = Array.isArray(locationEvidence.raw_evidence)
+        ? locationEvidence.raw_evidence
+        : (locationEvidence.raw_evidence ? [locationEvidence.raw_evidence] : []);
+    addDescriptionLocationEvidence(rawDescription || visibleText, locationEvidence);
+    locationEvidence.values.sort((a, b) => b.confidence - a.confidence);
+    locationEvidence.locations = locationEvidence.values.map(item => item.value);
+    locationEvidence.location = locationEvidence.locations.join('; ') || null;
+    locationEvidence.raw_evidence = locationEvidence.raw_evidence.join(' | ');
+    const location = locationEvidence.location;
     const hiringOrganization = extractHiringOrganizationName(jsonJob);
     const discoveredDetailLinks = extractLinksFromHtml(html, pageUrl, pageUrl).jobs.size;
     const score = scoreJobPage({
@@ -3217,6 +3372,7 @@ function extractRawJobFromHtml(html, pageUrl, companyName) {
         title,
         rawDescription,
         location,
+        locationEvidence,
         applyUrl: jobPageUrl,
         applicationUrl,
         canonicalUrl,
@@ -3279,6 +3435,7 @@ async function structureJobWithGPT(rawJobOrTitle, maybeDescription, signal) {
         raw_description: rawJob.rawDescription || maybeDescription || '',
         source_url: rawJob.canonicalUrl || rawJob.url || null,
         crawler_location: rawJob.location || null,
+        location_evidence: rawJob.locationEvidence?.raw_evidence || null,
         structured_location: rawJob.structuredLocation || null,
         company_hq: rawJob.companyHq || await findCompanyHqLocation(rawJob.companyWebsiteUrl, { signal }),
         model: CONFIG.GPT_MODEL
@@ -3545,12 +3702,14 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
     }
 
     const companyHq = rawJob.companyHq || await findCompanyHqLocation(companyWebsiteUrl, { signal });
+    const deterministicLocation = rawJob.locationEvidence?.location || rawJob.location || null;
     const resolvedLocation = await resolveJobLocation({
-        location: structured.job_location,
+        location: deterministicLocation || structured.job_location,
         company_website: companyWebsiteUrl,
         company_hq: companyHq,
         raw_description: rawJob.rawDescription,
         description: rawJob.rawDescription,
+        location_evidence: rawJob.locationEvidence?.raw_evidence || null,
         title: structuredValidation.title,
         employment_type: structured.employment_type,
         remote_evidence: structured.remote_type === 'hybrid' ? 'hybrid' : '',
@@ -4347,6 +4506,8 @@ module.exports = {
         MAX_JOB_API_JSON_DEPTH: CONFIG.MAX_JOB_API_JSON_DEPTH,
     },
     extractRawJobFromHtml,
+    extractJobLocationEvidence,
+    splitLocationValues,
     isAcceptableSavedJobUrl,
     isCareerListingUrl,
     isGenericJobTitle,
