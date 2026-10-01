@@ -637,6 +637,62 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429]);
+const TRANSIENT_ERROR_CODES = new Set([
+  'ECONNABORTED',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'ETIMEDOUT',
+  'ERR_NETWORK',
+  'ERR_SOCKET_TIMEOUT',
+]);
+
+function isOperationalFailure(resultOrError) {
+  if (resultOrError?.operationalFailure) {
+    return isOperationalFailure(resultOrError.operationalFailure);
+  }
+
+  const status = Number(resultOrError?.status);
+  if (TRANSIENT_HTTP_STATUSES.has(status) || status === 0 || status >= 500) return true;
+
+  const code = String(
+    resultOrError?.error?.code ||
+    resultOrError?.code ||
+    resultOrError?.cause?.code ||
+    ''
+  ).toUpperCase();
+  return TRANSIENT_ERROR_CODES.has(code);
+}
+
+function buildStoredAtsFallback(company, reason) {
+  const storedAts = String(company?.ats_type || '').trim().toLowerCase();
+  const atsType = storedAts === 'custom' ? 'custom' : canonicalClientAts(storedAts);
+  const careerUrl = normalizeUrl(company?.career_page_url) || normalizeUrl(company?.detected_career_url);
+
+  if (!atsType || !careerUrl) return null;
+
+  return {
+    career_page_url: careerUrl,
+    detected_career_url: normalizeUrl(company?.detected_career_url) || careerUrl,
+    ats_type: atsType,
+    ats_confidence: company.ats_confidence || 0,
+    ats_api_url: company.ats_api_url || null,
+    crawl_status: atsType === 'custom' ? 'custom_detected' : 'ats_detected',
+    career_page_status: company.career_page_status || 'transient_detection_failure',
+    last_error: reason?.message || String(reason || 'Temporary ATS detection failure'),
+    last_error_type: reason?.code || reason?.name || 'TransientDetectionFailure',
+    detection_signals: {
+      ats_refresh_fallback: {
+        reason: 'operational_failure',
+        preserved_ats_type: atsType,
+        preserved_career_url: careerUrl,
+      },
+    },
+  };
+}
+
 function getAbortError(signal) {
   if (signal?.reason instanceof Error) return signal.reason;
 
@@ -1049,7 +1105,8 @@ async function fetchCompanies(checkpoint = null) {
         detected_career_url,
         career_page_status,
         ats_type,
-        ats_api_url,
+         ats_confidence,
+         ats_api_url,
         crawl_status
       `)
       .order('Id', { ascending: true })
@@ -1647,7 +1704,7 @@ function careerEvidenceScore(url, html, title, source, websiteUrl) {
   return score;
 }
 
-async function validateCareerCandidate(candidate, websiteUrl, workerId, signal) {
+async function validateCareerCandidate(candidate, websiteUrl, workerId, signal, diagnostics = null) {
   throwIfAborted(signal);
   const candidateUrl = safeUrl(candidate.url);
   if (!candidateUrl) return null;
@@ -1665,6 +1722,10 @@ async function validateCareerCandidate(candidate, websiteUrl, workerId, signal) 
     const title = extractTitle(fetched.html);
     const httpOk = fetched.status >= 200 && fetched.status < 400;
     const blockedOrRateLimited = [401, 403, 429].includes(fetched.status);
+
+    if (!httpOk && diagnostics && isOperationalFailure(fetched)) {
+      diagnostics.operationalFailure = fetched;
+    }
 
     if (isSoft404(fetched.html, title)) return null;
 
@@ -1731,6 +1792,9 @@ async function validateCareerCandidate(candidate, websiteUrl, workerId, signal) 
     };
   } catch (err) {
     throwIfAborted(signal);
+    if (diagnostics && isOperationalFailure(err)) {
+      diagnostics.operationalFailure = err;
+    }
     return null;
   }
 }
@@ -2361,13 +2425,16 @@ async function discoverCareerPage(company, workerId, signal) {
     }))
     .sort((a, b) => b.score - a.score);
 
+  const existingCareerDiagnostics = {};
+
   for (const candidate of existingCandidates) {
     throwIfAborted(signal);
     const validated = await validateCareerCandidate(
       candidate,
       websiteUrl || candidate.url,
       workerId,
-      signal
+      signal,
+      existingCareerDiagnostics
     );
 
     if (validated) {
@@ -2573,7 +2640,10 @@ async function discoverCareerPage(company, workerId, signal) {
     protocolUsed: homepageResult?.protocolUsed || null,
     title: homepageResult?.html ? extractTitle(homepageResult.html) : null,
     redirects: homepageResult?.redirects || [],
-    metadata: homepageResult,
+    metadata: {
+      ...(homepageResult || {}),
+      operationalFailure: existingCareerDiagnostics.operationalFailure || null,
+    },
     genuineCareer: false,
   };
 
@@ -2622,6 +2692,25 @@ async function processCompany(company, workerId, signal) {
   const discoveredUrl = normalizeUrl(careerDiscovery?.url);
 
   if (!discoveredUrl || !careerDiscovery?.genuineCareer) {
+    const fallback = isOperationalFailure(careerDiscovery?.metadata)
+      ? buildStoredAtsFallback(
+          company,
+          careerDiscovery?.metadata?.error || new Error('Temporary career discovery failure')
+        )
+      : null;
+
+    if (fallback) {
+      return {
+        status: 'transient_failure_fallback',
+        result: fallback,
+        metadata: {
+          retryCount: 0,
+          error: fallback.last_error,
+          preservedPreviousDetection: true,
+        },
+      };
+    }
+
     return {
       status: 'no_url',
       result: {
@@ -2738,6 +2827,25 @@ async function processCompany(company, workerId, signal) {
           };
         }
       } else {
+        const fallback = isOperationalFailure(fetchResult)
+          ? buildStoredAtsFallback(
+              company,
+              fetchResult.error || new Error('Temporary career page fetch failure')
+            )
+          : null;
+
+        if (fallback) {
+          return {
+            status: 'transient_failure_fallback',
+            result: fallback,
+            metadata: {
+              retryCount,
+              error: fallback.last_error,
+              preservedPreviousDetection: true,
+            },
+          };
+        }
+
         detectionResult = {
           ats_type: 'error',
           ats_confidence: 0,
@@ -2940,6 +3048,22 @@ async function processCompany(company, workerId, signal) {
       lastError = err;
 
       if (attempt === CONFIG.maxRetries - 1) {
+        const fallback = isOperationalFailure(err)
+          ? buildStoredAtsFallback(company, err)
+          : null;
+
+        if (fallback) {
+          return {
+            status: 'transient_failure_fallback',
+            result: fallback,
+            metadata: {
+              retryCount: retryCount + 1,
+              error: fallback.last_error,
+              preservedPreviousDetection: true,
+            },
+          };
+        }
+
         const elapsed = Date.now() - startTime;
 
         // Career discovery already verified this URL. Preserve the genuine
@@ -3409,6 +3533,8 @@ if (require.main === module) {
 module.exports = {
   canonicalCareerListingCandidates,
   collectHomepageCandidates,
+  buildStoredAtsFallback,
+  isOperationalFailure,
   isCareerListingUrl,
   isIndividualCareerJobUrl,
 };

@@ -277,8 +277,7 @@ async function run() {
     const { data: companies, error } = await supabase
         .from('companies')
         .select('"Id", "Name", "Website", detected_career_url')
-        .eq('ats_type', 'softgarden')
-        .eq('crawl_status', 'ats_detected');
+        .eq('ats_type', 'softgarden');
 
     if (error) {
         console.error('❌ Supabase error:', error.message);

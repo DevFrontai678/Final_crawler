@@ -138,11 +138,7 @@ async function addSoftgardenCompaniesToQueue() {
     let totalAdded = 0;
     let hasMore = true;
 
-    // 🔥 Recrawl interval (default 48 hours)
-    const recrawlHours = parseInt(process.env.RECRAWL_INTERVAL_HOURS || '48', 10);
-    const cutoffIso = new Date(Date.now() - recrawlHours * 60 * 60 * 1000).toISOString();
-
-    console.log(`📋 Fetching Softgarden companies (pending or last crawled before ${cutoffIso})...`);
+    console.log('📋 Fetching all eligible Softgarden companies...');
 
     while (hasMore) {
         const start = page * pageSize;
@@ -152,8 +148,6 @@ async function addSoftgardenCompaniesToQueue() {
             .from('companies')
             .select('"Id", detected_career_url, "Name", "Website", crawl_status, last_crawled_at')
             .eq('ats_type', 'softgarden')
-            .neq('crawl_status', 'in_progress')
-            .or(`crawl_status.eq.pending,last_crawled_at.lt.${cutoffIso}`)
             .not('detected_career_url', 'is', null)
             .order('Id', { ascending: true })
             .range(start, end);
@@ -249,7 +243,7 @@ const worker = new Worker(QUEUE_NAME, async job => {
                 .from('jobs')
                 .upsert(preparedJobs, {
                     onConflict: 'company_id,external_job_id',
-                    ignoreDuplicates: true
+                    ignoreDuplicates: false
                 });
 
             if (saveError) {

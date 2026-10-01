@@ -291,8 +291,7 @@ async function run() {
     const { data: companies, error } = await supabase
         .from('companies')
         .select('"Id", "Name", "Website", detected_career_url')
-        .eq('ats_type', 'rexx')
-        .in('crawl_status', ['pending', 'ats_detected']);
+        .eq('ats_type', 'rexx');
 
     if (error) {
         console.error('❌ Supabase error:', error.message);

@@ -164,7 +164,6 @@ const CONFIG = {
     MAX_JOB_LINKS_PER_COMPANY: parseInt(process.env.MAX_JOB_LINKS_PER_COMPANY || '5000', 10),
     MAX_DISCOVERY_PAGES_PER_COMPANY: parseInt(process.env.MAX_DISCOVERY_PAGES_PER_COMPANY || '1000', 10),
     MAX_EXTERNAL_DISCOVERY_PAGES_PER_COMPANY: parseInt(process.env.MAX_EXTERNAL_DISCOVERY_PAGES_PER_COMPANY || '25', 10),
-    RECRAWL_INTERVAL_HOURS: parseInt(process.env.RECRAWL_INTERVAL_HOURS || '48', 10),
     COMPANY_TIMEOUT_MS: CRAWLER_TIMEOUTS.CUSTOM_CRAWLER_COMPANY_TIMEOUT_MS,
     JOB_TIMEOUT_MS: CRAWLER_TIMEOUTS.JOB_TIMEOUT_MS,
     JOB_DETAIL_CONCURRENCY: Math.max(1, parseInt(process.env.CRAWLER_JOB_DETAIL_CONCURRENCY || '5', 10) || 5),
@@ -3688,7 +3687,6 @@ async function rebuildQueue() {
 }
 
 async function enqueueCompanies() {
-    const cutoff = new Date(Date.now() - CONFIG.RECRAWL_INTERVAL_HOURS * 3600 * 1000).toISOString();
     let page = 0, total = 0, hasMore = true;
     let totalEligible = null;
 
@@ -3696,9 +3694,7 @@ async function enqueueCompanies() {
     const { count: countResult, error: countError } = await supabase.from('companies')
         .select('"Id"', { count: 'exact', head: true })
         .eq('ats_type', 'custom')
-        .or('detected_career_url.not.is.null,career_page_url.not.is.null')
-        .neq('crawl_status', 'in_progress')
-        .or(`crawl_status.eq.pending,last_crawled_at.is.null,last_crawled_at.lt.${cutoff}`);
+        .or('detected_career_url.not.is.null,career_page_url.not.is.null');
 
     if (countError) {
         console.warn(`[QUEUE] Count query failed: ${countError.message}`);
@@ -3716,8 +3712,6 @@ async function enqueueCompanies() {
             .select('"Id", detected_career_url, career_page_url, career_page_status, detection_signals, "Name", "Website"')
             .eq('ats_type', 'custom')
             .or('detected_career_url.not.is.null,career_page_url.not.is.null')
-            .neq('crawl_status', 'in_progress')
-            .or(`crawl_status.eq.pending,last_crawled_at.is.null,last_crawled_at.lt.${cutoff}`)
             .order('Id', { ascending: true })
             .range(start, end);
 
