@@ -3021,6 +3021,9 @@ function chooseJobPageUrl({ pageUrl, canonicalUrl, jsonUrl, applyUrl }) {
 
 function isAcceptableSavedJobUrl(url, rawJob) {
     const normalized = normalizeUrl(url, rawJob?.url || url);
+    if (rawJob?.sourceType === 'api' && !normalized) {
+        return Boolean(rawJob.externalJobId || rawJob.jobId || rawJob.requisitionId || rawJob.referenceId || rawJob.stableApiId);
+    }
     if (!normalized || isNonJobUrl(normalized)) return false;
     if (rawJob?.sourceType === 'api') return true;
     if (isCareerListingUrl(normalized)) return false;
@@ -3541,12 +3544,21 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
         };
     }
 
+    const companyHq = rawJob.companyHq || await findCompanyHqLocation(companyWebsiteUrl, { signal });
     const resolvedLocation = await resolveJobLocation({
         location: structured.job_location,
         company_website: companyWebsiteUrl,
+        company_hq: companyHq,
+        raw_description: rawJob.rawDescription,
+        description: rawJob.rawDescription,
+        title: structuredValidation.title,
+        employment_type: structured.employment_type,
+        remote_evidence: structured.remote_type === 'hybrid' ? 'hybrid' : '',
+        requirements: rawJob.requirements,
+        responsibilities: rawJob.responsibilities,
         location_lat: null,
         location_lng: null
-    }, { signal });
+    }, { signal, companyHq });
     const location = resolvedLocation.location;
     const lat = resolvedLocation.location_lat;
     const lng = resolvedLocation.location_lng;
@@ -3589,9 +3601,9 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
             location: location ? String(location) : null,
             location_lat: lat,
             location_lng: lng,
-            remote_type: structured.remote_type,
-            _classification_source: 'llm',
-            _location_source: structured.job_location ? 'llm' : resolvedLocation.source,
+            remote_type: resolvedLocation.remote_type,
+            _classification_source: 'authoritative',
+            _location_source: resolvedLocation.source,
             employment_type: structured.employment_type,
             skill_embedding: embedding,
             apply_url: jobPageUrl,

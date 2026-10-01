@@ -24,6 +24,97 @@ function normalizeLocation(location) {
     return value.length > 0 ? value : null;
 }
 
+function normalizeActualLocation(location) {
+    const value = normalizeLocation(location);
+    if (!value) return null;
+    const normalized = value.toLowerCase().replace(/[.]/g, '').trim();
+    if ([
+        LOCATION_UNKNOWN.toLowerCase(), 'n/a', 'na', 'null', 'none',
+        'remote', 'fully remote', 'hybrid', 'home office', 'homeoffice',
+        'anywhere', 'various locations', 'multiple locations', 'flexible location'
+    ].includes(normalized)) return null;
+    if (/\b(?:remote|home[- ]?office|homeoffice|anywhere)\b/i.test(normalized)) return null;
+    return value;
+}
+
+function employmentText(job = {}) {
+    return [
+        job.title, job.raw_description, job.description, job.requirements,
+        job.responsibilities, job.employment_type, job.employmentType,
+        job.remote_evidence, job.remoteEvidence,
+        job.remote_type === 'hybrid' ? 'hybrid' : ''
+    ].filter(Boolean).map(asTrimmedString).join('\n');
+}
+
+function isTechnicalRemoteContext(text, matchIndex) {
+    const context = text.slice(Math.max(0, matchIndex - 70), matchIndex + 100).toLowerCase();
+    return /\b(?:server|access|support|monitor(?:ing)?|system|desktop|connection|administration|admin|maintenance|software|network|vpn|infrastructure)\b/.test(context);
+}
+
+function hasHybridEmploymentEvidence(text) {
+    const value = asTrimmedString(text);
+    if (!value) return false;
+    const patterns = [
+        /\bhybrid(?:arbeit| working| work| position| role)?\b/i,
+        /\bhome[- ]?office\b/i,
+        /\bwork(?:ing)?\s+from\s+home\b/i,
+        /\bteilweise\s+(?:remote|im\s+homeoffice)\b/i,
+        /\b(?:mobiles?|mobile)\s+arbeiten\b/i,
+        /\bremote\s*(?:und|\/|\+|&)\s*(?:vor\s+ort|office|büro|onsite|on[- ]site)\b/i,
+        /\b(?:vor\s+ort|office|büro|onsite|on[- ]site)\s*(?:und|\/|\+|&)\s*remote\b/i,
+    ];
+    return patterns.some(pattern => {
+        const match = pattern.exec(value);
+        return match && !isTechnicalRemoteContext(value, match.index);
+    });
+}
+
+function hasExplicitFullRemoteEvidence(text) {
+    const value = asTrimmedString(text);
+    if (!value) return false;
+    const patterns = [
+        /\b100\s*%\s*(?:remote|remote[- ]?work|home[- ]?office|homeoffice)\b/i,
+        /\b(?:fully|completely|entirely|fully)\s+remote\b/i,
+        /\bremote\s+only\b/i,
+        /\bwork(?:ing)?\s+fully\s+remotely\b/i,
+        /\bvoll(?:ständig|kommen)\s+(?:remote|im\s+homeoffice)\b/i,
+        /\bausschließlich\s+(?:remote|im\s+homeoffice)\b/i
+    ];
+    return patterns.some(pattern => {
+        const match = pattern.exec(value);
+        return match && !isTechnicalRemoteContext(value, match.index);
+    });
+}
+
+function resolveAuthoritativeRemoteLocation({ jobLocation, companyHq, jobText = '' } = {}) {
+    const actualJobLocation = normalizeActualLocation(jobLocation);
+    const hq = normalizeActualLocation(companyHq);
+    const hybrid = hasHybridEmploymentEvidence(jobText);
+
+    if (actualJobLocation) {
+        return {
+            location: actualJobLocation,
+            remote_type: hybrid ? 'hybrid' : 'onsite',
+            source: 'job',
+            evidence: hybrid ? 'job_location_plus_hybrid' : 'job_location_plus_no_hybrid'
+        };
+    }
+    if (hq) {
+        return {
+            location: hq,
+            remote_type: hybrid ? 'hybrid' : 'onsite',
+            source: 'company_hq',
+            evidence: hybrid ? 'company_hq_plus_hybrid' : 'company_hq_plus_no_hybrid'
+        };
+    }
+    return {
+        location: LOCATION_UNKNOWN,
+        remote_type: hasExplicitFullRemoteEvidence(jobText) ? 'remote' : 'onsite',
+        source: 'unavailable',
+        evidence: hasExplicitFullRemoteEvidence(jobText) ? 'explicit_full_remote' : 'no_location_or_full_remote'
+    };
+}
+
 function companyWebsiteFrom(job = {}) {
     return job.company_website || job.company_website_url || job.companyWebsiteUrl ||
         job.website || job.company?.Website || job.company_metadata?.website || null;
@@ -39,12 +130,76 @@ function candidateWebsiteUrls(website) {
         const origin = base.origin;
         return [...new Set([
             base.toString().replace(/\/$/, ''),
-            ...['about', 'about-us', 'company', 'contact', 'contact-us', 'impressum', 'imprint']
+            ...['impressum', 'imprint', 'legal-notice', 'mentions-legales', 'aviso-legal', 'colophon',
+                'de/impressum', 'de/imprint', 'unternehmen/impressum',
+                'unternehmen/imprint', 'legal/impressum', 'legal/imprint', 'kontakt/impressum',
+                'company/impressum', 'about/impressum', 'datenschutz/impressum']
                 .map(path => `${origin}/${path}`)
         ])];
     } catch {
         return [];
     }
+}
+
+function absoluteUrl(value, baseUrl) {
+    try { return new URL(value, baseUrl).toString(); } catch { return null; }
+}
+
+function extractSitemapUrls(text, baseUrl) {
+    return [...String(text || '').matchAll(/<loc[^>]*>\s*([^<]+)\s*<\/loc>/gi)]
+        .map(match => absoluteUrl(match[1].trim(), baseUrl))
+        .filter(Boolean);
+}
+
+function extractRobotsSitemaps(text, baseUrl) {
+    return String(text || '').split(/\r?\n/)
+        .map(line => line.match(/^\s*sitemap\s*:\s*(\S+)/i)?.[1])
+        .map(value => absoluteUrl(value, baseUrl))
+        .filter(Boolean);
+}
+
+async function discoverImpressumUrls(website, { signal } = {}) {
+    if (!website) return [];
+    let base;
+    try { base = new URL(/^https?:\/\//i.test(website) ? website : `https://${website}`); } catch { return []; }
+    base.hash = ''; base.search = '';
+    const origin = base.origin;
+    const urls = new Set(candidateWebsiteUrls(base.toString()));
+    const sitemapQueue = [`${origin}/robots.txt`, `${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`];
+    const visited = new Set();
+    let sitemapCount = 0;
+    while (sitemapQueue.length > 0 && sitemapCount < 25) {
+        const url = sitemapQueue.shift();
+        if (!url || visited.has(url)) continue;
+        visited.add(url); sitemapCount++;
+        try {
+            const response = await axios.get(url, {
+                timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
+                maxRedirects: 5,
+                signal,
+                headers: { 'User-Agent': process.env.CRAWLER_USER_AGENT || 'customer-matching-crawler/1.0' }
+            });
+            const body = String(response.data || '');
+            const discoveredSitemaps = url.endsWith('/robots.txt')
+                ? extractRobotsSitemaps(body, url)
+                : extractSitemapUrls(body, url);
+            for (const discovered of discoveredSitemaps) {
+                if (/sitemap|\.xml(?:$|\?)/i.test(discovered) && !visited.has(discovered)) sitemapQueue.push(discovered);
+                if (/impressum|imprint|legal|rechtlich|mentions-legales|legal-notice|aviso-legal|colophon/i.test(discovered)) urls.add(discovered);
+            }
+            if (!url.endsWith('/robots.txt')) {
+                for (const discovered of extractSitemapUrls(body, url)) {
+                    if (/impressum|imprint|legal|rechtlich|mentions-legales|legal-notice|aviso-legal|colophon/i.test(discovered)) urls.add(discovered);
+                }
+            }
+            if (url.endsWith('/robots.txt')) {
+                for (const link of body.match(/https?:\/\/[^\s]+/gi) || []) {
+                    if (/impressum|imprint|legal-notice|mentions-legales|aviso-legal|colophon/i.test(link)) urls.add(link.replace(/[)>,.;]+$/, ''));
+                }
+            }
+        } catch { /* optional discovery source */ }
+    }
+    return [...urls].filter(url => /impressum|imprint|legal|rechtlich|mentions-legales|legal-notice|aviso-legal|colophon/i.test(url));
 }
 
 function extractCompanyLocationFromHtml(html) {
@@ -67,10 +222,45 @@ function extractCompanyLocationFromHtml(html) {
     return null;
 }
 
+function extractLegalCompanyAddress(html) {
+    if (!html) return null;
+    const $ = cheerio.load(html);
+    const fragments = [];
+    $('address, [itemprop="address"], [class*="impressum"], [id*="impressum"], [class*="legal"], footer').each((_, el) => {
+        const text = $(el).text().replace(/\s+/g, ' ').trim();
+        if (text) fragments.push(text);
+    });
+    fragments.push($('body').text().replace(/\s+/g, ' ').trim());
+    const priority = fragments.sort((a, b) => {
+        const score = value => (/(?:sitz|headquarters?|registered office|company address|geschäftssitz|unternehmenssitz|hauptsitz)/i.test(value) ? 4 : 0) +
+            (/(?:impressum|imprint|anbieter|company information)/i.test(value) ? 2 : 0);
+        return score(b) - score(a);
+    });
+    for (const fragment of priority) {
+        const labelledHq = fragment.match(/(?:sitz|headquarters?|registered office|company address|geschäftssitz|unternehmenssitz|hauptsitz)\s*[:\-]?\s*([^|]{2,180})/i);
+        if (labelledHq) {
+            const postalInLabel = labelledHq[1].match(/\b\d{4,5}\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß' .-]{2,80}/);
+            if (postalInLabel) return postalInLabel[0].trim()
+                .replace(/\s+(?:telefon|tel\.?|phone|email|e-mail|fax|www\.?|vertreten|register|ust\.?|hrb)\b.*$/i, '')
+                .replace(/[.,;]+$/, '');
+            if (labelledHq[1].trim()) return labelledHq[1].trim().replace(/[.,;]+$/, '');
+        }
+        const postal = fragment.match(/\b\d{4,5}\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß' .-]{2,80}/);
+        if (postal) {
+            return postal[0].trim()
+                .replace(/\s+(?:telefon|tel\.?|phone|email|e-mail|fax|www\.?|vertreten|register|ust\.?|hrb)\b.*$/i, '')
+                .replace(/[.,;]+$/, '');
+        }
+        const labelled = fragment.match(/(?:sitz|headquarters?|registered office|company address|geschäftssitz|unternehmenssitz|hauptsitz|adresse|address)\s*[:\-]\s*([^|]{2,140})/i);
+        if (labelled) return labelled[1].trim().replace(/[.,;]+$/, '');
+    }
+    return null;
+}
+
 async function findCompanyHqLocation(website, { signal } = {}) {
-    const urls = candidateWebsiteUrls(website);
+    const urls = await discoverImpressumUrls(website, { signal });
     if (urls.length === 0) return null;
-    const cacheKey = urls[0];
+    const cacheKey = String(website).toLowerCase().replace(/\/$/, '');
     if (hqLocationCache.has(cacheKey)) return hqLocationCache.get(cacheKey);
     if (hqLocationInFlightCache.has(cacheKey)) return hqLocationInFlightCache.get(cacheKey);
 
@@ -83,7 +273,7 @@ async function findCompanyHqLocation(website, { signal } = {}) {
                     signal,
                     headers: { 'User-Agent': process.env.CRAWLER_USER_AGENT || 'customer-matching-crawler/1.0' }
                 });
-                const location = extractCompanyLocationFromHtml(response.data);
+                const location = extractLegalCompanyAddress(response.data);
                 if (location) {
                     hqLocationCache.set(cacheKey, location);
                     return location;
@@ -104,22 +294,23 @@ async function findCompanyHqLocation(website, { signal } = {}) {
 }
 
 async function resolveJobLocation(job = {}, { signal, companyHq } = {}) {
-    const normalizedExisting = normalizeLocation(job.location);
-    const existing = normalizedExisting && normalizedExisting.toLowerCase() !== LOCATION_UNKNOWN.toLowerCase()
-        ? normalizedExisting
-        : null;
     const hq = companyHq === undefined
         ? await findCompanyHqLocation(companyWebsiteFrom(job), { signal })
         : companyHq;
-    const location = existing || hq || LOCATION_UNKNOWN;
-    const source = existing ? 'job' : (hq ? 'company_hq' : 'unavailable');
+    const authority = resolveAuthoritativeRemoteLocation({
+        jobLocation: job.location,
+        companyHq: hq,
+        jobText: employmentText(job)
+    });
+    const location = authority.location;
+    const source = authority.source;
     const shouldGeocode = location !== LOCATION_UNKNOWN &&
         (job.location_lat === null || job.location_lat === undefined || job.location_lng === null || job.location_lng === undefined);
     const geo = shouldGeocode ? await geocodeCity(location, { signal }) : {
         lat: job.location_lat ?? null,
         lng: job.location_lng ?? null
     };
-    return { location, location_lat: geo.lat, location_lng: geo.lng, source };
+    return { ...authority, location_lat: geo.lat, location_lng: geo.lng };
 }
 
 function buildEmbeddingText(job = {}) {
@@ -251,18 +442,18 @@ async function enrichJobForStorage(job = {}) {
     } else {
         // Never use a keyword or heuristic classifier after an LLM failure.
         // Preserve a valid crawler location for fallback before using company HQ.
-        row.remote_type = 'unknown';
+        row.remote_type = 'onsite';
         row._classification_source = 'failed';
         row.location = normalizeLocation(row.location);
     }
 
     const resolvedLocation = await resolveJobLocation(row, { companyHq });
     row.location = resolvedLocation.location;
+    row.remote_type = resolvedLocation.remote_type;
     row.location_lat = resolvedLocation.location_lat;
     row.location_lng = resolvedLocation.location_lng;
-    row._location_source = classification.ok && classification.data.job_location
-        ? 'llm'
-        : resolvedLocation.source;
+    row._location_source = resolvedLocation.source;
+    row._classification_source = 'authoritative';
 
     if (!classification.ok || !classification.data.job_location) {
         console.log(
@@ -314,11 +505,11 @@ async function preserveAuthoritativeFieldsForUpsert(supabase, row = {}) {
     const existingLocationIsAuthoritative = existingLocation &&
         existingLocation.toLowerCase() !== LOCATION_UNKNOWN.toLowerCase();
 
-    if (classificationSource !== 'llm' && existingRemoteIsValid) {
+    if (!['llm', 'authoritative'].includes(classificationSource) && existingRemoteIsValid) {
         cleanRow.remote_type = existingRemote;
     }
 
-    if (locationSource !== 'llm' && existingLocationIsAuthoritative) {
+    if (!['llm', 'authoritative'].includes(locationSource) && existingLocationIsAuthoritative) {
         cleanRow.location = existing.location;
         cleanRow.location_lat = existing.location_lat ?? null;
         cleanRow.location_lng = existing.location_lng ?? null;
@@ -352,5 +543,10 @@ module.exports = {
     preserveAuthoritativeFieldsForUpsert,
     resolveJobLocation,
     findCompanyHqLocation,
+    resolveAuthoritativeRemoteLocation,
+    hasHybridEmploymentEvidence,
+    hasExplicitFullRemoteEvidence,
+    discoverImpressumUrls,
+    extractLegalCompanyAddress,
     LOCATION_UNKNOWN
 };
