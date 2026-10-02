@@ -30,7 +30,12 @@ const axios = require('axios');
 const { AsyncLocalStorage } = require('async_hooks');
 const { fetchWithScraperAPI } = TEST_MODE ? { fetchWithScraperAPI: null } : require('../utils/scraperapi-config');
 const { CRAWLER_TIMEOUTS } = require('../utils/crawler-timeouts');
-const { resolveJobLocation, findCompanyHqLocation, preserveAuthoritativeFieldsForUpsert } = require('../utils/job-enrichment');
+const {
+    resolveJobLocation,
+    findCompanyHqLocation,
+    preserveAuthoritativeFieldsForUpsert,
+    selectAuthoritativeJobLocation
+} = require('../utils/job-enrichment');
 const { classifyJobWithLLM } = require('../ai/job-classifier');
 const {
     createDiscoveryState,
@@ -3702,9 +3707,13 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
     }
 
     const companyHq = rawJob.companyHq || await findCompanyHqLocation(companyWebsiteUrl, { signal });
-    const deterministicLocation = rawJob.locationEvidence?.location || rawJob.location || null;
+    const deterministicEvidence = rawJob.locationEvidence?.location || rawJob.location || null;
+    const selectedJobLocation = selectAuthoritativeJobLocation({
+        deterministicEvidence,
+        llmLocation: structured.job_location
+    });
     const resolvedLocation = await resolveJobLocation({
-        location: deterministicLocation || structured.job_location,
+        location: selectedJobLocation.location,
         company_website: companyWebsiteUrl,
         company_hq: companyHq,
         raw_description: rawJob.rawDescription,
@@ -3761,7 +3770,7 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
             location_lat: lat,
             location_lng: lng,
             remote_type: resolvedLocation.remote_type,
-            _classification_source: 'authoritative',
+            _classification_source: selectedJobLocation.source === 'llm' ? 'llm' : 'failed',
             _location_source: resolvedLocation.source,
             employment_type: structured.employment_type,
             skill_embedding: embedding,

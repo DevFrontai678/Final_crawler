@@ -5,7 +5,10 @@ const {
     hasHybridEmploymentEvidence,
     hasExplicitFullRemoteEvidence,
     discoverImpressumUrls,
-    extractLegalCompanyAddress
+    extractLegalCompanyAddress,
+    normalizeLocationCandidate,
+    sanitizeLocationEvidence,
+    selectAuthoritativeJobLocation
 } = require('../src/utils/job-enrichment');
 
 function expect(result, location, remoteType) {
@@ -14,6 +17,36 @@ function expect(result, location, remoteType) {
 }
 
 async function run() {
+    const meschedeEvidence = 'Im Schlahbruch 31, 59872 Meschede, DE; Meschede / Wochenarbeitszeit: 40 Stunden';
+    assert.strictEqual(normalizeLocationCandidate(meschedeEvidence), null);
+    assert.strictEqual(sanitizeLocationEvidence(meschedeEvidence), 'Im Schlahbruch 31, 59872 Meschede, Germany');
+    for (const suffix of [
+        'Arbeitszeit: 40 Stunden',
+        'Benefits: Jobticket',
+        'Contact: jobs@example.test',
+        'Zusatzinformationen: Bitte bewerben',
+        'Navigation: Home | Careers'
+    ]) {
+        assert.strictEqual(sanitizeLocationEvidence(`40210 Düsseldorf; ${suffix}`).includes(suffix), false, suffix);
+    }
+    assert.strictEqual(sanitizeLocationEvidence('40210 Düsseldorf\nContact: jobs@example.test'), '40210 Düsseldorf');
+    assert.strictEqual(normalizeLocationCandidate('Düsseldorf'), 'Düsseldorf');
+    assert.strictEqual(normalizeLocationCandidate('Niedersachsen'), 'Niedersachsen');
+    assert.strictEqual(normalizeLocationCandidate('10115 Berlin'), '10115 Berlin');
+    assert.strictEqual(normalizeLocationCandidate('Düsseldorf; Dortmund'), 'Düsseldorf; Dortmund');
+    assert.deepStrictEqual(
+        selectAuthoritativeJobLocation({ deterministicEvidence: meschedeEvidence, llmLocation: 'Meschede, Germany' }),
+        { location: 'Meschede, Germany', source: 'llm' }
+    );
+    assert.deepStrictEqual(
+        selectAuthoritativeJobLocation({ deterministicEvidence: meschedeEvidence, llmLocation: meschedeEvidence }),
+        { location: 'Im Schlahbruch 31, 59872 Meschede, Germany', source: 'deterministic_fallback' }
+    );
+    assert.deepStrictEqual(
+        selectAuthoritativeJobLocation({ deterministicEvidence: null, llmLocation: null }),
+        { location: null, source: 'unavailable' }
+    );
+
     expect(resolveAuthoritativeRemoteLocation({ jobLocation: 'Berlin', jobText: 'Hybrid working available' }), 'Berlin', 'hybrid');
     expect(resolveAuthoritativeRemoteLocation({ jobLocation: 'Berlin', jobText: 'Remote possible' }), 'Berlin', 'onsite');
     expect(resolveAuthoritativeRemoteLocation({ jobLocation: 'Berlin', jobText: '100% remote' }), 'Berlin', 'onsite');

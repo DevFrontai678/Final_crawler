@@ -25,7 +25,7 @@ function normalizeLocation(location) {
 }
 
 function normalizeActualLocation(location) {
-    const value = normalizeLocation(location);
+    const value = normalizeLocationCandidate(location);
     if (!value) return null;
     const normalized = value.toLowerCase().replace(/[.]/g, '').trim();
     if ([
@@ -35,6 +35,42 @@ function normalizeActualLocation(location) {
     ].includes(normalized)) return null;
     if (/\b(?:remote|home[- ]?office|homeoffice|anywhere)\b/i.test(normalized)) return null;
     return value;
+}
+
+const LOCATION_FIELD_BOUNDARY_PATTERN = /(?:^|[;|•]|\s+\/\s+|\n)\s*[^\d,;|\n]{2,80}?\s*:\s*\S+/u;
+const LOCATION_METADATA_URL_PATTERN = /(?:https?:\/\/|www\.)\S+/i;
+const LOCATION_NON_VALUE_PATTERN = /^(?:remote|hybrid|homeoffice|home office|vollzeit|teilzeit|full[- ]?time|part[- ]?time|n\/a|none|unknown|unspecified)$/i;
+
+function normalizeLocationCandidate(location) {
+    const value = asTrimmedString(location)
+        .replace(/\u00a0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/^['"`]+|['"`]+$/g, '')
+        .replace(/[\s,;|]+$/, '')
+        .trim();
+    if (!value || value.length > 220) return null;
+    if (LOCATION_METADATA_URL_PATTERN.test(value) || /@/.test(value)) return null;
+    if (LOCATION_FIELD_BOUNDARY_PATTERN.test(value)) return null;
+    if (LOCATION_NON_VALUE_PATTERN.test(value)) return null;
+    if (/^(?:telefon|tel\.?|phone|fax|email|e-mail|register|legal form|rechtsform|supervisory board|aufsichtsrat)\b/i.test(value)) return null;
+    if (/^[+\d\s()./-]{6,}$/.test(value)) return null;
+    return value.replace(/,\s*DE$/i, ', Germany');
+}
+
+function sanitizeLocationEvidence(location) {
+    const rawValue = asTrimmedString(location).replace(/\u00a0/g, ' ');
+    if (!rawValue) return null;
+    const boundary = rawValue.search(/(?:\s*;\s*|\s*\|\s*|\s+\/\s+|\s*•\s*|\r?\n)\s*[^\d,;|\n]{2,80}?\s*:\s*\S+/u);
+    const candidate = boundary > 1 ? rawValue.slice(0, boundary).trim() : rawValue;
+    return normalizeLocationCandidate(candidate);
+}
+
+function selectAuthoritativeJobLocation({ deterministicEvidence, llmLocation } = {}) {
+    const cleaned = normalizeLocationCandidate(llmLocation);
+    if (cleaned) return { location: cleaned, source: 'llm' };
+    const fallback = sanitizeLocationEvidence(deterministicEvidence);
+    if (fallback) return { location: fallback, source: 'deterministic_fallback' };
+    return { location: null, source: 'unavailable' };
 }
 
 function employmentText(job = {}) {
@@ -562,18 +598,23 @@ async function enrichJobForStorage(job = {}) {
         company_hq: companyHq
     });
 
-    if (classification.ok) {
+    const cleanedJobLocation = classification.ok
+        ? normalizeLocationCandidate(classification.data.job_location)
+        : null;
+
+    if (cleanedJobLocation) {
         row.remote_type = classification.data.remote_type;
-        row.location = classification.data.job_location;
+        row.location = cleanedJobLocation;
         row.location_city = classification.data.location_city;
         row.location_country = classification.data.location_country;
         row._classification_source = 'llm';
     } else {
-        // Never use a keyword or heuristic classifier after an LLM failure.
-        // Preserve a valid crawler location for fallback before using company HQ.
+        // Never use a keyword or heuristic classifier after an LLM failure or
+        // contaminated LLM location. Preserve only a safely sanitized source
+        // location before using company HQ.
         row.remote_type = 'onsite';
         row._classification_source = 'failed';
-        row.location = normalizeLocation(row.location);
+        row.location = sanitizeLocationEvidence(row.location);
     }
 
     const resolvedLocation = await resolveJobLocation(row, { companyHq });
@@ -584,7 +625,7 @@ async function enrichJobForStorage(job = {}) {
     row._location_source = resolvedLocation.source;
     row._classification_source = 'authoritative';
 
-    if (!classification.ok || !classification.data.job_location) {
+    if (!classification.ok || !cleanedJobLocation) {
         console.log(
             '[LOCATION FALLBACK] company=' + (row.company_name || 'unknown') +
             ' external_job_id=' + (row.external_job_id || 'unknown') +
@@ -669,6 +710,9 @@ module.exports = {
     enrichJobForStorage,
     enrichJobRows,
     geocodeCity,
+    normalizeLocationCandidate,
+    sanitizeLocationEvidence,
+    selectAuthoritativeJobLocation,
     preserveAuthoritativeFieldsForUpsert,
     resolveJobLocation,
     findCompanyHqLocation,

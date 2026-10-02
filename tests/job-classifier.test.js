@@ -65,6 +65,9 @@ async function run() {
     assert.match(prompt, /actual location/i);
     assert.match(prompt, /technical terms/i);
     assert.match(prompt, /company headquarters/i);
+    assert.match(prompt, /clean and normalize the supplied location evidence/i);
+    assert.match(prompt, /working hours, weekly hours, benefits, contact information/i);
+    assert.match(prompt, /multiple valid locations/i);
 
     for (const [description, remoteType, location] of cases) {
         const result = await classifyJobWithLLM(
