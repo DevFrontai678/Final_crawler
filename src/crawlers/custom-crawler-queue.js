@@ -46,6 +46,7 @@ const {
     selectAuthoritativeJobLocation
 } = require('../utils/job-enrichment');
 const { classifyJobWithLLM } = require('../ai/job-classifier');
+const { resolveDuplicateIdentity } = require('../utils/job-duplicate-detection');
 const {
     createDiscoveryState,
     fingerprint: discoveryFingerprint,
@@ -3387,6 +3388,10 @@ function extractRawJobFromHtml(html, pageUrl, companyName) {
     const jsonJobs = extractJsonLdJobPostings($);
     const jsonJob = jsonJobs[0] || null;
     const canonicalUrl = normalizeUrl($('link[rel="canonical"]').attr('href'), pageUrl) || pageUrl;
+    const alternateUrls = $('link[rel~="alternate"][hreflang]')
+        .map((_, element) => normalizeUrl($(element).attr('href'), pageUrl))
+        .get()
+        .filter(Boolean);
     const locationContainer = findJobContainer($);
     const locationEvidence = extractJobLocationEvidence(locationContainer, $, null);
     $('script,style,noscript,nav,footer,header,.cookie-banner,#cookie,[class*="cookie"],[class*="navigation"],[class*="breadcrumb"]').remove();
@@ -3411,6 +3416,9 @@ function extractRawJobFromHtml(html, pageUrl, companyName) {
     locationEvidence.raw_evidence = locationEvidence.raw_evidence.join(' | ');
     const location = locationEvidence.location;
     const hiringOrganization = extractHiringOrganizationName(jsonJob);
+    const structuredIdentifier = typeof jsonJob?.identifier === 'string'
+        ? jsonJob.identifier
+        : jsonJob?.identifier?.value || jsonJob?.identifier?.name || null;
     const discoveredDetailLinks = extractLinksFromHtml(html, pageUrl, pageUrl).jobs.size;
     const score = scoreJobPage({
         url: pageUrl,
@@ -3446,7 +3454,9 @@ function extractRawJobFromHtml(html, pageUrl, companyName) {
         skills: jsonJob?.skills || null,
         experienceRequirements: jsonJob?.experienceRequirements || null,
         employmentType: jsonJob?.employmentType || null,
-        datePosted: jsonJob?.datePosted || null
+        datePosted: jsonJob?.datePosted || null,
+        externalJobId: structuredIdentifier,
+        alternateUrls
     };
 }
 
@@ -3615,7 +3625,13 @@ async function batchInsertJobs(rows) {
     let inserted = 0;
     for (let i = 0; i < rows.length; i += CONFIG.BATCH_INSERT_SIZE) {
         const batch = rows.slice(i, i + CONFIG.BATCH_INSERT_SIZE);
-        const preparedBatch = await Promise.all(batch.map(row => preserveAuthoritativeFieldsForUpsert(supabase, row)));
+        const deduplicatedBatch = [];
+        for (const row of batch) {
+            // This is intentionally in the custom HTML persistence path. ATS
+            // adapters retain their provider IDs and existing upsert behavior.
+            deduplicatedBatch.push(await resolveDuplicateIdentity(supabase, row));
+        }
+        const preparedBatch = await Promise.all(deduplicatedBatch.map(row => preserveAuthoritativeFieldsForUpsert(supabase, row)));
         const { error } = await supabase.from('jobs').upsert(preparedBatch, {
             onConflict: 'company_id,external_job_id',
             ignoreDuplicates: false
@@ -3829,6 +3845,10 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
         apiJobId: rawJob.jobId || rawJob.stableApiId || rawJob.referenceId,
         canonicalUrl: jobPageUrl || rawJob.canonicalUrl || finalUrl
     };
+    const hasStableProviderId = Boolean(
+        rawJob.externalJobId || rawJob.requisitionId || rawJob.jobId ||
+        rawJob.stableApiId || rawJob.referenceId
+    );
     throwIfAborted(signal);
 
     return {
@@ -3853,6 +3873,14 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
             apply_url: jobPageUrl,
             company_name: companyName.slice(0, 100),
             ats_source: 'custom',
+            _dedupe_metadata: {
+                stable_provider_id: hasStableProviderId,
+                source_job_id: rawJob.externalJobId || rawJob.jobId || rawJob.stableApiId || rawJob.referenceId || null,
+                requisition_id: rawJob.requisitionId || null,
+                source_url: finalUrl,
+                canonical_url: rawJob.canonicalUrl || finalUrl,
+                alternate_urls: rawJob.alternateUrls || []
+            },
             is_active: true,
             first_seen_at: new Date().toISOString(),
             last_seen_at: new Date().toISOString()

@@ -666,6 +666,8 @@ async function preserveAuthoritativeFieldsForUpsert(supabase, row = {}) {
     delete cleanRow.classification_description;
     delete cleanRow.location_city;
     delete cleanRow.location_country;
+    delete cleanRow._dedupe_metadata;
+    delete cleanRow._duplicate_of;
 
     const { data: existing, error } = await supabase
         .from('jobs')

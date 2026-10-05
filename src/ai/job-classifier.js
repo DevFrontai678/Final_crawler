@@ -14,6 +14,7 @@ const VALID_EMPLOYMENT_TYPES = new Set([
     'Full Time', 'Part Time', 'Internship', 'Apprenticeship', 'Working Student',
     'Contract', 'Temporary', 'Freelance', 'Other', 'Unknown'
 ]);
+const DUPLICATE_RETRY_DELAYS_MS = [0, 1000, 2500];
 const RETRY_DELAYS_MS = [0, 2000, 5000];
 
 let client;
@@ -159,6 +160,24 @@ function validateClassification(value) {
     };
 }
 
+function validateDuplicateClassification(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('LLM duplicate classification must be a JSON object');
+    }
+    if (typeof value.is_same_job !== 'boolean') {
+        throw new Error('LLM returned an invalid is_same_job value');
+    }
+    const confidence = Number(value.confidence);
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+        throw new Error('LLM returned an invalid duplicate confidence');
+    }
+    return {
+        is_same_job: value.is_same_job,
+        confidence,
+        reason: nullableString(value.reason)
+    };
+}
+
 function sleep(ms) {
     return ms > 0 ? new Promise(resolve => setTimeout(resolve, ms)) : Promise.resolve();
 }
@@ -202,6 +221,42 @@ async function classifyJobWithLLM(job = {}, { signal, clientOverride } = {}) {
     return { ok: false, data: null, attempts: RETRY_DELAYS_MS.length, error: lastError };
 }
 
+async function classifyJobDuplicateWithLLM(firstJob = {}, secondJob = {}, { signal, clientOverride } = {}) {
+    let lastError;
+    for (let index = 0; index < DUPLICATE_RETRY_DELAYS_MS.length; index++) {
+        try {
+            const requestClient = clientOverride || getClient();
+            await sleep(DUPLICATE_RETRY_DELAYS_MS[index]);
+            const response = await requestClient.chat.completions.create({
+                model: firstJob.model || MODEL,
+                messages: [
+                    { role: 'system', content: 'Return only valid JSON. Never add explanatory text.' },
+                    {
+                        role: 'user',
+                        content: [
+                            'You are the authoritative duplicate-vacancy classifier.',
+                            'Different companies are never duplicates. Different locations or different requisition IDs are not duplicates.',
+                            'A translated or alternate-language version of the same vacancy is a duplicate.',
+                            'Return exactly: {"is_same_job":true,"confidence":0.0,"reason":"short explanation"}',
+                            'JOB A:', JSON.stringify(firstJob),
+                            'JOB B:', JSON.stringify(secondJob)
+                        ].join('\n')
+                    }
+                ],
+                temperature: 0,
+                max_tokens: 250,
+                response_format: { type: 'json_object' }
+            }, signal ? { signal } : undefined);
+            const content = response.choices?.[0]?.message?.content?.trim() || '';
+            return { ok: true, data: validateDuplicateClassification(JSON.parse(content)), attempts: index + 1 };
+        } catch (error) {
+            lastError = error;
+            if (signal?.aborted) throw error;
+        }
+    }
+    return { ok: false, data: null, attempts: DUPLICATE_RETRY_DELAYS_MS.length, error: lastError };
+}
+
 module.exports = {
     MODEL,
     VALID_REMOTE_TYPES,
@@ -210,5 +265,7 @@ module.exports = {
     VALID_EMPLOYMENT_TYPES,
     buildClassificationPrompt,
     classifyJobWithLLM,
+    classifyJobDuplicateWithLLM,
+    validateDuplicateClassification,
     validateClassification
 };
