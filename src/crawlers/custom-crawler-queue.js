@@ -1871,6 +1871,7 @@ function normalizeApiJobRecord(record, responseUrl, baseUrl) {
         urlSource,
         isApplyOnly: urlSource === 'applyUrl',
         employmentType: getApiFieldValue(record, JOB_API_EMPLOYMENT_KEYS),
+        datePosted: getApiFieldValue(record, ['datePosted', 'publicationDate', 'postedAt']),
         department: getApiFieldValue(record, ['department', 'team', 'businessUnit', 'category']),
         requirements: getApiFieldValue(record, ['requirements', 'qualifications', 'skills']),
         responsibilities: getApiFieldValue(record, ['responsibilities', 'duties', 'tasks']),
@@ -3438,7 +3439,14 @@ function extractRawJobFromHtml(html, pageUrl, companyName) {
         jobPageUrl,
         score,
         jsonLdCount: jsonJobs.length,
-        hiringOrganization
+        hiringOrganization,
+        responsibilities: jsonJob?.responsibilities || null,
+        requirements: jsonJob?.qualifications || jsonJob?.requirements || null,
+        qualifications: jsonJob?.educationRequirements || jsonJob?.qualifications || null,
+        skills: jsonJob?.skills || null,
+        experienceRequirements: jsonJob?.experienceRequirements || null,
+        employmentType: jsonJob?.employmentType || null,
+        datePosted: jsonJob?.datePosted || null
     };
 }
 
@@ -3492,6 +3500,14 @@ async function structureJobWithGPT(rawJobOrTitle, maybeDescription, signal) {
         company_name: rawJob.companyName,
         title: rawJob.title || '',
         raw_description: rawJob.rawDescription || maybeDescription || '',
+        responsibilities: rawJob.responsibilities || null,
+        requirements: rawJob.requirements || null,
+        qualifications: rawJob.qualifications || rawJob.qualification || null,
+        skills: rawJob.skills || null,
+        experience_requirements: rawJob.experienceRequirements || rawJob.experience_requirements || null,
+        employment_metadata: rawJob.employmentType || rawJob.employment_type || null,
+        structured_fields: rawJob.structuredFields || null,
+        metadata: rawJob.metadata || null,
         source_url: rawJob.canonicalUrl || rawJob.url || null,
         crawler_location: rawJob.location || null,
         location_evidence: rawJob.locationEvidence?.raw_evidence || null,
@@ -3694,11 +3710,15 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
             department: apiCandidate.department,
             requirements: apiCandidate.requirements,
             responsibilities: apiCandidate.responsibilities,
+            qualifications: apiCandidate.qualifications || apiCandidate.qualification,
+            skills: apiCandidate.skills,
+            experienceRequirements: apiCandidate.experienceRequirements || apiCandidate.experience_requirements,
             externalJobId: apiCandidate.externalJobId,
             requisitionId: apiCandidate.requisitionId,
             jobId: apiCandidate.jobId,
             referenceId: apiCandidate.referenceId,
-            stableApiId: apiCandidate.stableApiId
+            stableApiId: apiCandidate.stableApiId,
+            datePosted: apiCandidate.datePosted || apiCandidate.date_posted || null
         }
         : pdfText
         ? extractRawJobFromPdf(pdfText, finalUrl)
@@ -3820,6 +3840,7 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
             raw_description: rawDescription,
             structured_skills: Array.isArray(structured.skills) && structured.skills.length > 0 ? structured.skills : null,
             seniority_level: structured.seniority_level,
+            support_level: structured.support_level,
             location: location ? String(location) : null,
             location_lat: lat,
             location_lng: lng,
@@ -3827,6 +3848,7 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
             _classification_source: selectedJobLocation.source === 'llm' ? 'llm' : 'failed',
             _location_source: resolvedLocation.source,
             employment_type: structured.employment_type,
+            posted_at: rawJob.datePosted || null,
             skill_embedding: embedding,
             apply_url: jobPageUrl,
             company_name: companyName.slice(0, 100),

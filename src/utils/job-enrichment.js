@@ -582,13 +582,13 @@ async function embedWithVoyage(text) {
     }
 }
 
-async function enrichJobForStorage(job = {}) {
+async function enrichJobForStorage(job = {}, options = {}) {
     const row = {
         ...job
     };
 
     row.raw_description = asTrimmedString(row.raw_description || row.description) || null;
-    const companyHq = await findCompanyHqLocation(companyWebsiteFrom(row));
+    const companyHq = await findCompanyHqLocation(companyWebsiteFrom(row), { signal: options.signal });
     const classification = await classifyJobWithLLM({
         ...row,
         classification_description: row.classification_description || row.raw_description || row.description || null,
@@ -596,7 +596,18 @@ async function enrichJobForStorage(job = {}) {
         crawler_location: row.location || null,
         structured_location: row.structured_location || null,
         company_hq: companyHq
+    }, {
+        signal: options.signal,
+        clientOverride: options.clientOverride
     });
+
+    // These fields are authoritative LLM output. No keyword or rule-based
+    // fallback is allowed for seniority, support level, or employment type.
+    if (classification.ok) {
+        row.seniority_level = classification.data.seniority_level;
+        row.support_level = classification.data.support_level;
+        row.employment_type = classification.data.employment_type;
+    }
 
     const cleanedJobLocation = classification.ok
         ? normalizeLocationCandidate(classification.data.job_location)
@@ -699,7 +710,7 @@ async function enrichJobRows(rows, options = {}) {
             company_name: job.company_name ?? options.companyName ?? null,
             company_website: job.company_website ?? options.companyWebsite ?? null,
             ats_source: job.ats_source ?? options.atsSource ?? null
-        }));
+        }, options));
     }
     return enriched;
 }

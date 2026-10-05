@@ -472,7 +472,7 @@ async function fetchJobsFeedJson(baseUrl) {
                 employment_type: job.employmentType || job.workTime || null,
                 location: extractLocationFromJob(job),
                 company_name: extractCompanyNameFromJob(job, null),
-                datePosted: job.datePosted || job.validThrough || job.dateCreated || job.publicationDate || null
+                datePosted: job.datePosted || job.publicationDate || null
             });
         }
         if (map.size > 0) console.log(`    ✅ jobs.feed.json mila: ${map.size} jobs full data ke saath`);
@@ -670,6 +670,7 @@ async function fetchSoftgardenJobs(userId, projectId, pageId, feedMap = new Map(
                 employment_type: (feedEntry && feedEntry.employment_type) || job.workTime || job.employmentType || null,
                 raw_description: rawDescription,
                 apply_url: applyUrl,
+                posted_at: (feedEntry && feedEntry.datePosted) || job.datePosted || job.publicationDate || null,
                 department: job.category || job.department || null,
                 company_name: companyName,
                 ats_source: 'softgarden'

@@ -4,6 +4,16 @@ const OpenAI = require('openai');
 
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const VALID_REMOTE_TYPES = new Set(['remote', 'hybrid', 'onsite', 'unknown']);
+const VALID_SENIORITY_LEVELS = new Set([
+    'Entry Level', 'Junior', 'Mid Level', 'Senior', 'Lead', 'Manager', 'Director', 'Executive'
+]);
+const VALID_SUPPORT_LEVELS = new Set([
+    '1st Level', '2nd Level', '3rd Level', 'Multi Level', 'Not Applicable'
+]);
+const VALID_EMPLOYMENT_TYPES = new Set([
+    'Full Time', 'Part Time', 'Internship', 'Apprenticeship', 'Working Student',
+    'Contract', 'Temporary', 'Freelance', 'Other', 'Unknown'
+]);
 const RETRY_DELAYS_MS = [0, 2000, 5000];
 
 let client;
@@ -24,21 +34,38 @@ function nullableString(value) {
     return normalized.length > 0 ? normalized : null;
 }
 
+function contextValue(value) {
+    if (value === null || value === undefined || value === '') return 'none';
+    if (typeof value === 'string') return value;
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
+}
+
 function buildClassificationPrompt(job = {}) {
     const description = job.classification_description || job.raw_description || job.description || '';
     const evidence = job.location_evidence || job.crawler_location || null;
     return [
         'You are the authoritative classifier for a production job-matching system.',
         '',
-        'Classify the employment arrangement and the actual location where the employee is expected to work.',
-        'Do not classify from isolated keywords. Understand the complete context.',
+        'Classify seniority, support level, employment type, employment arrangement, and the actual location where the employee is expected to work.',
+        'The seniority, support level, and employment type decisions are authoritative. Analyze the complete job context, not isolated keywords.',
         '',
         'Company: ' + (job.company_name || job.company || 'unknown'),
         'Job title: ' + (job.title || 'unknown'),
         'Source URL: ' + (job.source_url || job.apply_url || job.url || 'unknown'),
-        'Employment type evidence: ' + (job.employment_type || 'none'),
+        'Employment type evidence: ' + contextValue(job.employment_type || job.employmentType),
         'Work arrangement evidence: ' + (job.work_arrangement || job.workplace || 'none'),
-        'Department evidence: ' + (job.department || 'none'),
+        'Department and structured job fields: ' + contextValue(job.department || job.structured_fields),
+        'Responsibilities: ' + contextValue(job.responsibilities),
+        'Requirements: ' + contextValue(job.requirements),
+        'Qualifications: ' + contextValue(job.qualifications || job.qualification),
+        'Skills: ' + contextValue(job.skills),
+        'Experience requirements: ' + contextValue(job.experience_requirements || job.experienceRequirements),
+        'Employment metadata: ' + contextValue(job.employment_metadata),
+        'Other job metadata: ' + contextValue(job.metadata || job.json_ld || job.jsonLd),
         'Crawler-supplied location evidence: ' + (evidence || 'none'),
         'Structured location evidence: ' + (job.structured_location || 'none'),
         'Company HQ evidence: ' + (job.company_hq || 'none'),
@@ -54,6 +81,14 @@ function buildClassificationPrompt(job = {}) {
         '- Remote technical terms such as remote monitoring, remote access, and remote customer support tools do not make employment remote.',
         '- Remote after probation must be classified from the complete employment arrangement.',
         '- If the employment arrangement is ambiguous or unsupported, return remote_type unknown.',
+        '- seniority_level MUST be exactly one of: Entry Level, Junior, Mid Level, Senior, Lead, Manager, Director, Executive.',
+        '- Determine seniority from the complete title, description, responsibilities, requirements, qualifications, skills, experience, scope, complexity, ownership, and leadership expectations.',
+        '- Use an explicit level when present. Otherwise infer the strongest reasonable supported level; do not return a weaker level merely because the exact label is absent.',
+        '- Do not invent seniority beyond what the complete posting supports.',
+        '- support_level MUST be exactly one of: 1st Level, 2nd Level, 3rd Level, Multi Level, Not Applicable.',
+        '- Infer support level from actual support responsibilities and technical scope. Use Multi Level only when the role explicitly or substantively covers multiple support levels. Use Not Applicable for a non-support role.',
+        '- employment_type MUST be exactly one of: Full Time, Part Time, Internship, Apprenticeship, Working Student, Contract, Temporary, Freelance, Other, Unknown.',
+        '- Determine employment_type from the complete posting. Use Unknown only when the available job content does not support a more specific value.',
         '- Determine job_location only when the employee actual work location is supported by the posting.',
         '- Prefer explicit employment-location statements such as Location, Based in, Office located in, or office days in a city.',
         '- For job_location, clean and normalize the supplied location evidence, then return ONLY the actual employee work location.',
@@ -76,8 +111,9 @@ function buildClassificationPrompt(job = {}) {
         '  "division": null,',
         '  "cleaned_title": null,',
         '  "skills": [],',
-        '  "seniority_level": null,',
-        '  "employment_type": null,',
+        '  "seniority_level": "Entry Level|Junior|Mid Level|Senior|Lead|Manager|Director|Executive",',
+        '  "support_level": "1st Level|2nd Level|3rd Level|Multi Level|Not Applicable",',
+        '  "employment_type": "Full Time|Part Time|Internship|Apprenticeship|Working Student|Contract|Temporary|Freelance|Other|Unknown",',
         '  "remote_type": "remote|hybrid|onsite|unknown",',
         '  "job_location": null,',
         '  "location_city": null,',
@@ -93,6 +129,15 @@ function validateClassification(value) {
     if (!VALID_REMOTE_TYPES.has(value.remote_type)) {
         throw new Error('LLM returned an invalid remote_type');
     }
+    if (!VALID_SENIORITY_LEVELS.has(value.seniority_level)) {
+        throw new Error('LLM returned an invalid seniority_level');
+    }
+    if (!VALID_SUPPORT_LEVELS.has(value.support_level)) {
+        throw new Error('LLM returned an invalid support_level');
+    }
+    if (!VALID_EMPLOYMENT_TYPES.has(value.employment_type)) {
+        throw new Error('LLM returned an invalid employment_type');
+    }
     const skills = Array.isArray(value.skills)
         ? value.skills.map(nullableString).filter(Boolean).slice(0, 20)
         : [];
@@ -104,8 +149,9 @@ function validateClassification(value) {
         division: nullableString(value.division),
         cleaned_title: nullableString(value.cleaned_title),
         skills,
-        seniority_level: nullableString(value.seniority_level),
-        employment_type: nullableString(value.employment_type),
+        seniority_level: value.seniority_level,
+        support_level: value.support_level,
+        employment_type: value.employment_type,
         remote_type: value.remote_type,
         job_location: nullableString(value.job_location),
         location_city: nullableString(value.location_city),
@@ -159,6 +205,9 @@ async function classifyJobWithLLM(job = {}, { signal, clientOverride } = {}) {
 module.exports = {
     MODEL,
     VALID_REMOTE_TYPES,
+    VALID_SENIORITY_LEVELS,
+    VALID_SUPPORT_LEVELS,
+    VALID_EMPLOYMENT_TYPES,
     buildClassificationPrompt,
     classifyJobWithLLM,
     validateClassification

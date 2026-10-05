@@ -12,7 +12,7 @@ require('dotenv').config();
 const { Worker } = require('bullmq');
 const Redis = require('ioredis');
 const { createClient } = require('@supabase/supabase-js');
-const { structureJob } = require('../src/ai/gpt-structurer');
+const { classifyJobWithLLM } = require('../src/ai/job-classifier');
 const ws = require('ws');
 
 // ─── CONFIG ─────────────────────────────────────────────────────────────
@@ -55,21 +55,24 @@ const worker = new Worker(
 
         try {
             // 1. Structure the job with GPT-4o-mini
-            const result = await structureJob({
+            const classification = await classifyJobWithLLM({
+                ...job.data,
                 title,
                 raw_description
             });
 
-            if (!result) {
+            if (!classification.ok) {
                 stats.skipped++;
                 console.log(`⏭️ Skipped job ${jobId} (no result)`);
                 return { jobId, status: 'skipped' };
             }
+            const result = classification.data;
 
             // 2. Build update object
             const updates = {
                 structured_skills: result.skills && result.skills.length > 0 ? result.skills : null,
                 seniority_level: result.seniority_level,
+                support_level: result.support_level,
                 employment_type: result.employment_type
             };
 

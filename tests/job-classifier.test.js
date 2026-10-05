@@ -10,13 +10,21 @@ const { preserveAuthoritativeFieldsForUpsert, resolveJobLocation } = require('..
 
 function mockClient(payloads) {
     let index = 0;
+    const defaults = {
+        seniority_level: 'Mid Level',
+        support_level: 'Not Applicable',
+        employment_type: 'Unknown'
+    };
     return {
         chat: {
             completions: {
                 create: async () => ({
                     choices: [{
                         message: {
-                            content: JSON.stringify(payloads[Math.min(index++, payloads.length - 1)])
+                            content: JSON.stringify({
+                                ...defaults,
+                                ...payloads[Math.min(index++, payloads.length - 1)]
+                            })
                         }
                     }]
                 })
@@ -68,6 +76,9 @@ async function run() {
     assert.match(prompt, /clean and normalize the supplied location evidence/i);
     assert.match(prompt, /working hours, weekly hours, benefits, contact information/i);
     assert.match(prompt, /multiple valid locations/i);
+    assert.match(prompt, /seniority_level MUST be exactly one of/i);
+    assert.match(prompt, /support_level MUST be exactly one of/i);
+    assert.match(prompt, /complete title, description, responsibilities/i);
 
     for (const [description, remoteType, location] of cases) {
         const result = await classifyJobWithLLM(
@@ -90,7 +101,35 @@ async function run() {
         () => validateClassification({ remote_type: 'REMOTE' }),
         /invalid remote_type/
     );
-    assert.strictEqual(validateClassification({ remote_type: 'unknown' }).remote_type, 'unknown');
+    assert.strictEqual(validateClassification({
+        remote_type: 'unknown', seniority_level: 'Senior',
+        support_level: '3rd Level', employment_type: 'Full Time'
+    }).support_level, '3rd Level');
+    for (const value of ['Entry Level', 'Junior', 'Mid Level', 'Senior', 'Lead', 'Manager', 'Director', 'Executive']) {
+        assert.strictEqual(validateClassification({
+            remote_type: 'unknown', seniority_level: value,
+            support_level: 'Not Applicable', employment_type: 'Unknown'
+        }).seniority_level, value);
+    }
+    for (const value of ['1st Level', '2nd Level', '3rd Level', 'Multi Level', 'Not Applicable']) {
+        assert.strictEqual(validateClassification({
+            remote_type: 'unknown', seniority_level: 'Senior',
+            support_level: value, employment_type: 'Unknown'
+        }).support_level, value);
+    }
+    for (const value of ['Full Time', 'Part Time', 'Internship', 'Apprenticeship', 'Working Student', 'Contract', 'Temporary', 'Freelance', 'Other', 'Unknown']) {
+        assert.strictEqual(validateClassification({
+            remote_type: 'unknown', seniority_level: 'Senior',
+            support_level: 'Not Applicable', employment_type: value
+        }).employment_type, value);
+    }
+    assert.throws(
+        () => validateClassification({
+            remote_type: 'unknown', seniority_level: 'senior',
+            support_level: 'Not Applicable', employment_type: 'Full Time'
+        }),
+        /invalid seniority_level/
+    );
 
     const longTailCases = [
         [5000, '2 days remote per week', 'hybrid', null],
@@ -109,7 +148,13 @@ async function run() {
                 clientOverride: {
                     chat: { completions: { create: async request => {
                         capturedPrompt = request.messages[1].content;
-                        return { choices: [{ message: { content: JSON.stringify({ remote_type: remoteType, job_location: location }) } }] };
+                        return { choices: [{ message: { content: JSON.stringify({
+                            seniority_level: 'Senior',
+                            support_level: '3rd Level',
+                            employment_type: 'Full Time',
+                            remote_type: remoteType,
+                            job_location: location
+                        }) } }] };
                     } } }
                 }
             }

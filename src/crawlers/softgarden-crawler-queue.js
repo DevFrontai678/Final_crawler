@@ -229,9 +229,12 @@ const worker = new Worker(QUEUE_NAME, async job => {
             title: j.title || 'Untitled',
             raw_description: j.raw_description || null,
             apply_url: j.apply_url || null,
+            posted_at: j.posted_at || j.datePosted || null,
             ats_source: j.ats_source || 'softgarden',
             location: j.location || null,
             company_name: j.company_name || null,
+            department: j.department || null,
+            employment_type: j.employment_type || null,
             is_active: true,
             first_seen_at: new Date(),
             last_seen_at: new Date()
