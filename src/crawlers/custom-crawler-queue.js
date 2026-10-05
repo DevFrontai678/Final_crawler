@@ -18,7 +18,16 @@
 
 const TEST_MODE = process.env.CRAWLER_TEST_MODE === '1';
 const NO_RUNTIME = process.env.CRAWLER_NO_RUNTIME === '1';
+const IS_COMPANY_RUNNER = process.env.CRAWLER_COMPANY_RUNNER === '1' || process.argv.includes('--company-runner');
 const ENABLE_RUNTIME = !TEST_MODE && !NO_RUNTIME;
+if (IS_COMPANY_RUNNER && process.env.CRAWLER_RUNNER_CGROUP_PATH) {
+    try {
+        require('fs').writeFileSync(
+            require('path').join(process.env.CRAWLER_RUNNER_CGROUP_PATH, 'cgroup.procs'),
+            String(process.pid)
+        );
+    } catch {}
+}
 const { Queue, Worker } = ENABLE_RUNTIME ? require('bullmq') : { Queue: null, Worker: null };
 const Redis = ENABLE_RUNTIME ? require('ioredis') : null;
 const { chromium } = TEST_MODE ? { chromium: null } : require('playwright');
@@ -45,6 +54,10 @@ const {
     extractContinuationUrls,
     extractContinuationRequests
 } = require('./generic-discovery-engine');
+const {
+    runIsolatedCompany,
+    forceTerminateAllCompanyRunners
+} = require('./company-runner-supervisor');
 require('dotenv').config();
 
 function ts() {
@@ -178,6 +191,7 @@ const CONFIG = {
     MAX_DISCOVERY_PAGES_PER_COMPANY: parseInt(process.env.MAX_DISCOVERY_PAGES_PER_COMPANY || '1000', 10),
     MAX_EXTERNAL_DISCOVERY_PAGES_PER_COMPANY: parseInt(process.env.MAX_EXTERNAL_DISCOVERY_PAGES_PER_COMPANY || '25', 10),
     COMPANY_TIMEOUT_MS: CRAWLER_TIMEOUTS.CUSTOM_CRAWLER_COMPANY_TIMEOUT_MS,
+    CLEANUP_TIMEOUT_MS: CRAWLER_TIMEOUTS.CLEANUP_TIMEOUT_MS,
     JOB_TIMEOUT_MS: CRAWLER_TIMEOUTS.JOB_TIMEOUT_MS,
     JOB_DETAIL_CONCURRENCY: Math.max(1, parseInt(process.env.CRAWLER_JOB_DETAIL_CONCURRENCY || '5', 10) || 5),
     PLAYWRIGHT_TIMEOUT_MS: CRAWLER_TIMEOUTS.PAGE_CONTENT_TIMEOUT_MS,
@@ -757,7 +771,7 @@ const supabase = ENABLE_RUNTIME ? createClient(
     { realtime: { transport: ws } }
 ) : null;
 
-const redisConnection = ENABLE_RUNTIME ? new Redis({
+const redisConnection = ENABLE_RUNTIME && !IS_COMPANY_RUNNER ? new Redis({
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379', 10),
     maxRetriesPerRequest: null
@@ -765,13 +779,14 @@ const redisConnection = ENABLE_RUNTIME ? new Redis({
 
 
 
-const customCrawlQueue = ENABLE_RUNTIME ? new Queue(QUEUE_NAME, { connection: redisConnection }) : null;
+const customCrawlQueue = ENABLE_RUNTIME && !IS_COMPANY_RUNNER ? new Queue(QUEUE_NAME, { connection: redisConnection }) : null;
 const CRAWLER_INSTANCE_LOCK_KEY = `bull:${QUEUE_NAME}:crawler-instance-lock`;
 const CRAWLER_INSTANCE_LOCK_TTL_MS = 60000;
 const CRAWLER_INSTANCE_LOCK_RENEW_MS = 20000;
 let crawlerInstanceLockToken = null;
 let crawlerInstanceLockRenewal = null;
 let crawlerInstanceLockLost = false;
+let shutdownStarted = false;
 
 async function acquireCrawlerInstanceLock() {
     const token = crypto.randomUUID();
@@ -865,10 +880,25 @@ async function closeTrackedPage(page) {
 }
 
 async function closeCompanyPages(run) {
-    while (run.pages.size > 0) {
-        const pages = [...run.pages];
-        run.pages.clear();
-        await Promise.all(pages.map(page => page.close().catch(() => {})));
+    const pages = [...(run?.pages || [])];
+    run?.pages?.clear();
+    if (pages.length === 0) return;
+
+    await runBounded(() => Promise.all(pages.map(page => page.close().catch(() => {}))));
+}
+
+async function runBounded(task, timeoutMs = CONFIG.CLEANUP_TIMEOUT_MS) {
+    let timer;
+    try {
+        return await Promise.race([
+            Promise.resolve().then(task),
+            new Promise(resolve => { timer = setTimeout(() => resolve(undefined), timeoutMs); })
+        ]);
+    } catch (error) {
+        logError('TIMEOUT', `Bounded cleanup failed: ${error.message}`);
+        return undefined;
+    } finally {
+        if (timer) clearTimeout(timer);
     }
 }
 
@@ -976,12 +1006,13 @@ async function acceptCookies(page) {
 }
 
 // ─── SCROLL ───────────────────────────────────────────────────────────────
-async function autoScroll(page, maxSteps = CONFIG.AUTO_SCROLL_MAX_STEPS) {
+async function autoScroll(page, maxSteps = CONFIG.AUTO_SCROLL_MAX_STEPS, signal) {
     let lastH = 0;
     let lastContentState = '';
     let idleSteps = 0;
     let meaningfulChanges = 0;
     for (let i = 0; i < maxSteps; i++) {
+        throwIfAborted(signal);
         const state = await page.evaluate(() => ({
             height: document.body?.scrollHeight || 0,
             links: document.querySelectorAll('a[href], [data-url], [data-href]').length,
@@ -1015,7 +1046,7 @@ async function fetchWithPlaywright(url, options = {}) {
         if (waitForSelector) await page.waitForSelector(waitForSelector, { timeout: CRAWLER_TIMEOUTS.SELECTOR_TIMEOUT_MS }).catch(() => {});
         await page.waitForLoadState('networkidle', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS }).catch(() => {});
         await page.waitForTimeout(2000);
-        if (scroll) await autoScroll(page);
+        if (scroll) await autoScroll(page, CONFIG.AUTO_SCROLL_MAX_STEPS, signal);
         const html = await page.content();
         const finalUrl = page.url();
         const status = response ? response.status() : null;
@@ -1143,12 +1174,15 @@ async function discoverCareerPage(baseUrl) {
 
 // ─── LINK EXTRACTION FROM A PAGE ──────────────────────────────────────────
 // Returns: { jobs: Set, categories: Set, subdomains: Set, ats: Set }
-async function extractLinksFromPage(baseUrl, companyName) {
+async function extractLinksFromPage(baseUrl, companyName, signal) {
     const result = { jobs: new Set(), categories: new Set(), subdomains: new Set(), ats: new Set() };
 
     try {
         const context = await getBrowserContext();
-        const page = await context.newPage();
+        throwIfAborted(signal);
+        const page = trackCompanyPage(await context.newPage());
+        const closeOnAbort = signal ? () => page.close().catch(() => {}) : null;
+        if (closeOnAbort) signal.addEventListener('abort', closeOnAbort, { once: true });
 
         await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.PLAYWRIGHT_TIMEOUT_MS });
         await acceptCookies(page);
@@ -1241,12 +1275,14 @@ async function extractLinksFromPage(baseUrl, companyName) {
             }
         });
 
-        await page.close().catch(() => {});
+        if (closeOnAbort) signal.removeEventListener('abort', closeOnAbort);
+        await closeTrackedPage(page);
         await recycleBrowserIfNeeded();
     } catch (err) {
+        throwIfAborted(signal);
         console.log(`[EXTRACT] Error on ${baseUrl}: ${err.message}`);
         try {
-            const r = await fetchPageWithFallback(baseUrl, { waitForSelector: 'body' });
+            const r = await fetchPageWithFallback(baseUrl, { waitForSelector: 'body', signal });
             if (r && r.html) {
                 const $ = cheerio.load(r.html);
                 $('a').each((_, el) => {
@@ -1269,6 +1305,7 @@ async function extractLinksFromPage(baseUrl, companyName) {
 
 // ─── CONTAINER FIND ───────────────────────────────────────────────────────
 async function validateCareerPage(candidateUrl, companyName, companyWebsiteUrl, options = {}) {
+    throwIfAborted(options.signal);
     const url = normalizeUrl(candidateUrl);
     if (!url || isNonJobUrl(url)) return null;
     if (isAtsUrl(url)) {
@@ -1288,7 +1325,12 @@ async function validateCareerPage(candidateUrl, companyName, companyWebsiteUrl, 
         return { ok: false, url, reason: 'career_url_external_domain' };
     }
 
-    const fetched = await fetchPageWithFallback(url, { waitForSelector: 'body', scroll: true });
+    const fetched = await fetchPageWithFallback(url, {
+        waitForSelector: 'body',
+        scroll: true,
+        signal: options.signal
+    });
+    throwIfAborted(options.signal);
     if (!fetched?.html || fetched.html.length < 400) {
         return {
             ok: false,
@@ -1336,8 +1378,8 @@ async function validateCareerPage(candidateUrl, companyName, companyWebsiteUrl, 
     return { ok: true, url: finalUrl, html: fetched.html };
 }
 
-async function discoverCareerPage(baseUrl, companyName = '') {
-    const direct = await validateCareerPage(baseUrl, companyName);
+async function discoverCareerPage(baseUrl, companyName = '', options = {}) {
+    const direct = await validateCareerPage(baseUrl, companyName, undefined, options);
     if (direct?.ok) return direct.url;
 
     let base;
@@ -1351,7 +1393,7 @@ async function discoverCareerPage(baseUrl, companyName = '') {
     ];
 
     for (const p of paths) {
-        const checked = await validateCareerPage(base + p, companyName);
+        const checked = await validateCareerPage(base + p, companyName, undefined, options);
         if (checked?.ok) return checked.url;
     }
     return null;
@@ -1363,14 +1405,15 @@ function isStrongLoadMoreControl(text = '', aria = '', title = '', className = '
     return label.length > 0 && !/cookie|privacy|login|sign\s*in|submit|send|apply|application|contact|register|delete|remove|share|social|language|menu/i.test(value);
 }
 
-async function discoverAlternativeCareerUrls(rootUrl, state) {
+async function discoverAlternativeCareerUrls(rootUrl, state, signal) {
     let origin;
     try { origin = new URL(rootUrl).origin; } catch { return []; }
     const sitemapUrls = new Set([`${origin}/sitemap.xml`]);
     try {
         const robots = await axios.get(`${origin}/robots.txt`, {
             timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
-            responseType: 'text'
+            responseType: 'text',
+            signal
         });
         for (const line of String(robots.data || '').split(/\r?\n/)) {
             const match = line.match(/^\s*sitemap:\s*(\S+)/i);
@@ -1383,7 +1426,8 @@ async function discoverAlternativeCareerUrls(rootUrl, state) {
         try {
             const response = await axios.get(sitemapUrl, {
                 timeout: CRAWLER_TIMEOUTS.HTTP_TIMEOUT_MS,
-                responseType: 'text'
+                responseType: 'text',
+                signal
             });
             const locations = [...String(response.data || '').matchAll(/<loc[^>]*>([\s\S]*?)<\/loc>/gi)]
                 .map(match => match[1].trim())
@@ -1402,6 +1446,7 @@ async function clickLoadMore(page, options = {}) {
     let clicks = 0;
     let lastFingerprint = '';
     while (clicks < CONFIG.LOAD_MORE_MAX_CLICKS) {
+        throwIfAborted(options.signal);
         let clicked = false;
         const controls = [];
         for (const sel of selectors) {
@@ -1412,6 +1457,7 @@ async function clickLoadMore(page, options = {}) {
             } catch {}
         }
         for (const btn of controls) {
+            throwIfAborted(options.signal);
             try {
                 if (await btn.isVisible({ timeout: 250 })) {
                     const text = await btn.innerText({ timeout: 300 }).catch(() => '');
@@ -1445,7 +1491,7 @@ async function clickLoadMore(page, options = {}) {
                     clicks++;
                     clicked = true;
                     await page.waitForTimeout(1500);
-                    await autoScroll(page, 3);
+                    await autoScroll(page, 3, options.signal);
                     const after = await page.locator('a[href]').count().catch(() => before);
                     const fingerprint = `${after}:${await page.evaluate(() => document.body.innerText.length).catch(() => 0)}`;
                     if (after <= before && fingerprint === lastFingerprint) continue;
@@ -1536,7 +1582,7 @@ async function clickPaginationControls(page, signal, options = {}) {
             clicks++;
             await page.waitForLoadState('domcontentloaded', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS / 2 }).catch(() => {});
             await page.waitForTimeout(600);
-            await autoScroll(page, 3);
+            await autoScroll(page, 3, signal);
             await options.onClick?.({ page, clicks, beforeUrl, afterUrl: normalizeUrl(page.url()) || beforeUrl });
         } catch {}
     }
@@ -2218,6 +2264,7 @@ async function extractRenderedDomJobUrls(page, pageUrl, rootUrl, options = {}) {
 
     const jobs = new Set();
     for (const candidate of rawCandidates) {
+        throwIfAborted(options.signal);
         const text = compactText(candidate.text, 240);
         for (const raw of [
             candidate.attrs.href, candidate.attrs['data-href'], candidate.attrs['data-url'],
@@ -2263,6 +2310,7 @@ async function extractOpenShadowDomJobUrls(page, pageUrl, rootUrl, options = {})
 
     const jobs = new Set();
     for (const candidate of rawCandidates) {
+        throwIfAborted(options.signal);
         const text = compactText(candidate.text, 240);
         for (const raw of [
             candidate.attrs.href, candidate.attrs['data-href'], candidate.attrs['data-url'],
@@ -2285,6 +2333,7 @@ async function extractBoundedIframeLinks(page, pageUrl, rootUrl, options = {}) {
     const frames = page.frames().filter(frame => frame !== page.mainFrame());
     let inspected = 0;
     for (const frame of frames) {
+        throwIfAborted(options.signal);
         if (inspected >= maxIframes) {
             iframeState.limitReached = true;
             break;
@@ -2401,9 +2450,10 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
         const initialHtml = await page.content().catch(() => '');
         await page.waitForLoadState('networkidle', { timeout: CRAWLER_TIMEOUTS.LOAD_STATE_TIMEOUT_MS }).catch(() => {});
         await page.waitForTimeout(1500);
-        const scrollResult = await autoScroll(page);
+        const scrollResult = await autoScroll(page, CONFIG.AUTO_SCROLL_MAX_STEPS, signal);
         if (scrollResult?.limitReached) options.discoveryState?.recordLimit('scroll_budget', CONFIG.AUTO_SCROLL_MAX_STEPS);
         const loadMoreClicks = await clickLoadMore(page, {
+            signal,
             discoveryState: options.discoveryState,
             onClick: async () => {
                 const iterationHtml = await page.content().catch(() => '');
@@ -2554,6 +2604,7 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
                 : null;
             const dynamicJobs = await extractRenderedDomJobUrls(page, result.finalUrl, rootUrl, {
                 ...options,
+                signal,
                 maxCandidates: CONFIG.MAX_DYNAMIC_DOM_CANDIDATES_PER_PAGE
             });
             for (const url of dynamicJobs) {
@@ -2569,6 +2620,7 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
 
             const iframeResult = await extractBoundedIframeLinks(page, result.finalUrl, rootUrl, {
                 ...options,
+                signal,
                 externalHosts: options.externalHosts || new Set(),
                 iframeState: options.iframeState,
                 maxIframes: options.iframeState
@@ -2583,6 +2635,7 @@ async function extractLinksFromPage(pageUrl, rootUrl, companyName = '', signal, 
 
             const shadowJobs = await extractOpenShadowDomJobUrls(page, result.finalUrl, rootUrl, {
                 ...options,
+                signal,
                 maxRoots: CONFIG.MAX_SHADOW_DOM_ROOTS_PER_PAGE,
                 maxCandidates: CONFIG.MAX_SHADOW_DOM_CANDIDATES_PER_PAGE
             });
@@ -2730,7 +2783,8 @@ async function extractAllJobLinks(baseUrl, companyName, { onJobLink, onDiscovery
     // Sitemaps and robots references are alternative discovery edges. They
     // supplement the browser graph and are never treated as authoritative job
     // records until each URL is fetched and validated.
-    for (const sitemapCandidate of await discoverAlternativeCareerUrls(rootUrl, discoveryState)) {
+    for (const sitemapCandidate of await discoverAlternativeCareerUrls(rootUrl, discoveryState, signal)) {
+        throwIfAborted(signal);
         enqueueDiscoveryUrl(sitemapCandidate);
     }
 
@@ -3793,38 +3847,48 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
 
 async function withTimeout(task, ms, label, onTimeout, parentSignal) {
     const controller = new AbortController();
-    let timedOut = false;
-    let timeoutCleanup = Promise.resolve();
     const timeoutError = new Error(`Timeout: ${label}`);
     timeoutError.name = 'TimeoutError';
 
-    const timer = setTimeout(() => {
-        timedOut = true;
-        controller.abort(timeoutError);
-        timeoutCleanup = Promise.resolve(onTimeout?.(timeoutError))
-            .catch(cleanupError => logError('TIMEOUT', `Cleanup failed: ${cleanupError.message}`));
-    }, ms);
-    const abortFromParent = () => controller.abort(getAbortError(parentSignal));
+    let timer = null;
+    let rejectParentAbort;
+    const taskPromise = Promise.resolve().then(() => task(controller.signal));
+    // A task may contain a third-party promise which does not honour AbortSignal.
+    // Always consume its eventual rejection after the deadline so it cannot become
+    // an unhandled rejection while the BullMQ processor moves on.
+    taskPromise.catch(() => {});
+
+    const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(async () => {
+            controller.abort(timeoutError);
+            // Cleanup is best-effort and bounded, but it must never delay the
+            // deadline result or keep the BullMQ processor waiting.
+            void runBounded(() => onTimeout?.(timeoutError));
+            reject(timeoutError);
+        }, ms);
+    });
+
+    const parentAbortPromise = new Promise((_, reject) => {
+        rejectParentAbort = reject;
+    });
+    const abortFromParent = () => {
+        const reason = getAbortError(parentSignal);
+        controller.abort(reason);
+        rejectParentAbort(reason);
+    };
     if (parentSignal) {
         if (parentSignal.aborted) abortFromParent();
         else parentSignal.addEventListener('abort', abortFromParent, { once: true });
     }
 
     try {
-        const result = await task(controller.signal);
-        if (timedOut) {
-            await timeoutCleanup;
-            throw timeoutError;
-        }
-        return result;
-    } catch (err) {
-        if (timedOut) {
-            await timeoutCleanup;
-            throw timeoutError;
-        }
-        throw err;
+        return await Promise.race([
+            taskPromise,
+            timeoutPromise,
+            ...(parentSignal ? [parentAbortPromise] : [])
+        ]);
     } finally {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         if (parentSignal) parentSignal.removeEventListener('abort', abortFromParent);
     }
 }
@@ -3838,14 +3902,19 @@ function createStreamingJobProcessor({
     seen,
     rejectedSamples,
     failedSamples,
-    rejectionReasons
+    rejectionReasons,
+    processLink = processJobLink
 }) {
     const queuedLinks = new Set();
     const pendingLinks = [];
     const activeTasks = new Set();
+    const taskCancellation = new AbortController();
+    const taskSignal = signal && typeof AbortSignal.any === 'function'
+        ? AbortSignal.any([signal, taskCancellation.signal])
+        : (signal || taskCancellation.signal);
     let fatalError = null;
 
-    const isCancelled = () => signal?.aborted || companyRunContext.getStore()?.timedOut;
+    const isCancelled = () => taskSignal.aborted || companyRunContext.getStore()?.timedOut;
     const candidateKey = candidate => typeof candidate === 'object'
         ? (candidate.identity || candidate.jobId || candidate.requisitionId || candidate.detailUrl || candidate.applyUrl || candidate.responseUrl)
         : candidate;
@@ -3854,11 +3923,11 @@ function createStreamingJobProcessor({
         let result;
         try {
             result = await withTimeout(
-                jobSignal => processJobLink(link, companyId, companyName, jobSignal, companyWebsiteUrl),
+                jobSignal => processLink(link, companyId, companyName, jobSignal, companyWebsiteUrl),
                 CONFIG.JOB_TIMEOUT_MS,
                 `job ${candidateKey(link)}`,
                 undefined,
-                signal
+                taskSignal
             );
         } catch (error) {
             metrics.failedPages++;
@@ -3942,8 +4011,19 @@ function createStreamingJobProcessor({
     }
 
     async function drain({ cancelPending = false } = {}) {
-        if (cancelPending || isCancelled() || fatalError) pendingLinks.length = 0;
+        if (cancelPending || isCancelled() || fatalError) {
+            pendingLinks.length = 0;
+            if (!taskCancellation.signal.aborted) {
+                taskCancellation.abort(new Error('Company work cancelled'));
+            }
+        }
         else pump();
+
+        // Once the company deadline has fired, the caller must be able to finish
+        // the BullMQ job even if a browser/API/SDK promise is stuck. Every active
+        // wrapper receives the parent abort and will settle independently; waiting
+        // here would recreate the original production hang.
+        if (cancelPending || isCancelled()) return;
 
         while (activeTasks.size > 0) {
             await Promise.all([...activeTasks]);
@@ -4019,7 +4099,8 @@ async function processCompany(job, signal) {
     if (effectiveUrl) {
         const validated = await validateCareerPage(effectiveUrl, companyName, companyWebsiteUrl, {
             trustedCareerUrl: effectiveUrl,
-            company: careerRecord
+            company: careerRecord,
+            signal
         });
         if (validated?.sourceType === 'external_ats') {
             metrics.notFoundReason = validated.reason;
@@ -4326,59 +4407,107 @@ function logCompanyResult(jobData, result) {
     );
 }
 
-// ─── WORKER ───────────────────────────────────────────────────────────────
-const worker = ENABLE_RUNTIME ? new Worker(QUEUE_NAME, async job => {
-    const run = { pages: new Set(), scraperApiFallbacks: new Map(), timedOut: false };
-    activeCompanyRuns.add(run);
-    return companyRunContext.run(run, async () => {
-        try {
+async function runCompanyRunner() {
+    let started = false;
+
+    const sendResult = (result, done) => {
+        if (typeof process.send !== 'function' || !process.connected) {
+            done?.();
+            return;
+        }
+        try { process.send({ type: 'completed', result }, done); } catch { done?.(); }
+    };
+
+    process.on('message', message => {
+        if (started || message?.type !== 'run' || !message.jobData) return;
+        started = true;
+        const job = { data: message.jobData, processedOn: Date.now() };
+        const run = { pages: new Set(), scraperApiFallbacks: new Map(), timedOut: false };
+        const abortController = new AbortController();
+        activeCompanyRuns.add(run);
+
+        const terminateGracefully = () => {
+            run.timedOut = true;
+            if (!abortController.signal.aborted) abortController.abort(new Error('Company runner terminated'));
+            void closeCompanyPages(run);
+        };
+        process.once('SIGTERM', terminateGracefully);
+        process.once('disconnect', () => {
+            terminateGracefully();
+            setTimeout(() => {
+                try {
+                    if (process.platform === 'linux' || process.platform === 'darwin') process.kill(-process.pid, 'SIGKILL');
+                    else process.exit(1);
+                } catch { process.exit(1); }
+            }, CONFIG.CLEANUP_TIMEOUT_MS);
+        });
+
+        void companyRunContext.run(run, async () => {
+            let result;
             try {
-                return await withTimeout(
-                    signal => processCompany(job, signal),
-                    CONFIG.COMPANY_TIMEOUT_MS,
-                    `company ${job.data.companyName}`,
-                    async () => {
-                        run.timedOut = true;
-                        await closeCompanyPages(run);
-                    }
-                );
+                result = await processCompany(job, abortController.signal);
             } catch (error) {
-                if (error?.name !== 'TimeoutError') throw error;
                 const telemetry = {
                     ...(run.discoveryState?.metrics || {}),
                     ...(run.metrics || {}),
-                    timed_out: true,
-                    timeout_reason: error.message,
-                    discovery_tasks_remaining: run.discoveryState?.metrics?.tasksRemaining || 0,
-                    api_requests_attempted: run.discoveryState?.metrics?.apiRequestsAttempted || 0,
-                    api_requests_completed: run.discoveryState?.metrics?.apiRequestsCompleted || 0,
-                    api_requests_failed: run.discoveryState?.metrics?.apiRequestsFailed || 0,
-                    api_requests_remaining: run.discoveryState?.metrics?.apiRequestsRemaining || 0
+                    timed_out: abortController.signal.aborted,
+                    timeout_reason: abortController.signal.aborted ? error.message : undefined
                 };
-                const result = {
-                    status: 'partial',
+                result = {
+                    status: abortController.signal.aborted ? 'partial' : 'failed',
                     companyId: job.data.companyId,
                     companyName: job.data.companyName,
                     jobsSaved: run.metrics?.jobsSaved || 0,
-                    elapsedMs: Date.now() - (job.processedOn || Date.now()),
-                    metrics: { ...telemetry, discovery: telemetry, partialReason: 'company_timeout' }
+                    elapsedMs: Date.now() - job.processedOn,
+                    metrics: telemetry
                 };
-                await markCompanyStatus(job.data.companyId, 'partial');
-                await logCrawlEvent(job.data.companyId, 'partial', {
-                    reason: 'company_timeout',
-                    error_message: error.message,
-                    discovery: telemetry,
-                    duration_ms: result.elapsedMs,
-                    ...telemetry
-                }, { allowWhenTimedOut: true });
-                return result;
+            } finally {
+                await closeCompanyPages(run);
+                activeCompanyRuns.delete(run);
+                await runBounded(() => recycleBrowserWhenIdle());
+                await runBounded(() => sharedBrowser?.close());
+                sendResult(result, () => process.exit(0));
             }
-        } finally {
-            await closeCompanyPages(run);
-            activeCompanyRuns.delete(run);
-            await recycleBrowserWhenIdle();
-        }
+        });
     });
+}
+
+// ─── WORKER ───────────────────────────────────────────────────────────────
+const worker = ENABLE_RUNTIME && !IS_COMPANY_RUNNER ? new Worker(QUEUE_NAME, async job => {
+    const result = await runIsolatedCompany({
+        jobData: job.data,
+        runnerPath: __filename,
+        timeoutMs: CONFIG.COMPANY_TIMEOUT_MS,
+        terminationGraceMs: CONFIG.CLEANUP_TIMEOUT_MS,
+        onTimeout: () => logWarn('TIMEOUT', `Hard deadline reached for ${job.data.companyName}; terminating company runner`)
+    });
+
+    if (result.status === 'failed') {
+        throw new Error(result.error || `Company runner failed for ${job.data.companyName}`);
+    }
+
+    if (result.metrics?.timed_out || result.metrics?.partialReason === 'company_timeout') {
+        const telemetry = {
+            ...(result.metrics || {}),
+            timed_out: true,
+            timeout_reason: result.metrics?.timeout_reason || 'company deadline'
+        };
+        const timeoutResult = {
+            ...result,
+            status: 'partial',
+            metrics: { ...telemetry, discovery: telemetry, partialReason: 'company_timeout' }
+        };
+        await runBounded(() => markCompanyStatus(job.data.companyId, 'partial'));
+        await runBounded(() => logCrawlEvent(job.data.companyId, 'partial', {
+            reason: 'company_timeout',
+            error_message: telemetry.timeout_reason,
+            discovery: telemetry,
+            duration_ms: timeoutResult.elapsedMs,
+            ...telemetry
+        }, { allowWhenTimedOut: true }));
+        return timeoutResult;
+    }
+    return result;
 }, {
     connection: redisConnection,
     concurrency: CONFIG.CONCURRENCY,
@@ -4424,12 +4553,15 @@ async function waitForQueue() {
 }
 
 async function shutdown(code = 0) {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
     console.log('[SHUTDOWN]');
-    try { await worker.close(); } catch {}
-    try { await customCrawlQueue.close(); } catch {}
-    try { if (sharedBrowser) await sharedBrowser.close(); } catch {}
-    try { await releaseCrawlerInstanceLock(); } catch {}
-    try { await redisConnection.quit(); } catch {}
+    forceTerminateAllCompanyRunners();
+    await runBounded(() => worker?.close());
+    await runBounded(() => customCrawlQueue?.close());
+    await runBounded(() => sharedBrowser?.close());
+    await runBounded(() => releaseCrawlerInstanceLock());
+    await runBounded(() => redisConnection?.quit());
     process.exit(code);
 }
 
@@ -4484,7 +4616,14 @@ if (ENABLE_RUNTIME) process.on('unhandledRejection', r => console.error('[ERR]',
 if (ENABLE_RUNTIME) process.on('uncaughtException', e => console.error('[ERR]', e));
 
 if (require.main === module && ENABLE_RUNTIME) {
-    run().catch(err => { console.error('[FATAL]', err); shutdown(1); });
+    if (IS_COMPANY_RUNNER) {
+        runCompanyRunner().catch(error => {
+            console.error('[RUNNER_FATAL]', error);
+            process.exit(1);
+        });
+    } else {
+        run().catch(err => { console.error('[FATAL]', err); shutdown(1); });
+    }
 }
 
 module.exports = {
@@ -4501,6 +4640,8 @@ module.exports = {
     isPaginationControlEvidence,
     validateCareerPage,
     extractAllJobLinks,
+    createStreamingJobProcessor,
+    closeCompanyPages,
     extractLinksFromHtml,
     extractJobCandidatesFromApiPayload,
     normalizeApiJobRecord,
