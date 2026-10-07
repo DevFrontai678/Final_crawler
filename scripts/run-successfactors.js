@@ -55,6 +55,13 @@ async function getBrowser() {
     return browserInitPromise;
 }
 
+async function closeBrowserInstance() {
+    const browser = browserInstance;
+    browserInstance = null;
+    browserInitPromise = null;
+    if (browser) await browser.close().catch(() => {});
+}
+
 // ─── OPTIMIZED CUSTOM CRAWLER ──────────────────────────────────────────
 async function customCrawlerFetchPage(url) {
     if (isSkipFile(url)) {
@@ -488,11 +495,14 @@ async function run() {
         }
     });
 
-    if (browserInstance && browserInstance.isConnected()) {
-        await browserInstance.close();
-    }
+    await closeBrowserInstance();
 
     console.log(`\n✅ Done! Total SuccessFactors jobs saved: ${totalJobs}`);
 }
 
-run().catch(console.error);
+run()
+    .catch(error => {
+        console.error('❌ SuccessFactors crawler failed:', error);
+        process.exitCode = 1;
+    })
+    .finally(() => closeBrowserInstance());

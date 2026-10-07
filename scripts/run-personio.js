@@ -127,4 +127,9 @@ process.on('SIGINT', async () => {
     process.exit(0);
 });
 
-run().catch(console.error);
+run()
+    .catch(error => {
+        console.error('❌ Personio crawler failed:', error);
+        process.exitCode = 1;
+    })
+    .finally(() => closePersonioBrowser());

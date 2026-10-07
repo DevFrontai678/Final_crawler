@@ -7,6 +7,7 @@ const {
 } = require('../src/ai/job-classifier');
 const {
     enrichJobRows,
+    enrichJobForStorage,
     preserveAuthoritativeFieldsForUpsert
 } = require('../src/utils/job-enrichment');
 
@@ -74,6 +75,8 @@ async function run() {
 
     const contextPrompt = buildClassificationPrompt({
         title: 'Infrastructure Engineer',
+        company_name: 'Example GmbH',
+        company_website: 'https://example.test',
         raw_description: 'Full posting text',
         responsibilities: ['own production infrastructure', 'resolve escalations'],
         requirements: ['incident response'],
@@ -86,6 +89,8 @@ async function run() {
     for (const field of ['Responsibilities:', 'Requirements:', 'Qualifications:', 'Skills:', 'Experience requirements:', 'Employment metadata:', 'Other job metadata:']) {
         assert.match(contextPrompt, new RegExp(field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     }
+    assert.match(contextPrompt, /Company website: https:\/\/example\.test/);
+    assert.match(contextPrompt, /PDF URL: none/);
 
     let llmCalls = 0;
     const rows = await enrichJobRows([
@@ -123,6 +128,72 @@ async function run() {
     assert.strictEqual(saved[0].support_level, '2nd Level');
     assert.strictEqual(saved[0].employment_type, 'Full Time');
     assert.strictEqual(saved[0].posted_at, '2025-01-15T00:00:00.000Z');
+
+    const fallbackRows = await enrichJobRows([
+        {
+            company_id: 'company',
+            external_job_id: 'fallback',
+            title: 'Existing role',
+            raw_description: 'A complete job posting.',
+            seniority_level: 'Senior',
+            support_level: '2nd Level',
+            employment_type: 'Full Time'
+        }
+    ], {
+        clientOverride: {
+            chat: { completions: { create: async () => ({ choices: [{ message: { content: JSON.stringify({
+                is_job: true,
+                is_relevant: true,
+                seniority_level: 'Intermediate',
+                support_level: 'Not Applicable',
+                employment_type: 'Full Time',
+                remote_type: 'unknown',
+                job_location: null,
+                location_city: null,
+                location_country: null
+            }) } }] }) } }
+        },
+        companyId: 'company',
+        companyName: 'Example GmbH'
+    });
+    assert.strictEqual(fallbackRows[0].seniority_level, 'Senior');
+    assert.strictEqual(fallbackRows[0].support_level, 'Not Applicable');
+    assert.strictEqual(fallbackRows[0].employment_type, 'Full Time');
+
+    let unexpectedSecondClassification = 0;
+    const acceptedClassification = {
+        ok: true,
+        data: {
+            is_job: true,
+            is_relevant: true,
+            seniority_level: 'Lead',
+            support_level: '3rd Level',
+            employment_type: 'Contract',
+            remote_type: 'hybrid',
+            job_location: 'Berlin',
+            location_city: 'Berlin',
+            location_country: 'Germany'
+        }
+    };
+    const reused = await enrichJobForStorage({
+        company_id: 'company',
+        company_name: 'Example GmbH',
+        external_job_id: 'reused-classification',
+        title: 'Existing role',
+        raw_description: 'A complete job posting.'
+    }, {
+        classification: acceptedClassification,
+        clientOverride: {
+            chat: { completions: { create: async () => {
+                unexpectedSecondClassification++;
+                throw new Error('classification must be reused');
+            } } }
+        }
+    });
+    assert.strictEqual(unexpectedSecondClassification, 0);
+    assert.strictEqual(reused.seniority_level, 'Lead');
+    assert.strictEqual(reused.support_level, '3rd Level');
+    assert.strictEqual(reused.employment_type, 'Contract');
 
     console.log('job-enrichment classification tests passed');
 }

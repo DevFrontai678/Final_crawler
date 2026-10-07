@@ -79,7 +79,7 @@ async function customCrawlerFetchPage(url, retries = 2) {
             if (attempt === retries) break;
             await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
         } finally {
-            if (browser) await browser.close();
+            if (browser) await browser.close().catch(() => {});
         }
     }
     return null;
@@ -533,4 +533,7 @@ async function run() {
     console.log(`\n✅ Done! Total Recruitee jobs saved: ${totalJobs}`);
 }
 
-run().catch(console.error);
+run().catch(error => {
+    console.error('❌ Recruitee crawler failed:', error);
+    process.exitCode = 1;
+});

@@ -590,4 +590,7 @@ async function run() {
     console.log(`\n✅ Done! Total Umantis jobs saved: ${totalJobs}`);
 }
 
-run().catch(console.error);
+run().catch(error => {
+    console.error('❌ Umantis crawler failed:', error);
+    process.exitCode = 1;
+});

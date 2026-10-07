@@ -3439,6 +3439,7 @@ function extractRawJobFromHtml(html, pageUrl, companyName) {
         reasons,
         title,
         rawDescription,
+        content: visibleText,
         location,
         locationEvidence,
         applyUrl: jobPageUrl,
@@ -3461,15 +3462,17 @@ function extractRawJobFromHtml(html, pageUrl, companyName) {
 }
 
 function extractRawJobFromPdf(pdfText, pageUrl) {
-    const rawDescription = cleanDescription(pdfText);
+    // PDF extraction safety only requires readable text. Do not apply the
+    // HTML/job-page description threshold here: the shared LLM decides
+    // whether a short document is actually a vacancy.
+    const rawDescription = String(pdfText || '').replace(/\s+/g, ' ').trim() || null;
     const lines = String(pdfText || '').split('\n').map(l => l.trim()).filter(l => l.length > 5);
     const title = compactText(lines.find(l => !isGenericJobTitle(l) && l.length < 180) || '', 180);
     const score = scoreJobPage({ url: pageUrl, title, rawText: rawDescription, hasJsonLd: false, applyUrl: pageUrl });
     const reasons = [];
     if (!title) reasons.push('missing_pdf_title');
     if (isGenericJobTitle(title)) reasons.push('generic_or_category_title');
-    if (!rawDescription || wordCount(rawDescription) < CONFIG.MIN_JOB_CONTENT_WORDS) reasons.push('insufficient_pdf_content');
-    if (score < CONFIG.MIN_JOB_PAGE_SCORE) reasons.push(`weak_job_evidence_score_${score}`);
+    if (!rawDescription) reasons.push('insufficient_pdf_content');
     return {
         valid: reasons.length === 0,
         reasons,
@@ -3486,30 +3489,33 @@ function extractRawJobFromPdf(pdfText, pageUrl) {
     };
 }
 
-function validateStructuredJob(structured, rawJob, companyName) {
+function validateStructuredJob(structured, rawJob, companyName, { isPdf = false, isHtml = false } = {}) {
     const reasons = [];
     if (!structured) reasons.push('llm_failed');
     if (structured && structured.is_job === false) reasons.push(structured.reason || 'llm_rejected_non_job');
-    if (structured && structured.is_relevant === false) reasons.push(structured.relevance_reason || 'llm_rejected_off_division');
 
     const title = compactText(structured?.cleaned_title || rawJob?.title, 220);
-    if (isGenericJobTitle(title)) reasons.push('llm_title_generic_or_category');
-    if (!rawJob?.rawDescription || wordCount(rawJob.rawDescription) < CONFIG.MIN_JOB_CONTENT_WORDS) reasons.push('raw_content_too_short');
-    if (rawJob?.score < CONFIG.MIN_JOB_PAGE_SCORE) reasons.push('raw_page_lacks_job_evidence');
+    if (!isHtml && !isPdf && isGenericJobTitle(title)) reasons.push('llm_title_generic_or_category');
+    if (!isHtml && !isPdf && (!rawJob?.rawDescription || wordCount(rawJob.rawDescription) < CONFIG.MIN_JOB_CONTENT_WORDS)) {
+        reasons.push('raw_content_too_short');
+    }
+    if (!isHtml && !isPdf && rawJob?.score < CONFIG.MIN_JOB_PAGE_SCORE) reasons.push('raw_page_lacks_job_evidence');
 
     return { ok: reasons.length === 0, reasons, title };
 }
 
 // ─── GPT: STRUCTURE + VALIDATE + RELEVANCE ────────────────────────────────
-async function structureJobWithGPT(rawJobOrTitle, maybeDescription, signal) {
+async function structureJobWithGPT(rawJobOrTitle, maybeDescription, signal, { clientOverride } = {}) {
     throwIfAborted(signal);
     const rawJob = typeof rawJobOrTitle === 'object'
         ? rawJobOrTitle
         : { title: rawJobOrTitle, rawDescription: maybeDescription };
     const result = await classifyJobWithLLM({
         company_name: rawJob.companyName,
+        company_website: rawJob.companyWebsiteUrl || null,
+        pdf_url: rawJob.pdfUrl || null,
         title: rawJob.title || '',
-        raw_description: rawJob.rawDescription || maybeDescription || '',
+        raw_description: rawJob.rawDescription || rawJob.content || maybeDescription || '',
         responsibilities: rawJob.responsibilities || null,
         requirements: rawJob.requirements || null,
         qualifications: rawJob.qualifications || rawJob.qualification || null,
@@ -3517,14 +3523,21 @@ async function structureJobWithGPT(rawJobOrTitle, maybeDescription, signal) {
         experience_requirements: rawJob.experienceRequirements || rawJob.experience_requirements || null,
         employment_metadata: rawJob.employmentType || rawJob.employment_type || null,
         structured_fields: rawJob.structuredFields || null,
-        metadata: rawJob.metadata || null,
+        metadata: rawJob.metadata || {
+            source_type: rawJob.sourceType || 'html',
+            hiring_organization: rawJob.hiringOrganization || null,
+            application_url: rawJob.applicationUrl || null,
+            canonical_url: rawJob.canonicalUrl || null,
+            json_ld_count: rawJob.jsonLdCount || 0,
+            extraction_score: rawJob.score ?? null
+        },
         source_url: rawJob.canonicalUrl || rawJob.url || null,
         crawler_location: rawJob.location || null,
         location_evidence: rawJob.locationEvidence?.raw_evidence || null,
         structured_location: rawJob.structuredLocation || null,
         company_hq: rawJob.companyHq || await findCompanyHqLocation(rawJob.companyWebsiteUrl, { signal }),
         model: CONFIG.GPT_MODEL
-    }, { signal });
+    }, { signal, clientOverride });
     if (!result.ok) return null;
     return result.data;
 }
@@ -3694,6 +3707,10 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
         finalUrl = normalizeUrl(apiCandidate.detailUrl || apiCandidate.jobUrl || apiCandidate.applyUrl || apiCandidate.responseUrl) || normalizedInputUrl;
     } else if (isPdfUrl(normalizedInputUrl)) {
         pdfText = await downloadAndParsePDF(normalizedInputUrl, signal) || '';
+        const meaningfulPdfText = String(pdfText).replace(/\s+/g, ' ').trim();
+        if (!meaningfulPdfText) {
+            return { skip: true, reason: 'pdf_text_not_meaningful', url: finalUrl };
+        }
     } else {
         const r = await fetchPageWithFallback(normalizedInputUrl, { waitForSelector: 'body', scroll: true, signal });
         if (r) {
@@ -3743,39 +3760,29 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
     rawJob.url = finalUrl;
     rawJob.companyName = companyName;
     rawJob.companyWebsiteUrl = companyWebsiteUrl;
+    if (!rawJob.rawDescription && rawJob.content) rawJob.rawDescription = rawJob.content;
 
-    const genericValidation = validateGenericJobCandidate({
-        sourceType: rawJob.sourceType,
-        apiRecord: rawJob.sourceType === 'api',
-        title: rawJob.title,
-        rawDescription: rawJob.rawDescription,
-        location: rawJob.location,
-        detailUrl: rawJob.jobPageUrl || rawJob.canonicalUrl || finalUrl,
-        applicationUrl: rawJob.applicationUrl || rawJob.applyUrl,
-        jsonLd: rawJob.jsonLdCount > 0,
-        metadata: rawJob.hiringOrganization || rawJob.department || rawJob.requirements || rawJob.responsibilities,
-        department: rawJob.department,
-        requirements: rawJob.requirements,
-        responsibilities: rawJob.responsibilities,
-        employmentType: rawJob.employmentType,
-        externalJobId: rawJob.externalJobId,
-        jobId: rawJob.jobId,
-        requisitionId: rawJob.requisitionId,
-        referenceId: rawJob.referenceId,
-        stableApiId: rawJob.stableApiId
-    });
+    const isPdfCandidate = Boolean(pdfText);
+    const isHtmlCandidate = !apiCandidate && !isPdfCandidate;
+    rawJob.pdfUrl = isPdfCandidate ? finalUrl : null;
+    // PDF documents are intentionally sent to the existing LLM classifier
+    // before heuristic job-page validation. A PDF URL alone is not evidence
+    // that the document is a vacancy, while valid vacancies may not contain
+    // the HTML/page signals used by the generic crawler.
+    const pdfStructured = isPdfCandidate
+        ? await structureJobWithGPT(rawJob, undefined, signal)
+        : null;
 
-    if (!genericValidation.valid) {
-        return {
-            skip: true,
-            reason: `generic_job_evidence_failed:${genericValidation.reasons.join('|')}`,
-            url: finalUrl,
-            title: rawJob.title,
-            evidence: genericValidation.evidence
-        };
+    if (isHtmlCandidate) {
+        if (!rawJob.title || isGenericJobTitle(rawJob.title)) {
+            return { skip: true, reason: 'html_missing_usable_title', url: finalUrl, title: rawJob.title };
+        }
+        if (!rawJob.rawDescription || !String(rawJob.rawDescription).trim()) {
+            return { skip: true, reason: 'html_missing_usable_content', url: finalUrl, title: rawJob.title };
+        }
     }
 
-    if (!rawJob.valid) {
+    if (!isHtmlCandidate && !isPdfCandidate && !rawJob.valid) {
         return {
             skip: true,
             reason: rawJob.reasons.join('|') || 'raw_validation_failed',
@@ -3784,8 +3791,13 @@ async function processJobLink(input, companyId, companyName, signal, companyWebs
         };
     }
 
-    const structured = await structureJobWithGPT(rawJob, undefined, signal);
-    const structuredValidation = validateStructuredJob(structured, rawJob, companyName);
+    const structured = isPdfCandidate
+        ? pdfStructured
+        : await structureJobWithGPT(rawJob, undefined, signal);
+    const structuredValidation = validateStructuredJob(structured, rawJob, companyName, {
+        isPdf: isPdfCandidate,
+        isHtml: isHtmlCandidate
+    });
     if (!structuredValidation.ok) {
         logInfo('JOB', `SKIP ${rawJob.title || finalUrl} (${structuredValidation.reasons.join('|')})`);
         return {
@@ -4706,6 +4718,7 @@ module.exports = {
         MAX_JOB_API_JSON_DEPTH: CONFIG.MAX_JOB_API_JSON_DEPTH,
     },
     extractRawJobFromHtml,
+    extractRawJobFromPdf,
     extractJobLocationEvidence,
     splitLocationValues,
     isAcceptableSavedJobUrl,
@@ -4715,6 +4728,7 @@ module.exports = {
     getZeroLinkStatus,
     hasTechnicalJobFailure,
     validateStructuredJob,
+    structureJobWithGPT,
     pageHasCareerIntent,
     withTimeout
 };

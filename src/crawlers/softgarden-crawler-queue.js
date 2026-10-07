@@ -190,6 +190,7 @@ async function addSoftgardenCompaniesToQueue() {
 
 // ─── WORKER ────────────────────────────────────────────────────────────────
 let processedCount = 0, totalQueued = 0;
+let shutdownPromise = null;
 const stats = { processed: 0, failed_fetch: 0, no_jobs: 0, with_jobs: 0, jobs_saved: 0, existing_refreshed: 0, errors: 0 };
 
 function printProgress() {
@@ -297,32 +298,61 @@ const worker = new Worker(QUEUE_NAME, async job => {
     concurrency: parseInt(process.env.CRAWLER_COMPANY_BATCH_SIZE || '10', 10)
 });
 
-worker.on('completed', job => {
+async function shutdown(code = 0) {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+        await closeSoftgardenBrowser();
+        await worker.close().catch(() => {});
+        await softgardenQueue.close().catch(() => {});
+        await redisConnection.quit().catch(() => {});
+        process.exit(code);
+    })();
+    return shutdownPromise;
+}
+
+async function maybeShutdownWhenDrained() {
+    if (totalQueued === 0) return;
+    const counts = await softgardenQueue.getJobCounts('waiting', 'active', 'delayed', 'prioritized');
+    const remaining = Object.values(counts).reduce((total, count) => total + count, 0);
+    if (remaining === 0) await shutdown(0);
+}
+
+function markSettled() {
     processedCount++;
+    void maybeShutdownWhenDrained().catch(error => {
+        console.error(`❌ Softgarden queue drain check failed: ${error.message}`);
+    });
+}
+
+worker.on('completed', job => {
+    markSettled();
     if (processedCount % 5 === 0 || processedCount === totalQueued) printProgress();
     console.log(`✅ Job ${job.id} completed`);
 });
 
 worker.on('failed', (job, err) => {
     console.error(`❌ Job ${job?.id} failed: ${err.message}`);
+    markSettled();
 });
 
 // ─── START ──────────────────────────────────────────────────────────────────
 (async () => {
-    totalQueued = await addSoftgardenCompaniesToQueue();
-    if (totalQueued === 0) {
-        console.log('No Softgarden companies to process. Exiting.');
-        process.exit(0);
+    try {
+        totalQueued = await addSoftgardenCompaniesToQueue();
+        if (totalQueued === 0) {
+            console.log('No Softgarden companies to process. Exiting.');
+            await shutdown(0);
+            return;
+        }
+        const count = await softgardenQueue.count();
+        console.log(`\n🚀 Queue ready with ${count} companies. Workers running (concurrency: ${parseInt(process.env.CRAWLER_COMPANY_BATCH_SIZE || '10', 10)})...\n`);
+    } catch (error) {
+        console.error(`❌ Softgarden queue startup failed: ${error.message}`);
+        await shutdown(1);
     }
-    const count = await softgardenQueue.count();
-    console.log(`\n🚀 Queue ready with ${count} companies. Workers running (concurrency: ${parseInt(process.env.CRAWLER_COMPANY_BATCH_SIZE || '10', 10)})...\n`);
 })();
 
 process.on('SIGINT', async () => {
     console.log('\n⏹️ Shutting down gracefully...');
-    await closeSoftgardenBrowser();
-    await worker.close();
-    await softgardenQueue.close();
-    await redisConnection.quit();
-    process.exit(0);
+    await shutdown(0);
 });

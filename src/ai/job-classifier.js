@@ -14,6 +14,39 @@ const VALID_EMPLOYMENT_TYPES = new Set([
     'Full Time', 'Part Time', 'Internship', 'Apprenticeship', 'Working Student',
     'Contract', 'Temporary', 'Freelance', 'Other', 'Unknown'
 ]);
+const CLASSIFICATION_RESPONSE_FORMAT = Object.freeze({
+    type: 'json_schema',
+    json_schema: {
+        name: 'job_classification',
+        strict: true,
+        schema: {
+            type: 'object',
+            additionalProperties: false,
+            required: [
+                'is_job', 'is_relevant', 'reason', 'relevance_reason', 'division',
+                'cleaned_title', 'skills', 'seniority_level', 'support_level',
+                'employment_type', 'remote_type', 'job_location', 'location_city',
+                'location_country'
+            ],
+            properties: {
+                is_job: { type: 'boolean' },
+                is_relevant: { type: 'boolean' },
+                reason: { type: ['string', 'null'] },
+                relevance_reason: { type: ['string', 'null'] },
+                division: { type: ['string', 'null'] },
+                cleaned_title: { type: ['string', 'null'] },
+                skills: { type: 'array', items: { type: 'string' }, maxItems: 20 },
+                seniority_level: { type: 'string', enum: [...VALID_SENIORITY_LEVELS] },
+                support_level: { type: 'string', enum: [...VALID_SUPPORT_LEVELS] },
+                employment_type: { type: 'string', enum: [...VALID_EMPLOYMENT_TYPES] },
+                remote_type: { type: 'string', enum: [...VALID_REMOTE_TYPES] },
+                job_location: { type: ['string', 'null'] },
+                location_city: { type: ['string', 'null'] },
+                location_country: { type: ['string', 'null'] }
+            }
+        }
+    }
+});
 const DUPLICATE_RETRY_DELAYS_MS = [0, 1000, 2500];
 const RETRY_DELAYS_MS = [0, 2000, 5000];
 
@@ -51,12 +84,15 @@ function buildClassificationPrompt(job = {}) {
     return [
         'You are the authoritative classifier for a production job-matching system.',
         '',
-        'Classify seniority, support level, employment type, employment arrangement, and the actual location where the employee is expected to work.',
+        'First determine whether the supplied content is an actual job vacancy posting. Financial reports, company policies, quality documents, brochures, technical documents, recipes, certificates, and general company documents are not job postings unless the content itself is a specific vacancy announcement.',
+        'Then, for actual job postings, classify seniority, support level, employment type, employment arrangement, and the actual location where the employee is expected to work.',
         'The seniority, support level, and employment type decisions are authoritative. Analyze the complete job context, not isolated keywords.',
         '',
         'Company: ' + (job.company_name || job.company || 'unknown'),
+        'Company website: ' + (job.company_website || job.companyWebsite || 'unknown'),
         'Job title: ' + (job.title || 'unknown'),
         'Source URL: ' + (job.source_url || job.apply_url || job.url || 'unknown'),
+        'PDF URL: ' + (job.pdf_url || 'none'),
         'Employment type evidence: ' + contextValue(job.employment_type || job.employmentType),
         'Work arrangement evidence: ' + (job.work_arrangement || job.workplace || 'none'),
         'Department and structured job fields: ' + contextValue(job.department || job.structured_fields),
@@ -127,6 +163,12 @@ function validateClassification(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         throw new Error('LLM classification must be a JSON object');
     }
+    if (value.is_job !== undefined && typeof value.is_job !== 'boolean') {
+        throw new Error('LLM returned an invalid is_job value');
+    }
+    if (value.is_relevant !== undefined && typeof value.is_relevant !== 'boolean') {
+        throw new Error('LLM returned an invalid is_relevant value');
+    }
     if (!VALID_REMOTE_TYPES.has(value.remote_type)) {
         throw new Error('LLM returned an invalid remote_type');
     }
@@ -160,6 +202,27 @@ function validateClassification(value) {
     };
 }
 
+function buildSafeClassificationFallback(value = {}) {
+    if (!value || typeof value !== 'object' || typeof value.is_job !== 'boolean') return null;
+    const validOrNull = (set, candidate) => set.has(candidate) ? candidate : null;
+    return {
+        is_job: value.is_job,
+        is_relevant: typeof value.is_relevant === 'boolean' ? value.is_relevant : true,
+        reason: nullableString(value.reason),
+        relevance_reason: nullableString(value.relevance_reason),
+        division: nullableString(value.division),
+        cleaned_title: nullableString(value.cleaned_title),
+        skills: Array.isArray(value.skills) ? value.skills.map(nullableString).filter(Boolean).slice(0, 20) : [],
+        seniority_level: validOrNull(VALID_SENIORITY_LEVELS, value.seniority_level),
+        support_level: validOrNull(VALID_SUPPORT_LEVELS, value.support_level),
+        employment_type: validOrNull(VALID_EMPLOYMENT_TYPES, value.employment_type) || 'Unknown',
+        remote_type: validOrNull(VALID_REMOTE_TYPES, value.remote_type) || 'unknown',
+        job_location: nullableString(value.job_location),
+        location_city: nullableString(value.location_city),
+        location_country: nullableString(value.location_country)
+    };
+}
+
 function validateDuplicateClassification(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         throw new Error('LLM duplicate classification must be a JSON object');
@@ -184,23 +247,37 @@ function sleep(ms) {
 
 async function classifyJobWithLLM(job = {}, { signal, clientOverride } = {}) {
     let lastError;
+    let lastParsedResponse = null;
+    let validationCorrection = null;
     for (let index = 0; index < RETRY_DELAYS_MS.length; index++) {
         const attempt = index + 1;
         try {
             const requestClient = clientOverride || getClient();
             await sleep(RETRY_DELAYS_MS[index]);
+            const prompt = [
+                buildClassificationPrompt(job),
+                validationCorrection
+                    ? [
+                        '',
+                        'CORRECTION REQUIRED:',
+                        validationCorrection,
+                        'Return the complete JSON object again. Use only the exact allowed enum values shown in the schema.'
+                    ].join('\n')
+                    : ''
+            ].filter(Boolean).join('\n');
             const response = await requestClient.chat.completions.create({
                 model: job.model || MODEL,
                 messages: [
                     { role: 'system', content: 'Return only valid JSON. Never add explanatory text.' },
-                    { role: 'user', content: buildClassificationPrompt(job) }
+                    { role: 'user', content: prompt }
                 ],
                 temperature: 0,
                 max_tokens: 900,
-                response_format: { type: 'json_object' }
+                response_format: CLASSIFICATION_RESPONSE_FORMAT
             }, signal ? { signal } : undefined);
             const content = response.choices?.[0]?.message?.content?.trim() || '';
-            const result = validateClassification(JSON.parse(content));
+            lastParsedResponse = JSON.parse(content);
+            const result = validateClassification(lastParsedResponse);
             console.log('[LLM CLASSIFY] company=' + (job.company_name || job.company || '-') +
                 ' external_job_id=' + (job.external_job_id || '-') +
                 ' remote_type=' + result.remote_type +
@@ -210,6 +287,9 @@ async function classifyJobWithLLM(job = {}, { signal, clientOverride } = {}) {
             return { ok: true, data: result, attempts: attempt };
         } catch (error) {
             lastError = error;
+            validationCorrection = /^LLM returned an invalid (?:is_job|is_relevant|remote_type|seniority_level|support_level|employment_type)(?: value)?$/i.test(error?.message || '')
+                ? `The previous response failed validation: ${error.message}. Allowed values are: seniority_level=[${[...VALID_SENIORITY_LEVELS].join(', ')}], support_level=[${[...VALID_SUPPORT_LEVELS].join(', ')}], employment_type=[${[...VALID_EMPLOYMENT_TYPES].join(', ')}], remote_type=[${[...VALID_REMOTE_TYPES].join(', ')}].`
+                : null;
             if (signal?.aborted) throw error;
         }
     }
@@ -217,7 +297,26 @@ async function classifyJobWithLLM(job = {}, { signal, clientOverride } = {}) {
         ' external_job_id=' + (job.external_job_id || '-') +
         ' source_url=' + (job.source_url || job.apply_url || job.url || '-') +
         ' attempts=' + RETRY_DELAYS_MS.length +
-        ' reason=' + (lastError?.message || 'unknown error'));
+        ' reason=' + (lastError?.message || 'unknown error') +
+        (() => {
+            const match = /invalid (remote_type|seniority_level|support_level|employment_type)/i.exec(lastError?.message || '');
+            if (!match) return '';
+            const field = match[1];
+            let value;
+            try { value = JSON.stringify(lastParsedResponse?.[field]); } catch { value = String(lastParsedResponse?.[field]); }
+            return ` invalid_field=${field} invalid_value=${value || 'undefined'}`;
+        })());
+    const safeFallback = buildSafeClassificationFallback(lastParsedResponse);
+    if (safeFallback && /invalid (?:remote_type|seniority_level|support_level|employment_type)/i.test(lastError?.message || '')) {
+        console.warn('[LLM CLASSIFY FALLBACK] preserving job with safe neutral fields for malformed enum response');
+        return {
+            ok: true,
+            data: safeFallback,
+            fallback: true,
+            attempts: RETRY_DELAYS_MS.length,
+            error: lastError
+        };
+    }
     return { ok: false, data: null, attempts: RETRY_DELAYS_MS.length, error: lastError };
 }
 
@@ -263,9 +362,11 @@ module.exports = {
     VALID_SENIORITY_LEVELS,
     VALID_SUPPORT_LEVELS,
     VALID_EMPLOYMENT_TYPES,
+    CLASSIFICATION_RESPONSE_FORMAT,
     buildClassificationPrompt,
     classifyJobWithLLM,
     classifyJobDuplicateWithLLM,
     validateDuplicateClassification,
-    validateClassification
+    validateClassification,
+    buildSafeClassificationFallback
 };

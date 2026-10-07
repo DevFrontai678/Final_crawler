@@ -24,6 +24,12 @@ async function getBrowser() {
     return globalBrowser;
 }
 
+async function closeSoftgardenBrowser() {
+    const browser = globalBrowser;
+    globalBrowser = null;
+    if (browser) await browser.close().catch(() => {});
+}
+
 // ─── FETCH HTML: AXIOS + PLAYWRIGHT FALLBACK ─────────────────────────────
 async function fetchHtmlWithFallback(url) {
     try {
@@ -344,4 +350,9 @@ async function run() {
     console.log(`\n✅ Done! Total Softgarden jobs saved: ${totalJobs}`);
 }
 
-run().catch(console.error);
+run()
+    .catch(error => {
+        console.error('❌ Softgarden crawler failed:', error);
+        process.exitCode = 1;
+    })
+    .finally(() => closeSoftgardenBrowser());

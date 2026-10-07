@@ -43,7 +43,7 @@ async function customCrawlerFetchPage(url) {
         console.log(`   ⚠️ Custom crawler fetch error: ${err.message}`);
         return null;
     } finally {
-        if (browser) await browser.close();
+        if (browser) await browser.close().catch(() => {});
     }
 }
 
@@ -367,4 +367,7 @@ async function run() {
     console.log(`\n✅ Done! Total Rexx jobs saved: ${totalJobs}`);
 }
 
-run().catch(console.error);
+run().catch(error => {
+    console.error('❌ Rexx crawler failed:', error);
+    process.exitCode = 1;
+});

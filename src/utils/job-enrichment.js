@@ -589,7 +589,7 @@ async function enrichJobForStorage(job = {}, options = {}) {
 
     row.raw_description = asTrimmedString(row.raw_description || row.description) || null;
     const companyHq = await findCompanyHqLocation(companyWebsiteFrom(row), { signal: options.signal });
-    const classification = await classifyJobWithLLM({
+    const classification = options.classification || await classifyJobWithLLM({
         ...row,
         classification_description: row.classification_description || row.raw_description || row.description || null,
         source_url: row.source_url || row.apply_url || row.url || null,
@@ -602,11 +602,18 @@ async function enrichJobForStorage(job = {}, options = {}) {
     });
 
     // These fields are authoritative LLM output. No keyword or rule-based
-    // fallback is allowed for seniority, support level, or employment type.
+    // fallback is allowed. If one enum field was malformed after retries,
+    // preserve only that field's existing value while retaining valid fields
+    // and applying the classifier's neutral fallback when no value exists.
     if (classification.ok) {
-        row.seniority_level = classification.data.seniority_level;
-        row.support_level = classification.data.support_level;
-        row.employment_type = classification.data.employment_type;
+        const invalidField = classification.fallback
+            ? /invalid (seniority_level|support_level|employment_type)/i.exec(classification.error?.message || '')?.[1]
+            : null;
+        for (const field of ['seniority_level', 'support_level', 'employment_type']) {
+            if (field !== invalidField || row[field] === undefined || row[field] === null) {
+                row[field] = classification.data[field];
+            }
+        }
     }
 
     const cleanedJobLocation = classification.ok

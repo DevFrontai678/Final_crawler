@@ -17,7 +17,7 @@
  *   SCRAPERAPI_API_KEY=your_api_key_here
  *
  * Optional environment variables (.env):
- *   SCRAPERAPI_COUNTRY_CODE=de        // geo-target requests (default: de)
+ *   SCRAPERAPI_COUNTRY_CODE=fr        // optional geo-targeting; omitted by default
  *   SCRAPERAPI_PREMIUM=false          // use premium residential proxies
  *   SCRAPERAPI_TIMEOUT_MS=30000       // shared per-request timeout (required)
  *   SCRAPERAPI_INITIAL_BACKOFF_MS=2000
@@ -55,7 +55,10 @@ const SCRAPERAPI_CONFIG = Object.freeze({
     apiKey: SCRAPERAPI_API_KEY,
     baseUrl: 'https://api.scraperapi.com',
     renderJs: true,
-    countryCode: process.env.SCRAPERAPI_COUNTRY_CODE || 'de',
+    // Country targeting is opt-in. The production plan does not support
+    // Country targeting is unavailable by default, so an unset variable must
+    // not become a country_code request parameter.
+    countryCode: String(process.env.SCRAPERAPI_COUNTRY_CODE || '').trim() || null,
     premium: process.env.SCRAPERAPI_PREMIUM === 'true',
     requestTimeoutMs: parseInt(SCRAPERAPI_TIMEOUT_MS, 10),
     maxRetries: 1,
@@ -168,5 +171,6 @@ async function fetchWithScraperAPI(targetUrl, options = {}) {
 
 module.exports = {
     SCRAPERAPI_CONFIG,
+    buildRequestUrl,
     fetchWithScraperAPI
 };

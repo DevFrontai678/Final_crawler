@@ -173,7 +173,7 @@ async function fetchHtmlWithFallback(url, retryCount = 0) {
     }
 
     const encodedUrl = encodeURIComponent(url);
-    const apiUrl = `https://api.scraperapi.com/?api_key=${apiKey}&url=${encodedUrl}&render=true&country_code=de&premium=true`;
+    const apiUrl = `https://api.scraperapi.com/?api_key=${apiKey}&url=${encodedUrl}&render=true&premium=true`;
 
     const response = await axios.get(apiUrl, {
       timeout: SCRAPERAPI_CONFIG.requestTimeoutMs,

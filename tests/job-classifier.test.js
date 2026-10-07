@@ -4,7 +4,12 @@ const assert = require('assert');
 const {
     buildClassificationPrompt,
     classifyJobWithLLM,
-    validateClassification
+    validateClassification,
+    CLASSIFICATION_RESPONSE_FORMAT,
+    VALID_SENIORITY_LEVELS,
+    VALID_SUPPORT_LEVELS,
+    VALID_EMPLOYMENT_TYPES,
+    buildSafeClassificationFallback
 } = require('../src/ai/job-classifier');
 const { preserveAuthoritativeFieldsForUpsert, resolveJobLocation } = require('../src/utils/job-enrichment');
 
@@ -79,6 +84,143 @@ async function run() {
     assert.match(prompt, /seniority_level MUST be exactly one of/i);
     assert.match(prompt, /support_level MUST be exactly one of/i);
     assert.match(prompt, /complete title, description, responsibilities/i);
+    assert.match(prompt, /financial reports, company policies, quality documents/i);
+    assert.deepStrictEqual(
+        CLASSIFICATION_RESPONSE_FORMAT.json_schema.schema.properties.seniority_level.enum,
+        [...VALID_SENIORITY_LEVELS]
+    );
+    assert.deepStrictEqual(
+        CLASSIFICATION_RESPONSE_FORMAT.json_schema.schema.properties.support_level.enum,
+        [...VALID_SUPPORT_LEVELS]
+    );
+    assert.deepStrictEqual(
+        CLASSIFICATION_RESPONSE_FORMAT.json_schema.schema.properties.employment_type.enum,
+        [...VALID_EMPLOYMENT_TYPES]
+    );
+
+    assert.strictEqual(validateClassification({
+        is_job: false,
+        is_relevant: false,
+        remote_type: 'unknown',
+        seniority_level: 'Senior',
+        support_level: 'Not Applicable',
+        employment_type: 'Unknown'
+    }).is_job, false);
+    assert.throws(
+        () => validateClassification({
+            is_job: 'false',
+            remote_type: 'unknown',
+            seniority_level: 'Senior',
+            support_level: 'Not Applicable',
+            employment_type: 'Unknown'
+        }),
+        /invalid is_job/
+    );
+
+    const correctionPrompts = [];
+    let correctionAttempt = 0;
+    const corrected = await classifyJobWithLLM(
+        { company_name: 'ATIS systems GmbH', external_job_id: '2733664', title: 'Systems Engineer', raw_description: 'A complete job posting.' },
+        {
+            clientOverride: {
+                chat: { completions: { create: async request => {
+                    correctionPrompts.push(request.messages[1].content);
+                    correctionAttempt++;
+                    const seniority = correctionAttempt === 1 ? 'Intermediate' : 'Mid Level';
+                    return { choices: [{ message: { content: JSON.stringify({
+                        is_job: true,
+                        is_relevant: true,
+                        seniority_level: seniority,
+                        support_level: 'Not Applicable',
+                        employment_type: 'Full Time',
+                        remote_type: 'onsite',
+                        job_location: null,
+                        location_city: null,
+                        location_country: null
+                    }) } }] };
+                } } }
+            }
+        }
+    );
+    assert.equal(corrected.ok, true);
+    assert.equal(corrected.data.seniority_level, 'Mid Level');
+    assert.equal(correctionAttempt, 2);
+    assert.match(correctionPrompts[1], /invalid seniority_level/i);
+    assert.match(correctionPrompts[1], /Mid Level/);
+
+    let fallbackAttempts = 0;
+    const classificationLogs = [];
+    const originalConsoleError = console.error;
+    const originalConsoleWarn = console.warn;
+    console.error = (...args) => classificationLogs.push(args.join(' '));
+    console.warn = (...args) => classificationLogs.push(args.join(' '));
+    let fallback;
+    try {
+        fallback = await classifyJobWithLLM(
+            { company_name: 'ATIS systems GmbH', external_job_id: '2733664', title: 'Systems Engineer', raw_description: 'A complete job posting.' },
+            {
+                clientOverride: {
+                    chat: { completions: { create: async () => {
+                        fallbackAttempts++;
+                        return { choices: [{ message: { content: JSON.stringify({
+                            is_job: true,
+                            is_relevant: true,
+                            seniority_level: 'Intermediate',
+                            support_level: 'Not Applicable',
+                            employment_type: 'Full Time',
+                            remote_type: 'onsite',
+                            job_location: null,
+                            location_city: null,
+                            location_country: null
+                        }) } }] };
+                    } } }
+                }
+            }
+        );
+    } finally {
+        console.error = originalConsoleError;
+        console.warn = originalConsoleWarn;
+    }
+    assert.equal(fallback.ok, true);
+    assert.equal(fallback.fallback, true);
+    assert.equal(fallback.data.is_job, true);
+    assert.equal(fallback.data.seniority_level, null);
+    assert.equal(fallback.data.employment_type, 'Full Time');
+    assert.equal(fallbackAttempts, 3);
+    assert.match(classificationLogs.join('\n'), /invalid_field=seniority_level/);
+    assert.match(classificationLogs.join('\n'), /invalid_value="Intermediate"/);
+    assert.match(classificationLogs.join('\n'), /attempts=3/);
+    assert.match(classificationLogs.join('\n'), /LLM CLASSIFY FALLBACK/);
+
+    const invalidSupportFallback = buildSafeClassificationFallback({
+        is_job: true,
+        is_relevant: true,
+        seniority_level: 'Senior',
+        support_level: 'L4',
+        employment_type: 'Full Time',
+        remote_type: 'unknown'
+    });
+    assert.equal(invalidSupportFallback.support_level, null);
+    assert.equal(invalidSupportFallback.seniority_level, 'Senior');
+
+    const invalidEmploymentFallback = buildSafeClassificationFallback({
+        is_job: true,
+        is_relevant: true,
+        seniority_level: 'Senior',
+        support_level: 'Not Applicable',
+        employment_type: 'Permanent Employee',
+        remote_type: 'unknown'
+    });
+    assert.equal(invalidEmploymentFallback.employment_type, 'Unknown');
+
+    const missingFieldFallback = buildSafeClassificationFallback({
+        is_job: true,
+        is_relevant: true,
+        remote_type: 'unknown'
+    });
+    assert.strictEqual(missingFieldFallback.seniority_level, null);
+    assert.strictEqual(missingFieldFallback.support_level, null);
+    assert.strictEqual(missingFieldFallback.employment_type, 'Unknown');
 
     for (const [description, remoteType, location] of cases) {
         const result = await classifyJobWithLLM(

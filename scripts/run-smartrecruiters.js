@@ -535,4 +535,7 @@ async function run() {
     console.log(`\n✅ Done! Total SmartRecruiters jobs saved: ${totalJobs}`);
 }
 
-run().catch(console.error);
+run().catch(error => {
+    console.error('❌ SmartRecruiters crawler failed:', error);
+    process.exitCode = 1;
+});
