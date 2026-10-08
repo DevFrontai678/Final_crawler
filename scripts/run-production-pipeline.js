@@ -2,11 +2,34 @@
 
 require('dotenv').config();
 
+const fs = require('fs');
 const { spawn } = require('child_process');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const COMPANY_BATCH_SIZE = process.env.CRAWLER_COMPANY_BATCH_SIZE || '10';
+
+function markPipelineProcessStarted() {
+    const checkpointFile = process.env.PRODUCTION_RUN_CHECKPOINT_FILE;
+    const runId = process.env.PRODUCTION_RUN_ID;
+    if (!checkpointFile || !runId) return;
+    try {
+        const checkpoint = JSON.parse(fs.readFileSync(checkpointFile, 'utf8'));
+        if (checkpoint.runId !== runId) return;
+        checkpoint.pipelinePid = process.pid;
+        checkpoint.processStartedAt = new Date().toISOString();
+        checkpoint.status = process.env.CRAWLER_RECOVERY_MODE === '1'
+            ? 'recovery_running'
+            : 'running';
+        const tempFile = `${checkpointFile}.${process.pid}.tmp`;
+        fs.writeFileSync(tempFile, JSON.stringify(checkpoint, null, 2));
+        fs.renameSync(tempFile, checkpointFile);
+    } catch (error) {
+        console.error(`[PIPELINE] Could not update run checkpoint: ${error.message}`);
+    }
+}
+
+markPipelineProcessStarted();
 
 const STEPS = [
     { name: 'ATS Detection', cmd: 'node', args: ['scripts/run-ats-detection.js', '--all', '--concurrency', '10'] },

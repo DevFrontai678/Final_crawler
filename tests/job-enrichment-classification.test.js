@@ -109,6 +109,7 @@ async function run() {
     assert.strictEqual(rows[0].seniority_level, 'Senior');
     assert.strictEqual(rows[0].support_level, '2nd Level');
     assert.strictEqual(rows[0].employment_type, 'Full Time');
+    assert.match(rows[0].updated_at, /^\d{4}-\d{2}-\d{2}T/);
     assert.strictEqual(rows[1].support_level, '2nd Level');
 
     const saved = [];
@@ -128,6 +129,34 @@ async function run() {
     assert.strictEqual(saved[0].support_level, '2nd Level');
     assert.strictEqual(saved[0].employment_type, 'Full Time');
     assert.strictEqual(saved[0].posted_at, '2025-01-15T00:00:00.000Z');
+    assert.match(saved[0].updated_at, /^\d{4}-\d{2}-\d{2}T/);
+
+    const existingSupabase = {
+        from: () => ({
+            select: () => ({
+                eq: () => ({
+                    eq: () => ({
+                        maybeSingle: async () => ({
+                            data: { remote_type: 'remote', location: 'Berlin' },
+                            error: null
+                        })
+                    })
+                })
+            })
+        })
+    };
+    const firstRefresh = await preserveAuthoritativeFieldsForUpsert(existingSupabase, {
+        company_id: 'company',
+        external_job_id: 'one',
+        title: 'Refreshed role'
+    });
+    await new Promise(resolve => setTimeout(resolve, 2));
+    const secondRefresh = await preserveAuthoritativeFieldsForUpsert(existingSupabase, {
+        company_id: 'company',
+        external_job_id: 'one',
+        title: 'Refreshed role'
+    });
+    assert.notStrictEqual(secondRefresh.updated_at, firstRefresh.updated_at);
 
     const fallbackRows = await enrichJobRows([
         {

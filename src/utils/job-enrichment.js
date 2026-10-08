@@ -661,11 +661,20 @@ async function enrichJobForStorage(job = {}, options = {}) {
         row.skill_embedding = embedding;
     }
 
+    // Keep the activity timestamp current for both inserts and conflict-updates.
+    // Every crawler persistence path uses this shared enrichment function before
+    // upserting into jobs.
+    row.updated_at = new Date().toISOString();
+
     return row;
 }
 
 async function preserveAuthoritativeFieldsForUpsert(supabase, row = {}) {
     const cleanRow = { ...row };
+    // This is the common preparation boundary for both standard ATS and
+    // custom-crawler job upserts. Stamp here so duplicate updates and inserts
+    // both refresh jobs.updated_at without changing identity or conflict rules.
+    cleanRow.updated_at = new Date().toISOString();
     const classificationSource = cleanRow._classification_source;
     const locationSource = cleanRow._location_source;
     delete cleanRow._classification_source;

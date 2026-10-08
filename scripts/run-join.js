@@ -8,6 +8,10 @@ const cheerio = require('cheerio');
 const crypto = require('crypto');
 const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
 const { enrichJobForStorage, preserveAuthoritativeFieldsForUpsert } = require('../src/utils/job-enrichment');
+const {
+    filterRecoveryCompanies,
+    recordProductionRunCompanyCompleted
+} = require('../src/utils/company-batch-runner');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -320,17 +324,22 @@ async function run() {
         return;
     }
 
-    console.log(`📋 Processing ${companies.length} Join companies...\n`);
+    const { eligibleCompanies, skipped } = filterRecoveryCompanies(companies);
+    if (skipped > 0) {
+        console.log(`⏭️ Recovery skip applied: ${skipped} Join companies`);
+    }
+    console.log(`📋 Processing ${eligibleCompanies.length} Join companies...\n`);
 
     let totalJobs = 0;
-    for (const company of companies) {
+    for (const company of eligibleCompanies) {
         try {
             const result = await processJoinCompany(company);
             if (result.jobs.length === 0) {
                 console.log(`   ⚠️ No jobs found for ${company.Name}`);
-                await supabase.from('companies')
+                const { error: statusError } = await supabase.from('companies')
                     .update({ crawl_status: 'failed' })
                     .eq('Id', company.Id);
+                if (!statusError) recordProductionRunCompanyCompleted(company.Id);
                 continue;
             }
 
@@ -366,14 +375,16 @@ async function run() {
             }
             totalJobs += result.jobs.length;
             console.log(`   💾 Saved ${result.jobs.length} jobs for ${company.Name}`);
-            await supabase.from('companies')
+            const { error: statusError } = await supabase.from('companies')
                 .update({ crawl_status: 'completed' })
                 .eq('Id', company.Id);
+            if (!statusError) recordProductionRunCompanyCompleted(company.Id);
         } catch (err) {
             console.error(`   ⚠️ Skipping ${company.Name}: ${err.message}`);
-            await supabase.from('companies')
+            const { error: statusError } = await supabase.from('companies')
                 .update({ crawl_status: 'failed' })
                 .eq('Id', company.Id);
+            if (!statusError) recordProductionRunCompanyCompleted(company.Id);
         }
         await new Promise(r => setTimeout(r, 300));
     }

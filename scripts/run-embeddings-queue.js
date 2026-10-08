@@ -153,7 +153,7 @@ const worker = new Worker(QUEUE_NAME, async job => {
     const embedding = result[0];
     const { error: updateError } = await supabase
         .from('jobs')
-        .update({ skill_embedding: embedding })
+        .update({ skill_embedding: embedding, updated_at: new Date().toISOString() })
         .eq('id', jobId);
 
     if (updateError) {

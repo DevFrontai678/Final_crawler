@@ -7,7 +7,7 @@ const cheerio = require('cheerio');
 const crypto = require('crypto');
 const { CRAWLER_TIMEOUTS } = require('../src/utils/crawler-timeouts');
 const { enrichJobForStorage, preserveAuthoritativeFieldsForUpsert } = require('../src/utils/job-enrichment');
-const { runCompaniesInBatches } = require('../src/utils/company-batch-runner');
+const { runCompaniesInBatches, updateCompanyCrawlStatusOrThrow } = require('../src/utils/company-batch-runner');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -444,9 +444,7 @@ async function run() {
                 const result = await processSuccessFactorsCompany(company);
                 if (result.jobs.length === 0) {
                     console.log(`   ⚠️ [${meta.companyIndex}/${meta.companyTotal}] ${company.Name} | no jobs found`);
-                    await supabase.from('companies')
-                        .update({ crawl_status: 'failed' })
-                        .eq('Id', company.Id);
+                    await updateCompanyCrawlStatusOrThrow(supabase, company.Id, 'failed');
                     return { status: 'no_jobs', jobs: [] };
                 }
 
@@ -481,15 +479,11 @@ async function run() {
                     }
                 }
                 console.log(`   💾 [${meta.companyIndex}/${meta.companyTotal}] ${company.Name} | saved=${result.jobs.length}`);
-                await supabase.from('companies')
-                    .update({ crawl_status: 'completed' })
-                    .eq('Id', company.Id);
+                await updateCompanyCrawlStatusOrThrow(supabase, company.Id, 'completed');
                 return { status: 'completed', jobs: result.jobs };
             } catch (err) {
                 console.error(`   ⚠️ [${meta.companyIndex}/${meta.companyTotal}] ${company.Name} failed: ${err.message}`);
-                await supabase.from('companies')
-                    .update({ crawl_status: 'failed' })
-                    .eq('Id', company.Id);
+                await updateCompanyCrawlStatusOrThrow(supabase, company.Id, 'failed');
                 return { status: 'failed', jobs: [] };
             }
         }

@@ -3,7 +3,7 @@ const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
 const { processPersonioCompany, closePersonioBrowser } = require('../src/ats-adapters/personio-adapter');
 const { enrichJobForStorage, preserveAuthoritativeFieldsForUpsert } = require('../src/utils/job-enrichment');
-const { runCompaniesInBatches } = require('../src/utils/company-batch-runner');
+const { runCompaniesInBatches, updateCompanyCrawlStatusOrThrow } = require('../src/utils/company-batch-runner');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -44,9 +44,7 @@ async function run() {
                     error_message: result.error,
                     created_at: new Date()
                 });
-                await supabase.from('companies')
-                    .update({ crawl_status: 'failed' })
-                    .eq('Id', company.Id);
+                await updateCompanyCrawlStatusOrThrow(supabase, company.Id, 'failed');
                 return { status: 'failed', jobs: [] };
             }
 
@@ -58,9 +56,7 @@ async function run() {
                     error_message: 'No jobs found',
                     created_at: new Date()
                 });
-                await supabase.from('companies')
-                    .update({ crawl_status: 'failed' })
-                    .eq('Id', company.Id);
+                await updateCompanyCrawlStatusOrThrow(supabase, company.Id, 'failed');
                 return { status: 'no_jobs', jobs: [] };
             }
 
@@ -109,9 +105,7 @@ async function run() {
                 created_at: new Date()
             });
 
-            await supabase.from('companies')
-                .update({ crawl_status: 'completed' })
-                .eq('Id', company.Id);
+            await updateCompanyCrawlStatusOrThrow(supabase, company.Id, 'completed');
 
             return { status: 'success', jobs: result.jobs };
         }

@@ -195,6 +195,7 @@ async function processJobs(jobs) {
                 .from('jobs')
                 .update({
                     structured_skills: skills || [],
+                    updated_at: new Date().toISOString(),
                 })
                 .eq('id', job.id);
 

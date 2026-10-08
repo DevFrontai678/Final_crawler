@@ -73,7 +73,8 @@ const worker = new Worker(
                 structured_skills: result.skills && result.skills.length > 0 ? result.skills : null,
                 seniority_level: result.seniority_level,
                 support_level: result.support_level,
-                employment_type: result.employment_type
+                employment_type: result.employment_type,
+                updated_at: new Date().toISOString()
             };
 
             // 3. 🔥 CRITICAL FIX: Save title if original is null/empty

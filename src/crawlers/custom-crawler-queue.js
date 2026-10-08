@@ -45,6 +45,10 @@ const {
     preserveAuthoritativeFieldsForUpsert,
     selectAuthoritativeJobLocation
 } = require('../utils/job-enrichment');
+const {
+    filterRecoveryCompanies,
+    recordProductionRunCompanyCompleted
+} = require('../utils/company-batch-runner');
 const { classifyJobWithLLM } = require('../ai/job-classifier');
 const { resolveDuplicateIdentity } = require('../utils/job-duplicate-detection');
 const {
@@ -3631,6 +3635,9 @@ async function markCompanyStatus(companyId, status, { touchTimestamp = true, err
     }
     const { error } = await supabase.from('companies').update(u).eq('Id', companyId);
     if (error) console.error(`[DB] ${error.message}`);
+    if (!error && ['completed', 'no_jobs', 'not_found', 'failed', 'partial'].includes(status)) {
+        recordProductionRunCompanyCompleted(companyId);
+    }
 }
 
 async function batchInsertJobs(rows) {
@@ -4399,8 +4406,10 @@ async function enqueueCompanies() {
         if (error) { console.error(`[QUEUE] ${error.message}`); break; }
         if (!data?.length) { hasMore = false; break; }
 
+        const { eligibleCompanies, skipped } = filterRecoveryCompanies(data);
         console.log(`[QUEUE] Page ${page + 1}: ${data.length} companies`);
-        for (const c of data) {
+        if (skipped > 0) console.log(`[QUEUE] Recovery skips applied: ${skipped}`);
+        for (const c of eligibleCompanies) {
             const companyIndex = total + 1;
             await customCrawlQueue.add('crawl-company', {
                 companyId: c.Id,

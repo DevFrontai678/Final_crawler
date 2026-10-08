@@ -206,7 +206,7 @@ async function processJob(job, index, totalLabel, stats) {
     if (coords) {
         const { error: updateErr } = await supabase
             .from('jobs')
-            .update({ location_lat: coords.lat, location_lng: coords.lng })
+            .update({ location_lat: coords.lat, location_lng: coords.lng, updated_at: new Date().toISOString() })
             .eq('id', job.id);
         if (updateErr) {
             console.error(`     ❌ Update failed: ${updateErr.message}`);

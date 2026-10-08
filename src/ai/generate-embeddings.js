@@ -150,7 +150,7 @@ async function processJobs(jobs) {
             for (const update of updates) {
                 const { error } = await supabase
                     .from('jobs')
-                    .update({ skill_embedding: update.skill_embedding })
+                    .update({ skill_embedding: update.skill_embedding, updated_at: new Date().toISOString() })
                     .eq('id', update.id);
 
                 if (error) {
