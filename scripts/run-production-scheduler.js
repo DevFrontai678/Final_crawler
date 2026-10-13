@@ -206,21 +206,30 @@ function spawnPipeline({
     spawnImpl = spawn,
     env = process.env
 } = {}) {
-    const child = spawnImpl(process.execPath, [PIPELINE_SCRIPT], {
-        cwd: ROOT,
-        detached: true,
-        stdio: 'ignore',
-        env: {
-            ...env,
-            PRODUCTION_RUN_ID: runId || '',
-            PRODUCTION_RUN_CHECKPOINT_FILE: checkpointFile,
-            CRAWLER_RECOVERY_MODE: recovery ? '1' : '0',
-            CRAWLER_RECOVERY_ELIGIBLE_COMPANY_IDS: '',
-            CRAWLER_SKIP_COMPANY_IDS: recovery ? skipIds.join(',') : ''
-        }
-    });
-    child.unref();
-    return child.pid;
+    const logDirectory = '/home/customer-matching-crawler/logs';
+    const logFile = `${logDirectory}/production-pipeline.log`;
+    fs.mkdirSync(logDirectory, { recursive: true });
+    const logFd = fs.openSync(logFile, 'a');
+
+    try {
+        const child = spawnImpl(process.execPath, [PIPELINE_SCRIPT], {
+            cwd: ROOT,
+            detached: true,
+            stdio: ['ignore', logFd, logFd],
+            env: {
+                ...env,
+                PRODUCTION_RUN_ID: runId || '',
+                PRODUCTION_RUN_CHECKPOINT_FILE: checkpointFile,
+                CRAWLER_RECOVERY_MODE: recovery ? '1' : '0',
+                CRAWLER_RECOVERY_ELIGIBLE_COMPANY_IDS: '',
+                CRAWLER_SKIP_COMPANY_IDS: recovery ? skipIds.join(',') : ''
+            }
+        });
+        child.unref();
+        return child.pid;
+    } finally {
+        fs.closeSync(logFd);
+    }
 }
 
 async function runCycle({
