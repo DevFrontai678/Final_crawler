@@ -27,13 +27,13 @@
     "p-retry": "^7.1.1",
     "pdf-parse": "^2.4.5",
     "playwright": "^1.60.0",
-    "socks-proxy-agent": "^8.0.5",
     "scrapingbee": "^1.7.6",
     "serpapi": "^2.2.1",
+    "socks-proxy-agent": "^8.0.5",
     "uuid": "^14.0.1",
     "voyageai": "^0.4.0",
     "winston": "^3.19.0",
-    "ws": "^8.21.0",
+    "ws": "^8.22.0",
     "xml2js": "^0.6.2"
   },
   "devDependencies": {

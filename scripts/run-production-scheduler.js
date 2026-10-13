@@ -9,6 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws');
 
 const ROOT = path.resolve(__dirname, '..');
 const PIPELINE_SCRIPT = path.join(__dirname, 'run-production-pipeline.js');
@@ -515,7 +516,11 @@ async function main() {
     }
 
     try {
-        const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+        const supabase = createClient(
+            process.env.SUPABASE_URL,
+            process.env.SUPABASE_SERVICE_KEY,
+            { realtime: { transport: WebSocket } }
+        );
         const result = await runCycle({ supabase, state: loadState() });
         console.log(`[SCHEDULER] ${result.action}`);
     } finally {
